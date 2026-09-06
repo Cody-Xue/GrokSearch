@@ -248,7 +248,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
     async def _execute_stream_result_with_retry(self, headers: dict, payload: dict, ctx=None) -> GrokResponse:
         """执行带重试机制的流式 HTTP 请求"""
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+        timeout = httpx.Timeout(connect=6.0, read=180.0, write=10.0, pool=None)
 
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async for attempt in AsyncRetrying(
