@@ -147,6 +147,7 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "user", "content": time_context + query + platform_prompt},
             ],
             "stream": True,
+            "tools": [{"type": "web_search"}],
         }
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
