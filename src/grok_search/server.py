@@ -12,16 +12,16 @@ from pydantic import Field
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
-    from grok_search.providers.grok import GrokSearchProvider
+    from grok_search.providers.grok import GrokResponse, GrokSearchProvider
     from grok_search.logger import log_info
     from grok_search.config import config
-    from grok_search.sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from grok_search.sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, split_answer_and_sources
     from grok_search.planning import engine as planning_engine, _split_csv
 except ImportError:
-    from .providers.grok import GrokSearchProvider
+    from .providers.grok import GrokResponse, GrokSearchProvider
     from .logger import log_info
     from .config import config
-    from .sources import SourcesCache, merge_sources, new_session_id, split_answer_and_sources
+    from .sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, split_answer_and_sources
     from .planning import engine as planning_engine, _split_csv
 
 import asyncio
@@ -120,7 +120,7 @@ def _extra_results_to_sources(
 
     This tool extracts sources if provided by upstream, caches them, and returns:
     - session_id: string (When you feel confused or curious about the main content, use this field to invoke the get_sources tool to obtain the corresponding list of information sources)
-    - content: string (answer only)
+    - content: string (original answer when native citation offsets are present)
     - sources_count: int
     """,
     meta={"version": "2.0.0", "author": "guda.studio"},
@@ -164,11 +164,11 @@ async def web_search(
             tavily_count = extra_sources
 
     # 并行执行搜索任务
-    async def _safe_grok() -> str:
+    async def _safe_grok() -> GrokResponse:
         try:
-            return await grok_provider.search(query, platform)
+            return await grok_provider.search_with_sources(query, platform)
         except Exception:
-            return ""
+            return GrokResponse()
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -192,7 +192,7 @@ async def web_search(
 
     gathered = await asyncio.gather(*coros)
 
-    grok_result: str = gathered[0] or ""
+    grok_result: GrokResponse = gathered[0]
     tavily_results: list[dict] | None = None
     firecrawl_results: list[dict] | None = None
     idx = 1
@@ -202,9 +202,13 @@ async def web_search(
     if firecrawl_count > 0:
         firecrawl_results = gathered[idx]
 
-    answer, grok_sources = split_answer_and_sources(grok_result)
+    answer, grok_sources = split_answer_and_sources(grok_result.content)
+    native_sources = sources_from_annotations(grok_result.annotations)
+    if native_sources:
+        # Trimming or removing a sources section would invalidate citation offsets.
+        answer = grok_result.content
     extra = _extra_results_to_sources(tavily_results, firecrawl_results)
-    all_sources = merge_sources(grok_sources, extra)
+    all_sources = merge_sources(native_sources, grok_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
     return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
@@ -216,6 +220,8 @@ async def web_search(
     When you feel confused or curious about the search response content, use the session_id returned by web_search to invoke the this tool to obtain the corresponding list of information sources.
     Retrieve all cached sources for a previous web_search call.
     Provide the session_id returned by web_search to get the full source list.
+    Native Grok sources include citations with upstream offsets into the original
+    content and a label when the upstream title is a numeric citation marker.
     """,
     meta={"version": "1.0.0", "author": "guda.studio"},
 )

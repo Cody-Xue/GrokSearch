@@ -1,12 +1,13 @@
 import httpx
 import json
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import List, Optional
+from typing import Optional
 from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 from tenacity.wait import wait_base
 from zoneinfo import ZoneInfo
-from .base import BaseSearchProvider, SearchResult
+from .base import BaseSearchProvider
 from ..utils import search_prompt, fetch_prompt, url_describe_prompt, rank_sources_prompt
 from ..logger import log_info
 from ..config import config
@@ -117,6 +118,12 @@ class _WaitWithRetryAfter(wait_base):
             return None
 
 
+@dataclass
+class GrokResponse:
+    content: str = ""
+    annotations: list[dict] = field(default_factory=list)
+
+
 class GrokSearchProvider(BaseSearchProvider):
     def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
         super().__init__(api_url, api_key)
@@ -125,7 +132,12 @@ class GrokSearchProvider(BaseSearchProvider):
     def get_provider_name(self) -> str:
         return "Grok"
 
-    async def search(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> List[SearchResult]:
+    async def search(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> str:
+        """Keep the text-only provider API for existing callers."""
+        result = await self.search_with_sources(query, platform, min_results, max_results, ctx)
+        return result.content
+
+    async def search_with_sources(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None) -> GrokResponse:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -152,7 +164,7 @@ class GrokSearchProvider(BaseSearchProvider):
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_stream_result_with_retry(headers, payload, ctx)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -173,47 +185,68 @@ class GrokSearchProvider(BaseSearchProvider):
         return await self._execute_stream_with_retry(headers, payload, ctx)
 
     async def _parse_streaming_response(self, response, ctx=None) -> str:
-        content = ""
-        full_body_buffer = [] 
-        
+        result = await self._parse_streaming_result(response, ctx)
+        return result.content
+
+    async def _parse_streaming_result(self, response, ctx=None) -> GrokResponse:
+        result = GrokResponse()
+        full_body_buffer = []
+        saw_sse = False
+
+        def collect(data):
+            if not isinstance(data, dict):
+                return
+            choices = data.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                return
+            choice = choices[0]
+            message = choice.get("delta")
+            if not isinstance(message, dict):
+                message = choice.get("message")
+            if not isinstance(message, dict):
+                return
+            content = message.get("content")
+            if isinstance(content, str):
+                result.content += content
+            # Citations often arrive in chunks with no content at all.
+            annotations = message.get("annotations")
+            if isinstance(annotations, list):
+                result.annotations.extend(a for a in annotations if isinstance(a, dict))
+
         async for line in response.aiter_lines():
             line = line.strip()
             if not line:
                 continue
             
-            full_body_buffer.append(line)
-
             # 兼容 "data: {...}" 和 "data:{...}" 两种 SSE 格式
             if line.startswith("data:"):
+                saw_sse = True
                 if line in ("data: [DONE]", "data:[DONE]"):
                     continue
                 try:
                     # 去掉 "data:" 前缀，并去除可能的空格
                     json_str = line[5:].lstrip()
-                    data = json.loads(json_str)
-                    choices = data.get("choices", [])
-                    if choices and len(choices) > 0:
-                        delta = choices[0].get("delta", {})
-                        if "content" in delta:
-                            content += delta["content"]
-                except (json.JSONDecodeError, IndexError):
+                    collect(json.loads(json_str))
+                except json.JSONDecodeError:
                     continue
-                
-        if not content and full_body_buffer:
+            elif not saw_sse:
+                full_body_buffer.append(line)
+
+        if not saw_sse and full_body_buffer:
             try:
-                full_text = "".join(full_body_buffer)
-                data = json.loads(full_text)
-                if "choices" in data and len(data["choices"]) > 0:
-                    message = data["choices"][0].get("message", {})
-                    content = message.get("content", "")
+                collect(json.loads("\n".join(full_body_buffer)))
             except json.JSONDecodeError:
                 pass
         
-        await log_info(ctx, f"content: {content}", config.debug_enabled)
+        await log_info(ctx, f"content: {result.content}", config.debug_enabled)
 
-        return content
+        return result
 
     async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+        result = await self._execute_stream_result_with_retry(headers, payload, ctx)
+        return result.content
+
+    async def _execute_stream_result_with_retry(self, headers: dict, payload: dict, ctx=None) -> GrokResponse:
         """执行带重试机制的流式 HTTP 请求"""
         timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
 
@@ -232,7 +265,7 @@ class GrokSearchProvider(BaseSearchProvider):
                         json=payload,
                     ) as response:
                         response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
+                        return await self._parse_streaming_result(response, ctx)
 
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""

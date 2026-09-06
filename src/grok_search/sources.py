@@ -67,6 +67,42 @@ def merge_sources(*source_lists: list[dict]) -> list[dict]:
     return merged
 
 
+def sources_from_annotations(annotations: list[dict]) -> list[dict]:
+    """Group native URL citations without losing repeated citation locations.
+
+    Accept both flat Grok annotations and nested Chat Completions citations.
+    Numeric titles are citation labels, not document titles. Offsets are kept
+    as supplied by the upstream API and refer to the unmodified answer.
+    """
+    by_url: dict[str, dict] = {}
+    for annotation in annotations:
+        if not isinstance(annotation, dict) or annotation.get("type") != "url_citation":
+            continue
+        citation = annotation.get("url_citation", annotation)
+        if not isinstance(citation, dict):
+            continue
+        url = citation.get("url")
+        if not isinstance(url, str) or not url.strip().startswith(("https://", "http://")):
+            continue
+        url = url.strip()
+        source = by_url.setdefault(url, {"url": url, "provider": "grok", "citations": []})
+        occurrence = {}
+        title = citation.get("title")
+        if isinstance(title, str) and title.strip():
+            title = title.strip()
+            if title.isdecimal():
+                occurrence["label"] = title
+            else:
+                source.setdefault("title", title)
+        for key in ("start_index", "end_index"):
+            value = citation.get(key)
+            if type(value) is int and value >= 0:
+                occurrence[key] = value
+        if occurrence and occurrence not in source["citations"]:
+            source["citations"].append(occurrence)
+    return list(by_url.values())
+
+
 def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:
     raw = (text or "").strip()
     if not raw:

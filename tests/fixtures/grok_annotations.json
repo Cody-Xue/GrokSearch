@@ -1,0 +1,105 @@
+{
+  "description": "Actual URL annotations captured on 2026-09-06 from a Python 3.14 search. Original response body and credentials are omitted.",
+  "annotations": [
+    {
+      "end_index": 107,
+      "start_index": 54,
+      "title": "1",
+      "type": "url_citation",
+      "url": "https://docs.python.org/dev/whatsnew/3.14.html"
+    },
+    {
+      "end_index": 160,
+      "start_index": 107,
+      "title": "2",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/using/configure.html"
+    },
+    {
+      "end_index": 326,
+      "start_index": 275,
+      "title": "3",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/whatsnew/3.13.html"
+    },
+    {
+      "end_index": 710,
+      "start_index": 657,
+      "title": "2",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/using/configure.html"
+    },
+    {
+      "end_index": 885,
+      "start_index": 832,
+      "title": "1",
+      "type": "url_citation",
+      "url": "https://docs.python.org/dev/whatsnew/3.14.html"
+    },
+    {
+      "end_index": 938,
+      "start_index": 885,
+      "title": "4",
+      "type": "url_citation",
+      "url": "https://realpython.com/python314-new-features/"
+    },
+    {
+      "end_index": 1145,
+      "start_index": 1080,
+      "title": "5",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/howto/free-threading-python.html"
+    },
+    {
+      "end_index": 1350,
+      "start_index": 1297,
+      "title": "1",
+      "type": "url_citation",
+      "url": "https://docs.python.org/dev/whatsnew/3.14.html"
+    },
+    {
+      "end_index": 1473,
+      "start_index": 1417,
+      "title": "6",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/whatsnew/changelog.html"
+    },
+    {
+      "end_index": 1632,
+      "start_index": 1581,
+      "title": "7",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/whatsnew/3.14.html"
+    },
+    {
+      "end_index": 1829,
+      "start_index": 1776,
+      "title": "1",
+      "type": "url_citation",
+      "url": "https://docs.python.org/dev/whatsnew/3.14.html"
+    },
+    {
+      "end_index": 1991,
+      "start_index": 1938,
+      "title": "2",
+      "type": "url_citation",
+      "url": "https://docs.python.org/3/using/configure.html"
+    },
+    {
+      "end_index": 2044,
+      "start_index": 1991,
+      "title": "1",
+      "type": "url_citation",
+      "url": "https://docs.python.org/dev/whatsnew/3.14.html"
+    }
+  ],
+  "unique_urls": [
+    "https://docs.python.org/3/howto/free-threading-python.html",
+    "https://docs.python.org/3/using/configure.html",
+    "https://docs.python.org/3/whatsnew/3.13.html",
+    "https://docs.python.org/3/whatsnew/3.14.html",
+    "https://docs.python.org/3/whatsnew/changelog.html",
+    "https://docs.python.org/dev/whatsnew/3.14.html",
+    "https://realpython.com/python314-new-features/"
+  ]
+}
