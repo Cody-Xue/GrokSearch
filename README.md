@@ -166,7 +166,7 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
 | `GROK_RETRY_BUDGET_S` | ❌ | `45` | 单次调用重试总等待预算（秒），上游 Retry-After 超出预算时立即放弃；`0` 关闭 |
-| `GROK_MAX_CONCURRENCY` | ❌ | `4` | 同时在途的 Grok 请求上限 |
+| `GROK_MAX_CONCURRENCY` | ❌ | `16` | 同时在途的 Grok 请求上限 |
 | `GROK_BREAKER_THRESHOLD` | ❌ | `3` | 窗口内多少次 429 触发熔断 |
 | `GROK_BREAKER_WINDOW_S` | ❌ | `60` | 熔断计数窗口（秒） |
 | `GROK_BREAKER_COOLDOWN_S` | ❌ | `60` | 初始冷却时间（秒），探测失败后倍增 |

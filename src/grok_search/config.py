@@ -95,7 +95,7 @@ class Config:
     # -------------------------------------------------------- throttling / breaker
     @property
     def max_concurrency(self) -> int:
-        return max(1, _env_int("GROK_MAX_CONCURRENCY", 4))
+        return max(1, _env_int("GROK_MAX_CONCURRENCY", 16))
 
     @property
     def breaker_threshold(self) -> int:

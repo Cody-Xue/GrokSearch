@@ -144,7 +144,7 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_RETRY_MULTIPLIER` | No | `1` | Retry backoff multiplier |
 | `GROK_RETRY_MAX_WAIT` | No | `10` | Max retry wait in seconds |
 | `GROK_RETRY_BUDGET_S` | No | `45` | Total retry-wait budget per call (seconds); a Retry-After beyond the budget fails fast. `0` disables |
-| `GROK_MAX_CONCURRENCY` | No | `4` | Maximum in-flight Grok requests |
+| `GROK_MAX_CONCURRENCY` | No | `16` | Maximum in-flight Grok requests |
 | `GROK_BREAKER_THRESHOLD` | No | `3` | 429s within the window that open the breaker |
 | `GROK_BREAKER_WINDOW_S` | No | `60` | Breaker counting window (seconds) |
 | `GROK_BREAKER_COOLDOWN_S` | No | `60` | Initial cooldown (seconds), doubled after a failed probe |
