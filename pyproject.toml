@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grok-search"
-version = "0.1.0"
+version = "1.10.0"
 description = "MCP server for AI model search capabilities"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,3 +26,10 @@ where = ["src"]
 
 [project.scripts]
 grok-search = "grok_search.server:main"
+
+[tool.uv]
+# Rebuild whenever sources change; by default uv only watches pyproject.toml for local paths.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"

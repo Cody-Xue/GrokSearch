@@ -29,7 +29,13 @@ Claude ──MCP──► Grok Search Server
 - **双引擎**：Grok 搜索 + Tavily 抓取/映射，互补协作
 - **Firecrawl 托底**：Tavily 提取失败时自动降级到 Firecrawl Scrape，支持空内容自动重试
 - **OpenAI 兼容接口**，支持任意 Grok 镜像站
-- **自动时间注入**（检测时间相关查询，注入本地时间上下文）
+- **自动时间注入**（每次搜索注入本地日期与时间上下文）
+- **只读工具注解**：`web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` 声明 `readOnlyHint`，Claude Code 会并行执行同一轮里的多次调用，而不是逐个排队
+- **并发上限 + 按模型熔断**：`GROK_MAX_CONCURRENCY` 限制同时在途的 Grok 请求；连续 429 或账号池耗尽时按模型档位熔断并返回结构化错误，冷却后自动探测恢复
+- **失败必有回声**：上游流内错误帧、429、空响应都会变成 `error`/`error_type`/`retry_after_s` 字段，不再静默返回空正文
+- **引用核验层**：回答里的 arXiv 号、DOI 和被引用 URL 分别经 arXiv API、Crossref 与实际页面核验，未命中的列入 `unresolved`
+- **抓取质量门槛与分页**：Tavily 结果过短时回退 Firecrawl 取较长者；arXiv 摘要页直接走 arXiv API；`max_chars`/`offset` 分页读取超长页面
+- **输出风格开关**：`GROK_SEARCH_STYLE=concise` 去掉术语定义与类比段落；两种风格都附带数字原样引用、不跨来源拼区间的硬规则
 - 一键禁用 Claude Code 官方 WebSearch/WebFetch，强制路由到本工具
 - 智能重试（支持 Retry-After 头解析 + 指数退避）
 - 父进程监控（Windows 下自动检测父进程退出，防止僵尸进程）
@@ -159,6 +165,21 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MAX_ATTEMPTS` | ❌ | `3` | 最大重试次数 |
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
+| `GROK_RETRY_BUDGET_S` | ❌ | `45` | 单次调用重试总等待预算（秒），上游 Retry-After 超出预算时立即放弃；`0` 关闭 |
+| `GROK_MAX_CONCURRENCY` | ❌ | `4` | 同时在途的 Grok 请求上限 |
+| `GROK_BREAKER_THRESHOLD` | ❌ | `3` | 窗口内多少次 429 触发熔断 |
+| `GROK_BREAKER_WINDOW_S` | ❌ | `60` | 熔断计数窗口（秒） |
+| `GROK_BREAKER_COOLDOWN_S` | ❌ | `60` | 初始冷却时间（秒），探测失败后倍增 |
+| `GROK_BREAKER_MAX_COOLDOWN_S` | ❌ | `300` | 冷却时间上限（秒） |
+| `GROK_SEARCH_STYLE` | ❌ | `explanatory` | 输出风格：`explanatory` 或 `concise` |
+| `GROK_VERIFY_IDS` | ❌ | `true` | 回答里的 arXiv 号与 DOI 是否自动核验 |
+| `GROK_VERIFY_URLS` | ❌ | `true` | 被引用的 URL 是否做可达性与标题核验 |
+| `GROK_VERIFY_TIMEOUT_S` | ❌ | `20` | 核验层总超时（秒） |
+| `GROK_VERIFY_MAILTO` | ❌ | 空 | 核验请求的 User-Agent 联系邮箱（Crossref 礼貌池） |
+| `GROK_PLANNING_TOOLS` | ❌ | `false` | 是否注册 `plan_*` 六个搜索规划工具 |
+| `GROK_FETCH_MIN_CHARS` | ❌ | `2000` | Tavily 抓取结果低于此长度时回退 Firecrawl |
+| `GROK_FETCH_MAX_CHARS` | ❌ | `40000` | `web_fetch` 单次默认返回字符数 |
+| `TAVILY_EXTRACT_TIMEOUT_S` | ❌ | `30` | Tavily 提取超时（秒） |
 
 > **注意**：配置了 `GUDA_API_KEY` 后，`GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` 均为可选，系统自动从 `GUDA_BASE_URL` 派生。显式设置的独立变量优先级更高。
 
@@ -188,6 +209,8 @@ claude mcp list
 
 `web_search` 输出不展开信源，仅返回 `sources_count`；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
 
+新增参数：`instructions`（按次追加给搜索模型的要求，例如"至少覆盖 15 个不同域名"或"只列 arXiv 号和标题"）、`verify`（默认 `true`，对回答里的 arXiv 号、DOI 与被引用 URL 做核验）。返回值除 `content`/`sources_count` 外还有 `distinct_domains`（引用了多少个不同站点）、`verification`（`arxiv`/`doi`/`urls` 三组核验结果与 `unresolved` 列表），失败时有 `error`/`error_type`/`retry_after_s`，正文以 `[搜索失败]` 开头。`extra_sources > 0` 时，Tavily/Firecrawl 的独立结果会以 "Extra sources" 小节附在正文末尾。
+
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `query` | string | ✅ | - | 搜索查询语句 |
@@ -195,7 +218,7 @@ claude mcp list
 | `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
 | `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
 
-自动检测查询中的时间相关关键词（如"最新""今天""recent"等），注入本地时间上下文以提升时效性搜索的准确度。
+每次搜索自动注入本地日期、时间与时区上下文，以提升时效性搜索的准确度。
 
 返回值（结构化字典）：
 - `session_id`: 本次查询的会话 ID
@@ -296,3 +319,17 @@ A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 AP
 
 [![Star History Chart](https://api.star-history.com/svg?repos=GuDaStudio/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#GuDaStudio/GrokSearch&type=date&legend=top-left)
 </div>
+
+## 变更记录
+
+### v1.10.0（2026-09-17）
+
+- 只读工具加 `readOnlyHint` 注解，Claude Code 可并行执行多次搜索与抓取。
+- 新增并发信号量、按模型分键的熔断器（连续 429 或账号池耗尽即熔断，半开探测恢复）、按时间计算的重试预算。
+- 上游流内 `event: error` 帧、429、空响应统一转为结构化错误字段，不再静默返回空正文；错误无条件写入日志。
+- `web_search` 新增 `instructions`、`verify` 参数与 `distinct_domains`、`verification` 返回字段；`extra_sources` 结果附在正文末尾。
+- 系统提示词拆为策略段与风格段，`GROK_SEARCH_STYLE` 可切换；新增引用完整性硬规则。
+- `web_fetch` 新增长度门槛回退、`max_chars`/`offset` 分页与 arXiv 摘要页适配，Tavily 提取超时降为 30 秒。
+- `plan_*` 六个规划工具改为 `GROK_PLANNING_TOOLS=true` 时才注册。
+- `switch_model` 在 `GROK_MODEL` 环境变量存在时给出警告；`get_config_info` 增加熔断状态与服务器版本。
+- 删除未被调用的 Grok fetch/describe/rank 代码路径及相关提示词；`build/`、`*.egg-info` 不再入库。

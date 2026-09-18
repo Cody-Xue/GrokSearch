@@ -23,9 +23,31 @@ try:
 except OSError:
     logger.addHandler(logging.NullHandler())
 
+
 async def log_info(ctx, message: str, is_debug: bool = False):
+    """Debug-gated info: written to the log file only when GROK_DEBUG is on."""
     if is_debug:
         logger.info(message)
-        
+
     if ctx:
         await ctx.info(message)
+
+
+async def log_warning(ctx, message: str):
+    """Always written to the log file."""
+    logger.warning(message)
+    if ctx:
+        try:
+            await ctx.warning(message)
+        except Exception:
+            pass
+
+
+async def log_error(ctx, message: str):
+    """Always written to the log file, regardless of GROK_DEBUG."""
+    logger.error(message)
+    if ctx:
+        try:
+            await ctx.error(message)
+        except Exception:
+            pass

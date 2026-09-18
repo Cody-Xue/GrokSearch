@@ -2,6 +2,28 @@ import os
 import json
 from pathlib import Path
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("true", "1", "yes", "on")
+
+
 class Config:
     _instance = None
     _SETUP_COMMAND = (
@@ -48,22 +70,89 @@ class Config:
         except IOError as e:
             raise ValueError(f"无法保存配置文件: {str(e)}")
 
+    # ------------------------------------------------------------------ basics
     @property
     def debug_enabled(self) -> bool:
-        return os.getenv("GROK_DEBUG", "false").lower() in ("true", "1", "yes")
+        return _env_bool("GROK_DEBUG", False)
 
     @property
     def retry_max_attempts(self) -> int:
-        return int(os.getenv("GROK_RETRY_MAX_ATTEMPTS", "3"))
+        return max(0, _env_int("GROK_RETRY_MAX_ATTEMPTS", 3))
 
     @property
     def retry_multiplier(self) -> float:
-        return float(os.getenv("GROK_RETRY_MULTIPLIER", "1"))
+        return _env_float("GROK_RETRY_MULTIPLIER", 1.0)
 
     @property
     def retry_max_wait(self) -> int:
-        return int(os.getenv("GROK_RETRY_MAX_WAIT", "10"))
+        return _env_int("GROK_RETRY_MAX_WAIT", 10)
 
+    @property
+    def retry_budget_s(self) -> float:
+        """Total seconds one call may spend waiting between retries. 0 disables the budget."""
+        return max(0.0, _env_float("GROK_RETRY_BUDGET_S", 45.0))
+
+    # -------------------------------------------------------- throttling / breaker
+    @property
+    def max_concurrency(self) -> int:
+        return max(1, _env_int("GROK_MAX_CONCURRENCY", 4))
+
+    @property
+    def breaker_threshold(self) -> int:
+        return max(1, _env_int("GROK_BREAKER_THRESHOLD", 3))
+
+    @property
+    def breaker_window_s(self) -> float:
+        return max(1.0, _env_float("GROK_BREAKER_WINDOW_S", 60.0))
+
+    @property
+    def breaker_cooldown_s(self) -> float:
+        return max(1.0, _env_float("GROK_BREAKER_COOLDOWN_S", 60.0))
+
+    @property
+    def breaker_max_cooldown_s(self) -> float:
+        return max(self.breaker_cooldown_s, _env_float("GROK_BREAKER_MAX_COOLDOWN_S", 300.0))
+
+    # ---------------------------------------------------------------- search
+    @property
+    def search_style(self) -> str:
+        style = os.getenv("GROK_SEARCH_STYLE", "explanatory").strip().lower()
+        return style if style in ("explanatory", "concise") else "explanatory"
+
+    @property
+    def verify_ids(self) -> bool:
+        return _env_bool("GROK_VERIFY_IDS", True)
+
+    @property
+    def verify_urls(self) -> bool:
+        return _env_bool("GROK_VERIFY_URLS", True)
+
+    @property
+    def verify_timeout_s(self) -> float:
+        return max(1.0, _env_float("GROK_VERIFY_TIMEOUT_S", 20.0))
+
+    @property
+    def verify_mailto(self) -> str:
+        return os.getenv("GROK_VERIFY_MAILTO", "").strip()
+
+    @property
+    def planning_tools_enabled(self) -> bool:
+        return _env_bool("GROK_PLANNING_TOOLS", False)
+
+    # ----------------------------------------------------------------- fetch
+    @property
+    def fetch_min_chars(self) -> int:
+        return max(0, _env_int("GROK_FETCH_MIN_CHARS", 2000))
+
+    @property
+    def fetch_max_chars(self) -> int:
+        return max(1000, _env_int("GROK_FETCH_MAX_CHARS", 40000))
+
+    @property
+    def tavily_extract_timeout_s(self) -> float:
+        return max(5.0, _env_float("TAVILY_EXTRACT_TIMEOUT_S", 30.0))
+
+    # ------------------------------------------------------------- endpoints
     @property
     def guda_base_url(self) -> str:
         return os.getenv("GUDA_BASE_URL", self._DEFAULT_GUDA_BASE_URL)
@@ -96,7 +185,7 @@ class Config:
 
     @property
     def tavily_enabled(self) -> bool:
-        return os.getenv("TAVILY_ENABLED", "true").lower() in ("true", "1", "yes")
+        return _env_bool("TAVILY_ENABLED", True)
 
     @property
     def tavily_api_url(self) -> str:
@@ -149,6 +238,7 @@ class Config:
         tmp_log_dir.mkdir(parents=True, exist_ok=True)
         return tmp_log_dir
 
+    # ------------------------------------------------------------------ model
     def _apply_model_suffix(self, model: str) -> str:
         try:
             url = self.grok_api_url
@@ -157,6 +247,15 @@ class Config:
         if "openrouter" in url and ":online" not in model:
             return f"{model}:online"
         return model
+
+    @property
+    def grok_model_source(self) -> str:
+        """Where the effective default model comes from: env, config file or default."""
+        if os.getenv("GROK_MODEL"):
+            return "env"
+        if self._load_config_file().get("model"):
+            return "config"
+        return "default"
 
     @property
     def grok_model(self) -> str:
@@ -202,11 +301,28 @@ class Config:
             "GROK_API_URL": api_url,
             "GROK_API_KEY": api_key_masked,
             "GROK_MODEL": self.grok_model,
+            "GROK_MODEL_SOURCE": self.grok_model_source,
             "GROK_DEBUG": self.debug_enabled,
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
+            "GROK_SEARCH_STYLE": self.search_style,
+            "GROK_MAX_CONCURRENCY": self.max_concurrency,
+            "GROK_RETRY_MAX_ATTEMPTS": self.retry_max_attempts,
+            "GROK_RETRY_BUDGET_S": self.retry_budget_s,
+            "GROK_BREAKER": {
+                "threshold": self.breaker_threshold,
+                "window_s": self.breaker_window_s,
+                "cooldown_s": self.breaker_cooldown_s,
+                "max_cooldown_s": self.breaker_max_cooldown_s,
+            },
+            "GROK_VERIFY_IDS": self.verify_ids,
+            "GROK_VERIFY_URLS": self.verify_urls,
+            "GROK_PLANNING_TOOLS": self.planning_tools_enabled,
+            "GROK_FETCH_MIN_CHARS": self.fetch_min_chars,
+            "GROK_FETCH_MAX_CHARS": self.fetch_max_chars,
             "TAVILY_API_URL": self.tavily_api_url,
             "TAVILY_ENABLED": self.tavily_enabled,
+            "TAVILY_EXTRACT_TIMEOUT_S": self.tavily_extract_timeout_s,
             "TAVILY_API_KEY": self._mask_api_key(self.tavily_api_key) if self.tavily_api_key else "未配置",
             "FIRECRAWL_API_URL": self.firecrawl_api_url,
             "FIRECRAWL_API_KEY": self._mask_api_key(self.firecrawl_api_key) if self.firecrawl_api_key else "未配置",

@@ -93,10 +93,6 @@ async def test_text_only_callers_remain_compatible(provider, monkeypatch):
     monkeypatch.setattr(provider, "_execute_stream_result_with_retry", execute)
     assert await provider.search("query") == "Title: Example\nExtracts: Summary"
     assert execute.call_args.args[1]["tools"] == [{"type": "web_search"}]
-    assert await provider.fetch("https://example.test/a") == "Title: Example\nExtracts: Summary"
-    assert await provider.describe_url("https://example.test/a") == {"url": "https://example.test/a", "title": "Example", "extracts": "Summary"}
-    execute.return_value = GrokResponse("2 1", [citation()])
-    assert await provider.rank_sources("query", "sources", 3) == [2, 1, 3]
     assert await provider._parse_streaming_response(httpx.Response(200, text=sse({"content": "text"}))) == "text"
 
 
@@ -206,4 +202,6 @@ async def test_failed_search_does_not_reuse_previous_sources(configured_server, 
         cached = await call(client, "get_sources", {"session_id": second["session_id"]})
     assert first["sources_count"] == 1
     assert second["sources_count"] == cached["sources_count"] == 0
-    assert second["content"] == ""
+    assert second["content"].startswith("[搜索失败]")
+    assert second["error_type"] == "unknown"
+    assert "upstream failed" in second["error"]

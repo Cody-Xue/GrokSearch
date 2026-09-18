@@ -28,7 +28,13 @@ Claude --MCP--> Grok Search Server
 
 - **Dual Engine**: Grok search + Tavily extraction/mapping, complementary collaboration
 - **OpenAI-compatible interface**, supports any Grok mirror endpoint
-- **Automatic time injection** (detects time-related queries, injects local time context)
+- **Automatic time injection** (local date and time context is prepended to every search)
+- **Read-only tool annotations**: `web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` declare `readOnlyHint`, so Claude Code runs several calls from one turn in parallel instead of one after another
+- **Concurrency cap + per-model circuit breaker**: `GROK_MAX_CONCURRENCY` bounds in-flight Grok requests; repeated 429s or an exhausted account pool open a breaker for that model tier and return a structured error, with half-open probing to recover
+- **Failures are never silent**: in-stream error frames, HTTP 429 and empty responses become `error`/`error_type`/`retry_after_s` fields instead of an empty answer
+- **Citation verification layer**: arXiv IDs, DOIs and cited URLs in the answer are resolved through the arXiv API, Crossref and the live page; misses are listed under `unresolved`
+- **Fetch quality gate and paging**: short Tavily extracts fall back to Firecrawl and the longer result wins; arXiv abstract pages use the arXiv API; `max_chars`/`offset` page through long documents
+- **Output style switch**: `GROK_SEARCH_STYLE=concise` drops term definitions and analogies; both styles carry hard rules to quote numbers verbatim and never merge figures across sources
 - One-click disable Claude Code's built-in WebSearch/WebFetch, force routing to this tool
 - Smart retry (Retry-After header parsing + exponential backoff)
 - Parent process monitoring (auto-detects parent process exit on Windows, prevents zombie processes)
@@ -137,6 +143,21 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_RETRY_MAX_ATTEMPTS` | No | `3` | Max retry attempts |
 | `GROK_RETRY_MULTIPLIER` | No | `1` | Retry backoff multiplier |
 | `GROK_RETRY_MAX_WAIT` | No | `10` | Max retry wait in seconds |
+| `GROK_RETRY_BUDGET_S` | No | `45` | Total retry-wait budget per call (seconds); a Retry-After beyond the budget fails fast. `0` disables |
+| `GROK_MAX_CONCURRENCY` | No | `4` | Maximum in-flight Grok requests |
+| `GROK_BREAKER_THRESHOLD` | No | `3` | 429s within the window that open the breaker |
+| `GROK_BREAKER_WINDOW_S` | No | `60` | Breaker counting window (seconds) |
+| `GROK_BREAKER_COOLDOWN_S` | No | `60` | Initial cooldown (seconds), doubled after a failed probe |
+| `GROK_BREAKER_MAX_COOLDOWN_S` | No | `300` | Cooldown ceiling (seconds) |
+| `GROK_SEARCH_STYLE` | No | `explanatory` | Output style: `explanatory` or `concise` |
+| `GROK_VERIFY_IDS` | No | `true` | Resolve arXiv IDs and DOIs found in the answer |
+| `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of cited URLs |
+| `GROK_VERIFY_TIMEOUT_S` | No | `20` | Overall verification timeout (seconds) |
+| `GROK_VERIFY_MAILTO` | No | empty | Contact e-mail for the verification User-Agent (Crossref polite pool) |
+| `GROK_PLANNING_TOOLS` | No | `false` | Register the six `plan_*` planning tools |
+| `GROK_FETCH_MIN_CHARS` | No | `2000` | Fall back to Firecrawl when the Tavily extract is shorter than this |
+| `GROK_FETCH_MAX_CHARS` | No | `40000` | Default characters returned per `web_fetch` call |
+| `TAVILY_EXTRACT_TIMEOUT_S` | No | `30` | Tavily extract timeout (seconds) |
 
 > **Note**: When `GUDA_API_KEY` is set, all `GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` variables become optional as they are auto-derived from `GUDA_BASE_URL`. Explicitly set variables take higher priority.
 
@@ -166,6 +187,8 @@ Executes AI-driven web search via Grok API. By default it returns only Grok's an
 
 `web_search` does not expand sources in the response; it only returns `sources_count`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
 
+New parameters: `instructions` (per-call requirements for the searcher, e.g. "cover at least 15 distinct domains" or "list arXiv IDs with titles only") and `verify` (default `true`; resolves arXiv IDs, DOIs and cited URLs found in the answer). Besides `content` and `sources_count` the result carries `distinct_domains` and `verification` (`arxiv`/`doi`/`urls` plus an `unresolved` list); on failure it carries `error`/`error_type`/`retry_after_s` and `content` starts with `[搜索失败]`. With `extra_sources > 0` the independent Tavily/Firecrawl hits are appended to the answer as an "Extra sources" section.
+
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Search query |
@@ -173,7 +196,7 @@ Executes AI-driven web search via Grok API. By default it returns only Grok's an
 | `model` | string | No | `null` | Per-request Grok model ID |
 | `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0 disables) |
 
-Automatically detects time-related keywords in queries (e.g., "latest", "today", "recent"), injecting local time context to improve accuracy for time-sensitive searches.
+Local date, time and timezone context is prepended to every search to improve time-sensitive queries.
 
 Return value (structured dict):
 - `session_id`: search session ID
@@ -274,3 +297,17 @@ A: Say "Show grok-search configuration info" in a Claude conversation to automat
 
 [![Star History Chart](https://api.star-history.com/svg?repos=GuDaStudio/GrokSearch&type=date&legend=top-left)](https://www.star-history.com/#GuDaStudio/GrokSearch&type=date&legend=top-left)
 </div>
+
+## Changelog
+
+### v1.10.0 (2026-09-17)
+
+- Read-only tools carry `readOnlyHint`, so Claude Code executes parallel searches and fetches concurrently.
+- Added a concurrency semaphore, a per-model circuit breaker (repeated 429s or an exhausted account pool open it; half-open probing closes it) and a time-based retry budget.
+- In-stream `event: error` frames, HTTP 429 and empty responses become structured error fields instead of a silent empty answer; errors are always logged.
+- `web_search` gained `instructions` and `verify` parameters plus `distinct_domains` and `verification` result fields; `extra_sources` hits are appended to the answer.
+- The system prompt is split into a strategy block and a switchable style block (`GROK_SEARCH_STYLE`); citation-integrity rules were added.
+- `web_fetch` gained a length gate with Firecrawl fallback, `max_chars`/`offset` paging and an arXiv abstract adapter; the Tavily extract timeout is now 30 s.
+- The six `plan_*` tools are registered only when `GROK_PLANNING_TOOLS=true`.
+- `switch_model` warns when `GROK_MODEL` is pinned by the environment; `get_config_info` reports breaker state and the server version.
+- Removed the unused Grok fetch/describe/rank code paths and prompts; `build/` and `*.egg-info` are no longer committed.

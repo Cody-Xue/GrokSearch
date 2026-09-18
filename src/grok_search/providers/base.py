@@ -1,30 +1,4 @@
 from abc import ABC, abstractmethod
-from typing import Dict, List
-
-
-class SearchResult:
-    def __init__(
-        self,
-        title: str,
-        url: str,
-        snippet: str,
-        source: str = "",
-        published_date: str = "",
-    ):
-        self.title = title
-        self.url = url
-        self.snippet = snippet
-        self.source = source
-        self.published_date = published_date
-
-    def to_dict(self) -> Dict[str, str]:
-        return {
-            "title": self.title,
-            "url": self.url,
-            "snippet": self.snippet,
-            "source": self.source,
-            "published_date": self.published_date,
-        }
 
 
 class BaseSearchProvider(ABC):
@@ -33,7 +7,7 @@ class BaseSearchProvider(ABC):
         self.api_key = api_key
 
     @abstractmethod
-    async def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+    async def search(self, query: str, platform: str = "") -> str:
         pass
 
     @abstractmethod
