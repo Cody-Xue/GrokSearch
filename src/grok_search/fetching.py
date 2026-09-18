@@ -13,6 +13,7 @@ import httpx
 
 from .config import config
 from .logger import log_info
+from .verify import arxiv_get
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 _ARXIV_ABS_RE = re.compile(r"^https?://(?:www\.)?arxiv\.org/abs/([0-9]{4}\.[0-9]{4,5}|[a-z\-]+(?:\.[A-Z]{2})?/[0-9]{7})(?:v\d+)?/?(?:[?#].*)?$", re.I)
@@ -72,8 +73,7 @@ async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
 
 async def _fetch_arxiv_abs(arxiv_id: str) -> str | None:
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        response = await client.get(ARXIV_API, params={"id_list": arxiv_id, "max_results": 1})
-        response.raise_for_status()
+        response = await arxiv_get(client, {"id_list": arxiv_id, "max_results": 1})
         root = ET.fromstring(response.text)
     entry = root.find("a:entry", _ATOM)
     if entry is None:

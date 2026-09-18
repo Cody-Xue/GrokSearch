@@ -97,7 +97,28 @@ async def test_arxiv_abs_uses_api_and_skips_extractors(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_arxiv_abs_recovers_from_one_406(monkeypatch):
+    from grok_search import verify
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0)
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return httpx.Response(406, text="Not Acceptable") if calls["n"] == 1 else httpx.Response(200, text=ATOM)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(fetching.httpx, "AsyncClient", lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs))
+    tavily = AsyncMock(return_value="skeleton")
+    monkeypatch.setattr(fetching, "_call_tavily_extract", tavily)
+    out = await fetching.fetch_page("https://arxiv.org/abs/2607.20852")
+    assert out.startswith("[web_fetch] source=arxiv-api") and calls["n"] == 2 and tavily.await_count == 0
+
+
+@pytest.mark.asyncio
 async def test_arxiv_api_failure_falls_back_to_extractors(monkeypatch):
+    from grok_search import verify
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0)
+
     async def handler(request):
         return httpx.Response(503, text="down")
 

@@ -75,3 +75,37 @@ async def test_verify_answer_without_url_checks(monkeypatch):
     assert result["checked"] == {"arxiv": 1, "doi": 0, "urls": 0}
     assert result["arxiv"][0]["title"] == "SWE-Review: Closing the Loop"
     assert result["urls"] == [] and result["unresolved"] == []
+
+
+@pytest.mark.asyncio
+async def test_arxiv_get_retries_once_on_406_and_timeout(monkeypatch):
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0)
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(406, text="Not Acceptable")
+        if calls["n"] == 2:
+            return httpx.Response(200, text=ATOM)
+        if calls["n"] == 3:
+            raise httpx.ConnectTimeout("slow")
+        return httpx.Response(200, text=ATOM)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        found, missing = await verify.lookup_arxiv(["2607.06065"], client)
+        assert list(found) == ["2607.06065"] and calls["n"] == 2
+        found, missing = await verify.lookup_arxiv(["2607.06065"], client)
+        assert list(found) == ["2607.06065"] and calls["n"] == 4
+
+
+@pytest.mark.asyncio
+async def test_arxiv_get_gives_up_after_second_failure(monkeypatch):
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0)
+
+    async def handler(request):
+        return httpx.Response(503, text="down")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            await verify.arxiv_get(client, {"id_list": "2607.06065"})

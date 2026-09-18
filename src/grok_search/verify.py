@@ -19,6 +19,38 @@ import httpx
 ARXIV_API = "https://export.arxiv.org/api/query"
 CROSSREF_API = "https://api.crossref.org/works/"
 
+# The arXiv API is reachable but flaky from some networks (sporadic 406 / connect
+# timeouts between otherwise healthy responses). One retry after the 3-second
+# spacing arXiv asks for turns most of those into successes.
+_ARXIV_RETRY_STATUSES = {406, 408, 429, 500, 502, 503, 504}
+ARXIV_RETRY_DELAY_S = 3.0
+
+
+async def arxiv_get(client: httpx.AsyncClient, params: dict, attempts: int = 2) -> httpx.Response:
+    """GET the arXiv API with one spaced retry on transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            response = await client.get(
+                ARXIV_API,
+                params=params,
+                headers={"Accept": "application/atom+xml, application/xml;q=0.9, */*;q=0.8"},
+            )
+            if response.status_code in _ARXIV_RETRY_STATUSES and attempt + 1 < attempts:
+                last_exc = httpx.HTTPStatusError(f"arXiv API returned {response.status_code}", request=response.request, response=response)
+                await asyncio.sleep(ARXIV_RETRY_DELAY_S)
+                continue
+            response.raise_for_status()
+            return response
+        except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
+            last_exc = e
+            if attempt + 1 < attempts:
+                await asyncio.sleep(ARXIV_RETRY_DELAY_S)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
 _ARXIV_RE = re.compile(r"(?<![\w.])(\d{2})(\d{2})\.(\d{4,5})(?:v\d+)?(?![\w.])")
 _DOI_RE = re.compile(r"\b(10\.\d{4,9}/[^\s\"'<>()\[\]{}]+)")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
@@ -57,8 +89,7 @@ async def lookup_arxiv(ids: list[str], client: httpx.AsyncClient) -> tuple[dict,
     found: dict[str, dict] = {}
     for start in range(0, len(ids), 50):
         chunk = ids[start:start + 50]
-        response = await client.get(ARXIV_API, params={"id_list": ",".join(chunk), "max_results": len(chunk)})
-        response.raise_for_status()
+        response = await arxiv_get(client, {"id_list": ",".join(chunk), "max_results": len(chunk)})
         root = ET.fromstring(response.text)
         for entry in root.findall("a:entry", _ATOM):
             raw_id = (entry.findtext("a:id", default="", namespaces=_ATOM) or "").split("/abs/")[-1]
