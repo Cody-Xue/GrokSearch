@@ -1,7 +1,18 @@
+import asyncio
+import time
+
 import httpx
 import pytest
 
 from grok_search import verify
+
+
+@pytest.fixture(autouse=True)
+def _fresh_arxiv_state(monkeypatch):
+    monkeypatch.setattr(verify, "ARXIV_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0.0)
+    verify._ARXIV_CACHE.clear()
+    verify._arxiv_gate.update(loop=None, lock=None, last_start=0.0)
 
 ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -95,6 +106,7 @@ async def test_arxiv_get_retries_once_on_406_and_timeout(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         found, missing = await verify.lookup_arxiv(["2607.06065"], client)
         assert list(found) == ["2607.06065"] and calls["n"] == 2
+        verify._ARXIV_CACHE.clear()  # force a second network round: timeout then success
         found, missing = await verify.lookup_arxiv(["2607.06065"], client)
         assert list(found) == ["2607.06065"] and calls["n"] == 4
 
@@ -109,3 +121,46 @@ async def test_arxiv_get_gives_up_after_second_failure(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(httpx.HTTPStatusError):
             await verify.arxiv_get(client, {"id_list": "2607.06065"})
+
+
+@pytest.mark.asyncio
+async def test_arxiv_calls_are_spaced_process_wide(monkeypatch):
+    monkeypatch.setattr(verify, "ARXIV_MIN_INTERVAL_S", 0.15)
+    starts = []
+
+    async def handler(request):
+        starts.append(time.monotonic())
+        return httpx.Response(200, text=ATOM)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await asyncio.gather(*(verify.arxiv_get(client, {"id_list": f"26{i:02d}.00001"}) for i in range(3)))
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert len(starts) == 3 and all(g >= 0.14 for g in gaps), gaps
+
+
+@pytest.mark.asyncio
+async def test_arxiv_lookup_is_cached(monkeypatch):
+    calls = {"n": 0}
+
+    async def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, text=ATOM)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        first, _ = await verify.lookup_arxiv(["2607.06065"], client)
+        second, missing = await verify.lookup_arxiv(["2607.06065"], client)
+    assert first == second and missing == [] and calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_verify_timeout_marks_pending_lookups(monkeypatch):
+    async def handler(request):
+        await asyncio.sleep(5)
+        return httpx.Response(200, text=ATOM)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(verify.httpx, "AsyncClient", lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs))
+    result = await verify.verify_answer("see 2607.06065 and 10.1038/x", [{"url": "https://example.test/slow"}], check_urls=True, timeout_s=0.2)
+    assert result["timed_out"] is True
+    assert {(u["kind"], u["value"], u["reason"]) for u in result["unresolved"]} == {
+        ("arxiv", "2607.06065", "timed out"), ("doi", "10.1038/x", "timed out"), ("url", "https://example.test/slow", "timed out")}

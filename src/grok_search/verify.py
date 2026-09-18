@@ -10,6 +10,7 @@ with what the answer claims and treat `unresolved` entries as suspect.
 import asyncio
 import html
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 from urllib.parse import unquote, urlparse
@@ -25,12 +26,37 @@ CROSSREF_API = "https://api.crossref.org/works/"
 _ARXIV_RETRY_STATUSES = {406, 408, 429, 500, 502, 503, 504}
 ARXIV_RETRY_DELAY_S = 3.0
 
+# arXiv's terms ask for at least 3 seconds between API calls from one client.
+# Concurrent searches each verify their own answer, so every arXiv call in
+# this process passes through one gate that spaces request starts; a burst of
+# parallel lookups otherwise earns "Rate exceeded." and long stalls for all.
+ARXIV_MIN_INTERVAL_S = 3.0
+_arxiv_gate: dict = {"loop": None, "lock": None, "last_start": 0.0}
+
+# Resolved entries are cached for an hour: a fetch and a verification of the
+# same paper, or repeated searches on one topic, should not re-query arXiv.
+ARXIV_CACHE_TTL_S = 3600.0
+_ARXIV_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+async def _arxiv_slot() -> None:
+    loop = asyncio.get_running_loop()
+    if _arxiv_gate["loop"] is not loop:
+        _arxiv_gate["loop"] = loop
+        _arxiv_gate["lock"] = asyncio.Lock()
+    async with _arxiv_gate["lock"]:
+        wait = _arxiv_gate["last_start"] + ARXIV_MIN_INTERVAL_S - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _arxiv_gate["last_start"] = time.monotonic()
+
 
 async def arxiv_get(client: httpx.AsyncClient, params: dict, attempts: int = 2) -> httpx.Response:
-    """GET the arXiv API with one spaced retry on transient failures."""
+    """GET the arXiv API through the spacing gate, with one spaced retry on transient failures."""
     last_exc: Exception | None = None
     for attempt in range(max(1, attempts)):
         try:
+            await _arxiv_slot()
             response = await client.get(
                 ARXIV_API,
                 params=params,
@@ -87,8 +113,16 @@ def _arxiv_id_from_url(url: str) -> Optional[str]:
 
 async def lookup_arxiv(ids: list[str], client: httpx.AsyncClient) -> tuple[dict, list[str]]:
     found: dict[str, dict] = {}
-    for start in range(0, len(ids), 50):
-        chunk = ids[start:start + 50]
+    now = time.monotonic()
+    pending: list[str] = []
+    for idv in ids:
+        cached = _ARXIV_CACHE.get(idv)
+        if cached and now - cached[0] < ARXIV_CACHE_TTL_S:
+            found[idv] = cached[1]
+        else:
+            pending.append(idv)
+    for start in range(0, len(pending), 50):
+        chunk = pending[start:start + 50]
         response = await arxiv_get(client, {"id_list": ",".join(chunk), "max_results": len(chunk)})
         root = ET.fromstring(response.text)
         for entry in root.findall("a:entry", _ATOM):
@@ -103,6 +137,7 @@ async def lookup_arxiv(ids: list[str], client: httpx.AsyncClient) -> tuple[dict,
                 "published": (entry.findtext("a:published", default="", namespaces=_ATOM) or "")[:10],
                 "authors": [a.findtext("a:name", default="", namespaces=_ATOM) for a in entry.findall("a:author", _ATOM)][:3],
             }
+            _ARXIV_CACHE[base] = (time.monotonic(), found[base])
     unresolved = [i for i in ids if i not in found]
     return found, unresolved
 
@@ -146,7 +181,7 @@ async def verify_answer(
     sources: list[dict] | None,
     *,
     check_urls: bool = True,
-    timeout_s: float = 20.0,
+    timeout_s: float = 30.0,
     mailto: str = "",
     max_urls: int = 30,
     max_dois: int = 30,
@@ -179,7 +214,8 @@ async def verify_answer(
     user_agent = "grok-search-verify/1.10" + (f" (mailto:{mailto})" if mailto else "")
     sem = asyncio.Semaphore(5)
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), follow_redirects=True, headers={"User-Agent": user_agent}) as client:
+    # arXiv answers slowly (15 s and more) once it has throttled a client, so reads get more room than connects.
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=None), follow_redirects=True, headers={"User-Agent": user_agent}) as client:
 
         async def run_arxiv():
             if not arxiv_ids:
@@ -220,6 +256,15 @@ async def verify_answer(
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
         except asyncio.TimeoutError:
             result["timed_out"] = True
+            # Whatever the cancelled lookups had not settled is reported explicitly rather than dropped.
+            seen = {(u["kind"], u["value"]) for u in result["unresolved"]}
+            done_arxiv = {x["id"] for x in result["arxiv"]}
+            done_doi = {x["doi"] for x in result["doi"]}
+            done_url = {x["url"] for x in result["urls"]}
+            for kind, values, done in (("arxiv", arxiv_ids, done_arxiv), ("doi", dois, done_doi), ("url", urls if check_urls else [], done_url)):
+                for value in values:
+                    if value not in done and (kind, value) not in seen:
+                        result["unresolved"].append({"kind": kind, "value": value, "reason": "timed out"})
 
     result["arxiv"].sort(key=lambda x: x["id"])
     result["doi"].sort(key=lambda x: x["doi"])

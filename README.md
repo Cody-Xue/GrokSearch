@@ -174,7 +174,7 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_SEARCH_STYLE` | ❌ | `explanatory` | 输出风格：`explanatory` 或 `concise` |
 | `GROK_VERIFY_IDS` | ❌ | `true` | 回答里的 arXiv 号与 DOI 是否自动核验 |
 | `GROK_VERIFY_URLS` | ❌ | `true` | 被引用的 URL 是否做可达性与标题核验 |
-| `GROK_VERIFY_TIMEOUT_S` | ❌ | `20` | 核验层总超时（秒） |
+| `GROK_VERIFY_TIMEOUT_S` | ❌ | `30` | 核验层总超时（秒）；超时未完成的条目以 `timed out` 列入 `unresolved`。所有 arXiv API 调用共用 3 秒间隔的闸门并缓存一小时 |
 | `GROK_VERIFY_MAILTO` | ❌ | 空 | 核验请求的 User-Agent 联系邮箱（Crossref 礼貌池） |
 | `GROK_PLANNING_TOOLS` | ❌ | `false` | 是否注册 `plan_*` 六个搜索规划工具 |
 | `GROK_FETCH_MIN_CHARS` | ❌ | `2000` | Tavily 抓取结果低于此长度时回退 Firecrawl |

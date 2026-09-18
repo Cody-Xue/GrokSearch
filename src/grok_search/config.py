@@ -129,7 +129,7 @@ class Config:
 
     @property
     def verify_timeout_s(self) -> float:
-        return max(1.0, _env_float("GROK_VERIFY_TIMEOUT_S", 20.0))
+        return max(1.0, _env_float("GROK_VERIFY_TIMEOUT_S", 30.0))
 
     @property
     def verify_mailto(self) -> str:

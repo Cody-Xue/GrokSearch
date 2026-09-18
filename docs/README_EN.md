@@ -152,7 +152,7 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_SEARCH_STYLE` | No | `explanatory` | Output style: `explanatory` or `concise` |
 | `GROK_VERIFY_IDS` | No | `true` | Resolve arXiv IDs and DOIs found in the answer |
 | `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of cited URLs |
-| `GROK_VERIFY_TIMEOUT_S` | No | `20` | Overall verification timeout (seconds) |
+| `GROK_VERIFY_TIMEOUT_S` | No | `30` | Overall verification timeout (seconds); lookups still pending at the deadline are listed under `unresolved` as `timed out`. All arXiv API calls share a 3-second spacing gate and a one-hour cache |
 | `GROK_VERIFY_MAILTO` | No | empty | Contact e-mail for the verification User-Agent (Crossref polite pool) |
 | `GROK_PLANNING_TOOLS` | No | `false` | Register the six `plan_*` planning tools |
 | `GROK_FETCH_MIN_CHARS` | No | `2000` | Fall back to Firecrawl when the Tavily extract is shorter than this |

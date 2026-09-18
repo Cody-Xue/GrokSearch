@@ -5,7 +5,15 @@ import httpx
 import pytest
 from fastmcp import Client
 
-from grok_search import fetching, server
+from grok_search import fetching, server, verify
+
+
+@pytest.fixture(autouse=True)
+def _fast_arxiv(monkeypatch):
+    monkeypatch.setattr(verify, "ARXIV_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0.0)
+    verify._ARXIV_CACHE.clear()
+    verify._arxiv_gate.update(loop=None, lock=None, last_start=0.0)
 
 ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom" xmlns:arxiv="http://arxiv.org/schemas/atom">
