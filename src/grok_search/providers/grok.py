@@ -238,7 +238,7 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "user", "content": user_content},
             ],
             "stream": True,
-            "tools": [{"type": "web_search"}],
+            "tools": [{"type": "web_search"}, {"type": "x_search"}],
         }
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)

@@ -92,7 +92,7 @@ async def test_text_only_callers_remain_compatible(provider, monkeypatch):
     execute = AsyncMock(return_value=GrokResponse("Title: Example\nExtracts: Summary", [citation()]))
     monkeypatch.setattr(provider, "_execute_stream_result_with_retry", execute)
     assert await provider.search("query") == "Title: Example\nExtracts: Summary"
-    assert execute.call_args.args[1]["tools"] == [{"type": "web_search"}]
+    assert execute.call_args.args[1]["tools"] == [{"type": "web_search"}, {"type": "x_search"}]
     assert await provider._parse_streaming_response(httpx.Response(200, text=sse({"content": "text"}))) == "text"
 
 
