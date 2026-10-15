@@ -12,21 +12,44 @@ from pydantic import Field
 
 # 尝试使用绝对导入（支持 mcp run）
 try:
-    from grok_search.providers.grok import GrokResponse, GrokSearchProvider
-    from grok_search.logger import log_info
+    from grok_search.providers.grok import GrokResponse, GrokSearchProvider, GrokUpstreamError
+    from grok_search.logger import log_info, log_error
     from grok_search.config import config
     from grok_search.sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, split_answer_and_sources
     from grok_search.planning import engine as planning_engine, _split_csv
+    from grok_search.throttle import breaker, BreakerOpen
+    from grok_search.verify import verify_answer
+    from grok_search.fetching import fetch_page
 except ImportError:
-    from .providers.grok import GrokResponse, GrokSearchProvider
-    from .logger import log_info
+    from .providers.grok import GrokResponse, GrokSearchProvider, GrokUpstreamError
+    from .logger import log_info, log_error
     from .config import config
     from .sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, split_answer_and_sources
     from .planning import engine as planning_engine, _split_csv
+    from .throttle import breaker, BreakerOpen
+    from .verify import verify_answer
+    from .fetching import fetch_page
 
 import asyncio
+import os
+from urllib.parse import urlparse
 
-mcp = FastMCP("grok-search")
+
+def _package_version() -> str:
+    try:
+        from importlib.metadata import version as _version
+        return _version("grok-search")
+    except Exception:
+        return "1.10.0"
+
+
+mcp = FastMCP("grok-search", version=_package_version())
+
+# Claude Code runs MCP tools concurrently only when they declare readOnlyHint;
+# every tool that does not mutate anything is annotated so a parallel fan-out
+# of searches is executed in parallel instead of one after another.
+_READ_ONLY_WEB = {"readOnlyHint": True, "openWorldHint": True}
+_READ_ONLY_LOCAL = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
 
 _SOURCES_CACHE = SourcesCache(max_size=256)
 _AVAILABLE_MODELS_CACHE: dict[tuple[str, str], list[str]] = {}
@@ -111,25 +134,59 @@ def _extra_results_to_sources(
     return sources
 
 
+def _distinct_domains(sources: list[dict] | None) -> int:
+    hosts: set[str] = set()
+    for item in sources or []:
+        url = (item or {}).get("url")
+        if not isinstance(url, str):
+            continue
+        host = urlparse(url).netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if host:
+            hosts.add(host)
+    return len(hosts)
+
+
+def _format_extra_section(extra: list[dict]) -> str:
+    lines = ["## Extra sources (independent search engines)"]
+    for i, item in enumerate(extra, 1):
+        url = item.get("url", "")
+        title = (item.get("title") or url).strip()
+        line = f"{i}. [{title}]({url}) [{item.get('provider', '')}]"
+        desc = (item.get("description") or "").strip().replace("\n", " ")
+        if desc:
+            line += f"\n   {desc[:300]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 @mcp.tool(
     name="web_search",
     output_schema=None,
+    annotations=_READ_ONLY_WEB,
     description="""
-    Before using this tool, please use the plan_intent tool to plan the search carefully.
-    Performs a deep web search based on the given query and returns Grok's answer directly.
+    Performs a deep web search through Grok's live web search and returns the answer directly.
+    Read-only: several searches may be issued in parallel.
 
-    This tool extracts sources if provided by upstream, caches them, and returns:
-    - session_id: string (When you feel confused or curious about the main content, use this field to invoke the get_sources tool to obtain the corresponding list of information sources)
-    - content: string (original answer when native citation offsets are present)
-    - sources_count: int
+    Returns:
+    - session_id: pass to get_sources to list every cited source with citation offsets
+    - content: the answer in Markdown with inline citations; on failure it starts with "[搜索失败]"
+    - sources_count / distinct_domains: how many sources and how many distinct sites were cited
+    - verification (when enabled): arXiv IDs, DOIs and cited URLs found in the answer, resolved
+      against the arXiv API, Crossref and the live page; treat entries in `unresolved` as suspect
+    - error / error_type / retry_after_s (failures only): rate_limit, circuit_open, empty_response,
+      http_<status> or unknown; wait retry_after_s seconds or switch model before calling again
     """,
-    meta={"version": "2.0.0", "author": "guda.studio"},
+    meta={"version": "2.1.0", "author": "guda.studio"},
 )
 async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
     platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
     model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided."] = "",
-    extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl. Set 0 to disable. Default 0."] = 0,
+    extra_sources: Annotated[int, "Number of additional reference results from Tavily/Firecrawl, appended to the answer as an 'Extra sources' section. Set 0 to disable. Default 0."] = 0,
+    instructions: Annotated[str, "Optional per-call instructions for the searcher, e.g. 'list at least 15 distinct sources' or 'return arXiv IDs with titles, no analogies'."] = "",
+    verify: Annotated[bool, "Resolve arXiv IDs, DOIs and cited URLs found in the answer and attach a `verification` field. Default true (also gated by GROK_VERIFY_IDS)."] = True,
 ) -> dict:
     session_id = new_session_id()
     try:
@@ -137,14 +194,14 @@ async def web_search(
         api_key = config.grok_api_key
     except ValueError as e:
         await _SOURCES_CACHE.set(session_id, [])
-        return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0}
+        return {"session_id": session_id, "content": f"配置错误: {str(e)}", "sources_count": 0, "error": str(e), "error_type": "config"}
 
     effective_model = config.grok_model
     if model:
         available = await _get_available_models_cached(api_url, api_key)
         if available and model not in available:
             await _SOURCES_CACHE.set(session_id, [])
-            return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0}
+            return {"session_id": session_id, "content": f"无效模型: {model}", "sources_count": 0, "error": f"无效模型: {model}", "error_type": "invalid_model"}
         effective_model = model
 
     grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
@@ -163,12 +220,25 @@ async def web_search(
         elif has_tavily:
             tavily_count = extra_sources
 
+    grok_error: dict = {}
+
     # 并行执行搜索任务
     async def _safe_grok() -> GrokResponse:
         try:
-            return await grok_provider.search_with_sources(query, platform)
-        except Exception:
-            return GrokResponse()
+            kwargs = {"instructions": instructions} if instructions else {}
+            return await grok_provider.search_with_sources(query, platform, **kwargs)
+        except BreakerOpen as e:
+            grok_error.update(error=str(e), error_type="circuit_open", retry_after_s=round(e.retry_after_s, 1))
+        except GrokUpstreamError as e:
+            grok_error.update(error=str(e), error_type=e.error_type, exhausted=e.exhausted)
+            if e.retry_after is not None:
+                grok_error["retry_after_s"] = round(float(e.retry_after), 1)
+            if e.status is not None:
+                grok_error["status"] = e.status
+        except Exception as e:
+            grok_error.update(error=str(e) or type(e).__name__, error_type="unknown")
+        await log_error(None, f"web_search upstream failed (model={effective_model}): {grok_error}")
+        return GrokResponse()
 
     async def _safe_tavily() -> list[dict] | None:
         try:
@@ -211,11 +281,57 @@ async def web_search(
     all_sources = merge_sources(native_sources, grok_sources, extra)
 
     await _SOURCES_CACHE.set(session_id, all_sources)
-    return {"session_id": session_id, "content": answer, "sources_count": len(all_sources)}
+    domains = _distinct_domains(all_sources)
+
+    if not answer:
+        if grok_error:
+            detail = f"上游搜索失败: {grok_error['error']}"
+        elif all_sources:
+            detail = "上游只返回了来源列表，无正文内容（可用 get_sources 查看来源）"
+        else:
+            detail = "上游返回空内容（未检测到明确错误）"
+        hint = ""
+        if grok_error.get("retry_after_s") is not None:
+            hint += f"，建议 {grok_error['retry_after_s']:.0f} 秒后重试"
+        if grok_error.get("exhausted"):
+            hint += "，该档位账号池已耗尽，可用 model 参数临时换用其他档位"
+        result = {
+            "session_id": session_id,
+            "content": f"[搜索失败] {detail}。模型: {effective_model}{hint}。",
+            "sources_count": len(all_sources),
+            "distinct_domains": domains,
+            "error": detail,
+            "error_type": grok_error.get("error_type", "empty_response"),
+        }
+        for field in ("retry_after_s", "status", "exhausted"):
+            if field in grok_error:
+                result[field] = grok_error[field]
+        return result
+
+    if extra:
+        # Appending after the answer keeps native citation offsets valid.
+        answer = answer.rstrip() + "\n\n" + _format_extra_section(extra)
+
+    result = {"session_id": session_id, "content": answer, "sources_count": len(all_sources), "distinct_domains": domains}
+
+    if verify and config.verify_ids:
+        try:
+            result["verification"] = await verify_answer(
+                answer,
+                all_sources,
+                check_urls=config.verify_urls,
+                timeout_s=config.verify_timeout_s,
+                mailto=config.verify_mailto,
+            )
+        except Exception as e:
+            result["verification"] = {"error": f"{type(e).__name__}: {e}"}
+
+    return result
 
 
 @mcp.tool(
     name="get_sources",
+    annotations=_READ_ONLY_LOCAL,
     description="""
     When you feel confused or curious about the search response content, use the session_id returned by web_search to invoke the this tool to obtain the corresponding list of information sources.
     Retrieve all cached sources for a previous web_search call.
@@ -237,28 +353,6 @@ async def get_sources(
             "error": "session_id_not_found_or_expired",
         }
     return {"session_id": session_id, "sources": sources, "sources_count": len(sources)}
-
-
-async def _call_tavily_extract(url: str) -> str | None:
-    import httpx
-    api_url = config.tavily_api_url
-    api_key = config.tavily_api_key
-    if not api_key:
-        return None
-    endpoint = f"{api_url.rstrip('/')}/extract"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"urls": [url], "format": "markdown"}
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(endpoint, headers=headers, json=body)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("results") and len(data["results"]) > 0:
-                content = data["results"][0].get("raw_content", "")
-                return content if content and content.strip() else None
-            return None
-    except Exception:
-        return None
 
 
 async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict] | None:
@@ -311,76 +405,34 @@ async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict] | No
         return None
 
 
-async def _call_firecrawl_scrape(url: str, ctx=None) -> str | None:
-    import httpx
-    api_url = config.firecrawl_api_url
-    api_key = config.firecrawl_api_key
-    if not api_key:
-        return None
-    endpoint = f"{api_url.rstrip('/')}/scrape"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    max_retries = config.retry_max_attempts
-    for attempt in range(max_retries):
-        body = {
-            "url": url,
-            "formats": ["markdown"],
-            "timeout": 60000,
-            "waitFor": (attempt + 1) * 1500,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                response = await client.post(endpoint, headers=headers, json=body)
-                response.raise_for_status()
-                data = response.json()
-                markdown = data.get("data", {}).get("markdown", "")
-                if markdown and markdown.strip():
-                    return markdown
-                await log_info(ctx, f"Firecrawl: markdown为空, 重试 {attempt + 1}/{max_retries}", config.debug_enabled)
-        except Exception as e:
-            await log_info(ctx, f"Firecrawl error: {e}", config.debug_enabled)
-            return None
-    return None
-
-
 @mcp.tool(
     name="web_fetch",
     output_schema=None,
+    annotations=_READ_ONLY_WEB,
     description="""
-    Fetches and extracts complete content from a URL, returning it as a structured Markdown document.
+    Fetches a URL and returns its content as Markdown. Read-only: several fetches may run in parallel.
 
-    **Key Features:**
-        - **Full Content Extraction:** Retrieves and parses all meaningful content (text, images, links, tables, code blocks).
-        - **Markdown Conversion:** Converts HTML structure to well-formatted Markdown with preserved hierarchy.
-        - **Content Fidelity:** Maintains 100% content fidelity without summarization or modification.
+    Backends: arXiv abstract pages use the arXiv API (complete metadata and abstract); other pages
+    use Tavily Extract, falling back to Firecrawl when the extract is missing or too short.
+
+    The first line is a metadata header:
+    `[web_fetch] source=<backend> total_chars=N offset=O returned=R truncated=true|false [next_offset=X]`
+    Long pages are paged: pass `offset=next_offset` to continue, or raise `max_chars`.
 
     **Edge Cases & Best Practices:**
         - Ensure URL is complete and accessible (not behind authentication or paywalls).
         - May not capture dynamically loaded content requiring JavaScript execution.
-        - Large pages may take longer to process; consider timeout implications.
     """,
-    meta={"version": "1.3.0", "author": "guda.studio"},
+    meta={"version": "1.4.0", "author": "guda.studio"},
 )
 async def web_fetch(
     url: Annotated[str, "Valid HTTP/HTTPS web address pointing to the target page. Must be complete and accessible."],
-    ctx: Context = None
+    max_chars: Annotated[int, Field(description="Maximum characters to return in this call. 0 uses GROK_FETCH_MAX_CHARS (default 40000).", ge=0)] = 0,
+    offset: Annotated[int, Field(description="Character offset to start from; use next_offset from a previous call to page through a long page.", ge=0)] = 0,
+    ctx: Context = None,
 ) -> str:
     await log_info(ctx, f"Begin Fetch: {url}", config.debug_enabled)
-
-    result = await _call_tavily_extract(url)
-    if result:
-        await log_info(ctx, "Fetch Finished (Tavily)!", config.debug_enabled)
-        return result
-
-    await log_info(ctx, "Tavily unavailable or failed, trying Firecrawl...", config.debug_enabled)
-    result = await _call_firecrawl_scrape(url, ctx)
-    if result:
-        await log_info(ctx, "Fetch Finished (Firecrawl)!", config.debug_enabled)
-        return result
-
-    await log_info(ctx, "Fetch Failed!", config.debug_enabled)
-    if not config.tavily_api_key and not config.firecrawl_api_key:
-        return "配置错误: TAVILY_API_KEY 和 FIRECRAWL_API_KEY 均未配置"
-    return "提取失败: 所有提取服务均未能获取内容"
+    return await fetch_page(url, max_chars=max_chars, offset=offset, ctx=ctx)
 
 
 async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 1,
@@ -416,6 +468,7 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
 
 @mcp.tool(
     name="web_map",
+    annotations=_READ_ONLY_WEB,
     description="""
     Maps a website's structure by traversing it like a graph, discovering URLs and generating a comprehensive site map.
 
@@ -446,11 +499,13 @@ async def web_map(
 @mcp.tool(
     name="get_config_info",
     output_schema=None,
+    annotations=_READ_ONLY_WEB,
     description="""
-    Returns current Grok Search MCP server configuration and tests API connectivity.
+    Returns current Grok Search MCP server configuration, circuit-breaker state, and tests API connectivity.
 
     **Key Features:**
         - **Configuration Check:** Verifies environment variables and current settings.
+        - **Breaker State:** Shows which model tiers are currently cooling down after rate limits.
         - **Connection Test:** Sends request to /models endpoint to validate API access.
         - **Model Discovery:** Lists all available models from the API.
 
@@ -459,13 +514,15 @@ async def web_map(
         - API keys are automatically masked for security in the response.
         - Connection test timeout is 10 seconds; network issues may cause delays.
     """,
-    meta={"version": "1.3.0", "author": "guda.studio"},
+    meta={"version": "1.4.0", "author": "guda.studio"},
 )
 async def get_config_info() -> str:
     import json
     import httpx
 
     config_info = config.get_config_info()
+    config_info["server_version"] = _package_version()
+    config_info["breaker"] = breaker.snapshot()
 
     # 添加连接测试
     test_result = {
@@ -478,10 +535,8 @@ async def get_config_info() -> str:
         api_url = config.grok_api_url
         api_key = config.grok_api_key
 
-        # 构建 /models 端点 URL
         models_url = f"{api_url.rstrip('/')}/models"
 
-        # 发送测试请求
         import time
         start_time = time.time()
 
@@ -494,21 +549,19 @@ async def get_config_info() -> str:
                 }
             )
 
-            response_time = (time.time() - start_time) * 1000  # 转换为毫秒
+            response_time = (time.time() - start_time) * 1000
 
             if response.status_code == 200:
                 test_result["status"] = "✅ 连接成功"
                 test_result["message"] = f"成功获取模型列表 (HTTP {response.status_code})"
                 test_result["response_time_ms"] = round(response_time, 2)
 
-                # 尝试解析返回的模型列表
                 try:
                     models_data = response.json()
                     if "data" in models_data and isinstance(models_data["data"], list):
                         model_count = len(models_data["data"])
                         test_result["message"] += f"，共 {model_count} 个模型"
 
-                        # 提取所有模型的 ID/名称
                         model_names = []
                         for model in models_data["data"]:
                             if isinstance(model, dict) and "id" in model:
@@ -516,7 +569,7 @@ async def get_config_info() -> str:
 
                         if model_names:
                             test_result["available_models"] = model_names
-                except:
+                except Exception:
                     pass
             else:
                 test_result["status"] = "⚠️ 连接异常"
@@ -545,19 +598,20 @@ async def get_config_info() -> str:
     name="switch_model",
     output_schema=None,
     description="""
-    Switches the default Grok model used for search and fetch operations, persisting the setting.
+    Switches the default Grok model used for search operations, persisting the setting.
 
     **Key Features:**
-        - **Model Selection:** Change the AI model for web search and content fetching.
+        - **Model Selection:** Change the AI model for web search.
         - **Persistent Storage:** Model preference saved to ~/.config/grok-search/config.json.
-        - **Immediate Effect:** New model used for all subsequent operations.
+        - **Immediate Effect:** New model used for all subsequent operations in this process.
 
     **Edge Cases & Best Practices:**
         - Use get_config_info to verify available models before switching.
         - Invalid model IDs may cause API errors in subsequent requests.
-        - Model changes persist across sessions until explicitly changed again.
+        - When the GROK_MODEL environment variable is set it wins again after a restart;
+          the response carries a warning in that case.
     """,
-    meta={"version": "1.3.0", "author": "guda.studio"},
+    meta={"version": "1.4.0", "author": "guda.studio"},
 )
 async def switch_model(
     model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-2-latest', 'grok-vision-beta')."]
@@ -576,6 +630,13 @@ async def switch_model(
             "message": f"模型已从 {previous_model} 切换到 {current_model}",
             "config_file": str(config.config_file)
         }
+        env_model = os.getenv("GROK_MODEL")
+        if env_model:
+            result["warning"] = (
+                f"环境变量 GROK_MODEL={env_model} 已设置，它的优先级高于配置文件："
+                f"本次切换只在当前进程有效，服务器重启后会恢复为 {env_model}。"
+                f"要永久切换，请修改 MCP 配置里的 GROK_MODEL。"
+            )
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -662,192 +723,193 @@ async def toggle_builtin_tools(
     }, ensure_ascii=False, indent=2)
 
 
-@mcp.tool(
-    name="plan_intent",
-    output_schema=None,
-    description="""
-    Phase 1 of search planning: Analyze user intent. Call this FIRST to create a session.
-    Returns session_id for subsequent phases. Required flow:
-    plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution
+def register_planning_tools(app: FastMCP) -> None:
+    """Six bookkeeping tools that record a client's search plan. Opt-in via GROK_PLANNING_TOOLS=true."""
 
-    Required phases depend on complexity: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.
-    """,
-)
-async def plan_intent(
-    thought: Annotated[str, "Reasoning for this phase"],
-    core_question: Annotated[str, "Distilled core question in one sentence"],
-    query_type: Annotated[str, "factual | comparative | exploratory | analytical"],
-    time_sensitivity: Annotated[str, "realtime | recent | historical | irrelevant"],
-    session_id: Annotated[str, "Empty for new session, or existing ID to revise"] = "",
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    domain: Annotated[str, "Specific domain if identifiable"] = "",
-    premise_valid: Annotated[Optional[bool], "False if the question contains a flawed assumption"] = None,
-    ambiguities: Annotated[str, "Comma-separated unresolved ambiguities"] = "",
-    unverified_terms: Annotated[str, "Comma-separated external terms to verify"] = "",
-    is_revision: Annotated[bool, "True to overwrite existing intent"] = False,
-) -> str:
-    import json
-    data = {"core_question": core_question, "query_type": query_type, "time_sensitivity": time_sensitivity}
-    if domain:
-        data["domain"] = domain
-    if premise_valid is not None:
-        data["premise_valid"] = premise_valid
-    if ambiguities:
-        data["ambiguities"] = _split_csv(ambiguities)
-    if unverified_terms:
-        data["unverified_terms"] = _split_csv(unverified_terms)
-    return json.dumps(planning_engine.process_phase(
-        phase="intent_analysis", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=data,
-    ), ensure_ascii=False, indent=2)
+    @app.tool(
+        name="plan_intent",
+        output_schema=None,
+        description="""
+        Phase 1 of search planning: Analyze user intent. Call this FIRST to create a session.
+        Returns session_id for subsequent phases. Required flow:
+        plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution
+
+        Required phases depend on complexity: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.
+        """,
+    )
+    async def plan_intent(
+        thought: Annotated[str, "Reasoning for this phase"],
+        core_question: Annotated[str, "Distilled core question in one sentence"],
+        query_type: Annotated[str, "factual | comparative | exploratory | analytical"],
+        time_sensitivity: Annotated[str, "realtime | recent | historical | irrelevant"],
+        session_id: Annotated[str, "Empty for new session, or existing ID to revise"] = "",
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        domain: Annotated[str, "Specific domain if identifiable"] = "",
+        premise_valid: Annotated[Optional[bool], "False if the question contains a flawed assumption"] = None,
+        ambiguities: Annotated[str, "Comma-separated unresolved ambiguities"] = "",
+        unverified_terms: Annotated[str, "Comma-separated external terms to verify"] = "",
+        is_revision: Annotated[bool, "True to overwrite existing intent"] = False,
+    ) -> str:
+        import json
+        data = {"core_question": core_question, "query_type": query_type, "time_sensitivity": time_sensitivity}
+        if domain:
+            data["domain"] = domain
+        if premise_valid is not None:
+            data["premise_valid"] = premise_valid
+        if ambiguities:
+            data["ambiguities"] = _split_csv(ambiguities)
+        if unverified_terms:
+            data["unverified_terms"] = _split_csv(unverified_terms)
+        return json.dumps(planning_engine.process_phase(
+            phase="intent_analysis", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence, phase_data=data,
+        ), ensure_ascii=False, indent=2)
+
+    @app.tool(
+        name="plan_complexity",
+        output_schema=None,
+        description="Phase 2: Assess search complexity (1-3). Controls required phases: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.",
+    )
+    async def plan_complexity(
+        session_id: Annotated[str, "Session ID from plan_intent"],
+        thought: Annotated[str, "Reasoning for complexity assessment"],
+        level: Annotated[int, "Complexity 1-3"],
+        estimated_sub_queries: Annotated[int, "Expected number of sub-queries"],
+        estimated_tool_calls: Annotated[int, "Expected total tool calls"],
+        justification: Annotated[str, "Why this complexity level"],
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        is_revision: Annotated[bool, "True to overwrite"] = False,
+    ) -> str:
+        import json
+        if not planning_engine.get_session(session_id):
+            return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
+        return json.dumps(planning_engine.process_phase(
+            phase="complexity_assessment", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence,
+            phase_data={"level": level, "estimated_sub_queries": estimated_sub_queries,
+                         "estimated_tool_calls": estimated_tool_calls, "justification": justification},
+        ), ensure_ascii=False, indent=2)
+
+    @app.tool(
+        name="plan_sub_query",
+        output_schema=None,
+        description="Phase 3: Add one sub-query. Call once per sub-query; data accumulates across calls. Set is_revision=true to replace all.",
+    )
+    async def plan_sub_query(
+        session_id: Annotated[str, "Session ID from plan_intent"],
+        thought: Annotated[str, "Reasoning for this sub-query"],
+        id: Annotated[str, "Unique ID (e.g., 'sq1')"],
+        goal: Annotated[str, "Sub-query goal"],
+        expected_output: Annotated[str, "What success looks like"],
+        boundary: Annotated[str, "What this excludes — mutual exclusion with siblings"],
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        depends_on: Annotated[str, "Comma-separated prerequisite IDs"] = "",
+        tool_hint: Annotated[str, "web_search | web_fetch | web_map"] = "",
+        is_revision: Annotated[bool, "True to replace all sub-queries"] = False,
+    ) -> str:
+        import json
+        if not planning_engine.get_session(session_id):
+            return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
+        item = {"id": id, "goal": goal, "expected_output": expected_output, "boundary": boundary}
+        if depends_on:
+            item["depends_on"] = _split_csv(depends_on)
+        if tool_hint:
+            item["tool_hint"] = tool_hint
+        return json.dumps(planning_engine.process_phase(
+            phase="query_decomposition", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence, phase_data=item,
+        ), ensure_ascii=False, indent=2)
+
+    @app.tool(
+        name="plan_search_term",
+        output_schema=None,
+        description="Phase 4: Add one search term. Call once per term; data accumulates. First call must set approach.",
+    )
+    async def plan_search_term(
+        session_id: Annotated[str, "Session ID from plan_intent"],
+        thought: Annotated[str, "Reasoning for this search term"],
+        term: Annotated[str, "Search query (max 8 words)"],
+        purpose: Annotated[str, "Sub-query ID this serves (e.g., 'sq1')"],
+        round: Annotated[int, "Execution round: 1=broad, 2+=targeted follow-up"],
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        approach: Annotated[str, "broad_first | narrow_first | targeted (required on first call)"] = "",
+        fallback_plan: Annotated[str, "Fallback if primary searches fail"] = "",
+        is_revision: Annotated[bool, "True to replace all search terms"] = False,
+    ) -> str:
+        import json
+        if not planning_engine.get_session(session_id):
+            return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
+        data = {"search_terms": [{"term": term, "purpose": purpose, "round": round}]}
+        if approach:
+            data["approach"] = approach
+        if fallback_plan:
+            data["fallback_plan"] = fallback_plan
+        return json.dumps(planning_engine.process_phase(
+            phase="search_strategy", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence, phase_data=data,
+        ), ensure_ascii=False, indent=2)
+
+    @app.tool(
+        name="plan_tool_mapping",
+        output_schema=None,
+        description="Phase 5: Map a sub-query to a tool. Call once per mapping; data accumulates.",
+    )
+    async def plan_tool_mapping(
+        session_id: Annotated[str, "Session ID from plan_intent"],
+        thought: Annotated[str, "Reasoning for this mapping"],
+        sub_query_id: Annotated[str, "Sub-query ID to map"],
+        tool: Annotated[str, "web_search | web_fetch | web_map"],
+        reason: Annotated[str, "Why this tool for this sub-query"],
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        params_json: Annotated[str, "Optional JSON string for tool-specific params"] = "",
+        is_revision: Annotated[bool, "True to replace all mappings"] = False,
+    ) -> str:
+        import json
+        if not planning_engine.get_session(session_id):
+            return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
+        item = {"sub_query_id": sub_query_id, "tool": tool, "reason": reason}
+        if params_json:
+            try:
+                item["params"] = json.loads(params_json)
+            except json.JSONDecodeError:
+                pass
+        return json.dumps(planning_engine.process_phase(
+            phase="tool_selection", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence, phase_data=item,
+        ), ensure_ascii=False, indent=2)
+
+    @app.tool(
+        name="plan_execution",
+        output_schema=None,
+        description="Phase 6: Define execution order. parallel_groups: semicolon-separated groups of comma-separated IDs (e.g., 'sq1,sq2;sq3').",
+    )
+    async def plan_execution(
+        session_id: Annotated[str, "Session ID from plan_intent"],
+        thought: Annotated[str, "Reasoning for execution order"],
+        parallel_groups: Annotated[str, "Parallel batches: 'sq1,sq2;sq3,sq4' (semicolon=groups, comma=IDs)"],
+        sequential: Annotated[str, "Comma-separated IDs that must run in order"],
+        estimated_rounds: Annotated[int, "Estimated execution rounds"],
+        confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
+        is_revision: Annotated[bool, "True to overwrite"] = False,
+    ) -> str:
+        import json
+        if not planning_engine.get_session(session_id):
+            return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
+        parallel = [_split_csv(g) for g in parallel_groups.split(";") if g.strip()] if parallel_groups else []
+        seq = _split_csv(sequential)
+        return json.dumps(planning_engine.process_phase(
+            phase="execution_order", thought=thought, session_id=session_id,
+            is_revision=is_revision, confidence=confidence,
+            phase_data={"parallel": parallel, "sequential": seq, "estimated_rounds": estimated_rounds},
+        ), ensure_ascii=False, indent=2)
 
 
-@mcp.tool(
-    name="plan_complexity",
-    output_schema=None,
-    description="Phase 2: Assess search complexity (1-3). Controls required phases: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.",
-)
-async def plan_complexity(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for complexity assessment"],
-    level: Annotated[int, "Complexity 1-3"],
-    estimated_sub_queries: Annotated[int, "Expected number of sub-queries"],
-    estimated_tool_calls: Annotated[int, "Expected total tool calls"],
-    justification: Annotated[str, "Why this complexity level"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    is_revision: Annotated[bool, "True to overwrite"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    return json.dumps(planning_engine.process_phase(
-        phase="complexity_assessment", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence,
-        phase_data={"level": level, "estimated_sub_queries": estimated_sub_queries,
-                     "estimated_tool_calls": estimated_tool_calls, "justification": justification},
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_sub_query",
-    output_schema=None,
-    description="Phase 3: Add one sub-query. Call once per sub-query; data accumulates across calls. Set is_revision=true to replace all.",
-)
-async def plan_sub_query(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this sub-query"],
-    id: Annotated[str, "Unique ID (e.g., 'sq1')"],
-    goal: Annotated[str, "Sub-query goal"],
-    expected_output: Annotated[str, "What success looks like"],
-    boundary: Annotated[str, "What this excludes — mutual exclusion with siblings"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    depends_on: Annotated[str, "Comma-separated prerequisite IDs"] = "",
-    tool_hint: Annotated[str, "web_search | web_fetch | web_map"] = "",
-    is_revision: Annotated[bool, "True to replace all sub-queries"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    item = {"id": id, "goal": goal, "expected_output": expected_output, "boundary": boundary}
-    if depends_on:
-        item["depends_on"] = _split_csv(depends_on)
-    if tool_hint:
-        item["tool_hint"] = tool_hint
-    return json.dumps(planning_engine.process_phase(
-        phase="query_decomposition", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=item,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_search_term",
-    output_schema=None,
-    description="Phase 4: Add one search term. Call once per term; data accumulates. First call must set approach.",
-)
-async def plan_search_term(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this search term"],
-    term: Annotated[str, "Search query (max 8 words)"],
-    purpose: Annotated[str, "Sub-query ID this serves (e.g., 'sq1')"],
-    round: Annotated[int, "Execution round: 1=broad, 2+=targeted follow-up"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    approach: Annotated[str, "broad_first | narrow_first | targeted (required on first call)"] = "",
-    fallback_plan: Annotated[str, "Fallback if primary searches fail"] = "",
-    is_revision: Annotated[bool, "True to replace all search terms"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    data = {"search_terms": [{"term": term, "purpose": purpose, "round": round}]}
-    if approach:
-        data["approach"] = approach
-    if fallback_plan:
-        data["fallback_plan"] = fallback_plan
-    return json.dumps(planning_engine.process_phase(
-        phase="search_strategy", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=data,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_tool_mapping",
-    output_schema=None,
-    description="Phase 5: Map a sub-query to a tool. Call once per mapping; data accumulates.",
-)
-async def plan_tool_mapping(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for this mapping"],
-    sub_query_id: Annotated[str, "Sub-query ID to map"],
-    tool: Annotated[str, "web_search | web_fetch | web_map"],
-    reason: Annotated[str, "Why this tool for this sub-query"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    params_json: Annotated[str, "Optional JSON string for tool-specific params"] = "",
-    is_revision: Annotated[bool, "True to replace all mappings"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    item = {"sub_query_id": sub_query_id, "tool": tool, "reason": reason}
-    if params_json:
-        try:
-            item["params"] = json.loads(params_json)
-        except json.JSONDecodeError:
-            pass
-    return json.dumps(planning_engine.process_phase(
-        phase="tool_selection", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence, phase_data=item,
-    ), ensure_ascii=False, indent=2)
-
-
-@mcp.tool(
-    name="plan_execution",
-    output_schema=None,
-    description="Phase 6: Define execution order. parallel_groups: semicolon-separated groups of comma-separated IDs (e.g., 'sq1,sq2;sq3').",
-)
-async def plan_execution(
-    session_id: Annotated[str, "Session ID from plan_intent"],
-    thought: Annotated[str, "Reasoning for execution order"],
-    parallel_groups: Annotated[str, "Parallel batches: 'sq1,sq2;sq3,sq4' (semicolon=groups, comma=IDs)"],
-    sequential: Annotated[str, "Comma-separated IDs that must run in order"],
-    estimated_rounds: Annotated[int, "Estimated execution rounds"],
-    confidence: Annotated[float, "Confidence 0.0-1.0"] = 1.0,
-    is_revision: Annotated[bool, "True to overwrite"] = False,
-) -> str:
-    import json
-    if not planning_engine.get_session(session_id):
-        return json.dumps({"error": f"Session '{session_id}' not found. Call plan_intent first."})
-    parallel = [_split_csv(g) for g in parallel_groups.split(";") if g.strip()] if parallel_groups else []
-    seq = _split_csv(sequential)
-    return json.dumps(planning_engine.process_phase(
-        phase="execution_order", thought=thought, session_id=session_id,
-        is_revision=is_revision, confidence=confidence,
-        phase_data={"parallel": parallel, "sequential": seq, "estimated_rounds": estimated_rounds},
-    ), ensure_ascii=False, indent=2)
+if config.planning_tools_enabled:
+    register_planning_tools(mcp)
 
 
 def main():
     import signal
-    import os
     import threading
 
     # 信号处理（仅主线程）
