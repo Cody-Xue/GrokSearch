@@ -1,11 +1,13 @@
+import asyncio
 import json
+import time
 
 import httpx
 import pytest
 from fastmcp import Client
 
 from grok_search import models, server
-from grok_search.models import ModelListCache, check_model, parse_model_name
+from grok_search.models import ModelListCache, check_model, parse_model_name, routing_base
 from grok_search.providers.grok import GrokResponse, GrokSearchProvider
 from grok_search.sources import SourcesCache
 
@@ -129,6 +131,83 @@ async def test_stale_list_never_rejects_a_new_model(monkeypatch):
     clock.t += 61
     check = await check_model("brand-new", default_model="x", api_url=URL, api_key=KEY, cache=cache)
     assert check.ok and check.status == "unverified"
+
+
+@pytest.mark.asyncio
+async def test_miss_refresh_respects_the_failure_backoff(monkeypatch):
+    clock = Clock()
+    calls = fake_fetch(monkeypatch, ["grok-4.7"], httpx.ConnectTimeout("down"))
+    cache = ModelListCache(clock=clock)
+    await cache.get(URL, KEY)
+    clock.t += models.MISS_REFRESH_MIN_AGE_S + 1
+    first = await check_model("unknown-1", default_model="x", api_url=URL, api_key=KEY, cache=cache)
+    assert first.status == "unverified" and len(calls) == 2
+    for name in ("unknown-2", "unknown-3(high)"):
+        assert (await check_model(name, default_model="x", api_url=URL, api_key=KEY, cache=cache)).status == "unverified"
+    assert len(calls) == 2  # within the backoff the failed refresh is not repeated
+    clock.t += models.FAILURE_BACKOFF_S + 1
+    await check_model("unknown-4", default_model="x", api_url=URL, api_key=KEY, cache=cache)
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_concurrent_misses_share_one_refresh_while_models_hangs(monkeypatch):
+    clock = Clock()
+    calls = []
+
+    async def fetch(api_url, api_key, timeout_s=10.0):
+        calls.append(api_url)
+        if len(calls) == 1:
+            return ["grok-4.7"]
+        await asyncio.sleep(0.2)  # stands in for the 10 s timeout of a hanging /models
+        raise httpx.ConnectTimeout("timed out")
+
+    monkeypatch.setattr(models, "fetch_available_models", fetch)
+    cache = ModelListCache(clock=clock)
+    await cache.get(URL, KEY)
+    clock.t += models.MISS_REFRESH_MIN_AGE_S + 1
+    started = time.monotonic()
+    results = await asyncio.gather(*(
+        check_model(f"unknown-{i}(high)", default_model="x", api_url=URL, api_key=KEY, cache=cache) for i in range(6)))
+    elapsed = time.monotonic() - started
+    assert [r.status for r in results] == ["unverified"] * 6
+    assert len(calls) == 2  # one refresh for six misses, not six refreshes in a row
+    assert elapsed < 0.6, elapsed
+
+
+@pytest.mark.asyncio
+async def test_queued_misses_reuse_a_refresh_that_just_succeeded(monkeypatch):
+    clock = Clock()
+    calls = []
+
+    async def fetch(api_url, api_key, timeout_s=10.0):
+        calls.append(api_url)
+        await asyncio.sleep(0.01)
+        return ["grok-4.7"] if len(calls) == 1 else ["grok-4.7", "grok-4.8"]
+
+    monkeypatch.setattr(models, "fetch_available_models", fetch)
+    cache = ModelListCache(clock=clock)
+    await cache.get(URL, KEY)
+    clock.t += models.MISS_REFRESH_MIN_AGE_S + 1
+    # Hold the cache while six checks start, so each reads the old list and queues for the refresh.
+    lock = cache._lock((URL, KEY))
+    await lock.acquire()
+    checks = [asyncio.ensure_future(check_model("grok-4.8(high)", default_model="x", api_url=URL, api_key=KEY, cache=cache))
+              for _ in range(6)]
+    await asyncio.sleep(0.01)
+    lock.release()
+    results = await asyncio.gather(*checks)
+    assert [r.status for r in results] == ["listed_after_refresh"] * 6
+    assert all(r.model == "grok-4.8(high)" for r in results)
+    assert len(calls) == 2  # one refresh, reused by the five queued checks
+
+
+@pytest.mark.parametrize("model, base", [
+    ("grok-4.7(high)", "grok-4.7"), ("grok-4.7(8192)", "grok-4.7"), ("grok-4.7(-1)", "grok-4.7"), ("grok-4.7()", "grok-4.7"),
+    ("grok-4.7", "grok-4.7"), ("grok-4.7(high):online", "grok-4.7"), ("literal(preview)", "literal(preview)"),
+])
+def test_routing_base(model, base):
+    assert routing_base(model) == base
 
 
 @pytest.fixture

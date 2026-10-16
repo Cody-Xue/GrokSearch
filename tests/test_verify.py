@@ -197,14 +197,14 @@ async def test_scope_and_skipped_entries(monkeypatch):
 
     mock_verify_client(monkeypatch, handler)
     sources = [{"url": f"https://example.test/{i}"} for i in range(3)] + [
-        {"url": "http://127.0.0.1:8080/admin"}, {"url": "http://localhost/x"}, {"url": "ftp://example.test/file"}]
+        {"url": "http://127.0.0.1:8080/admin"}, {"url": "ftp://example.test/file"}]
     result = await verify.verify_answer("no identifiers here", sources, check_urls=True, timeout_s=5, max_urls=2)
     assert result["claim_support"] == "not_checked" and "NOT checked" in result["scope"]
     reasons = {item["value"]: item["reason"] for item in result["skipped"]}
     assert reasons["https://example.test/2"] == "over the per-answer limit of 2 URL checks"
-    assert "private" in reasons["http://127.0.0.1:8080/admin"] and "private" in reasons["http://localhost/x"]
+    assert reasons["http://127.0.0.1:8080/admin"] == "blocked: 127.0.0.1 is not a public address (not fetched)"
     assert "scheme" in reasons["ftp://example.test/file"]
-    assert result["checked"]["urls"] == 2 and len(result["urls"]) == 2 and result["summary"]["skipped"] == 4
+    assert result["checked"]["urls"] == 2 and len(result["urls"]) == 2 and result["summary"]["skipped"] == 3
 
 
 @pytest.mark.asyncio
@@ -214,17 +214,154 @@ async def test_disabled_url_checks_are_listed_as_skipped(monkeypatch):
     assert result["skipped"] == [{"kind": "url", "value": "https://example.test/x", "reason": "URL checks disabled (GROK_VERIFY_URLS=false)"}]
 
 
+# ------------------------------------------------------------------ destination guard
+PUBLIC_IP = "93.184.216.34"
+
+
+@pytest.fixture(autouse=True)
+def dns(monkeypatch):
+    """URL checks resolve hosts first; tests have no real DNS, so names map through this table."""
+    table: dict = {}
+
+    async def resolve(host, port):
+        value = table.get(host, [PUBLIC_IP])
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
+
+    monkeypatch.setattr(verify, "resolve_host", resolve)
+    return table
+
+
+def recording_handler(hits, redirects=None):
+    async def handler(request):
+        hits.append(str(request.url))
+        target = (redirects or {}).get(str(request.url))
+        if target:
+            return httpx.Response(302, headers={"Location": target})
+        return httpx.Response(200, text="<title>page</title>")
+    return handler
+
+
 @pytest.mark.asyncio
-async def test_redirect_to_a_private_address_is_not_followed(monkeypatch):
+@pytest.mark.parametrize("url, address", [
+    ("http://127.1/", "127.0.0.1"),
+    ("http://2130706433/", "127.0.0.1"),
+    ("http://0x7f.0.0.1/", "127.0.0.1"),
+    ("http://0177.0.0.1:8080/", "127.0.0.1"),
+    ("http://100.64.12.34/", "100.64.12.34"),
+    ("http://[::ffff:127.0.0.1]/", "::ffff:127.0.0.1"),
+    ("http://[::1]:3000/", "::1"),
+    ("http://0.0.0.0/", "0.0.0.0"),
+    ("http://169.254.169.254/latest/meta-data/", "169.254.169.254"),
+    ("http://[64:ff9b::7f00:1]/", "64:ff9b::7f00:1"),
+])
+async def test_non_public_literals_are_never_requested(monkeypatch, url, address):
     hits = []
+    mock_verify_client(monkeypatch, recording_handler(hits))
+    result = await verify.verify_answer("x", [{"url": url}], check_urls=True, timeout_s=5)
+    assert hits == [] and result["urls"] == [] and result["unresolved"] == []
+    assert result["skipped"][0]["value"] == url
+    assert address in result["skipped"][0]["reason"] and result["skipped"][0]["reason"].startswith("blocked:")
+
+
+@pytest.mark.asyncio
+async def test_names_resolving_to_non_public_addresses_are_not_requested(monkeypatch, dns):
+    dns.update({
+        "nas": ["192.168.1.10"],
+        "localhost": ["127.0.0.1", "::1"],
+        "intranet.example.test": ["10.0.0.5"],
+        "cgnat.example.test": ["100.64.3.4"],
+        "mixed.example.test": [PUBLIC_IP, "10.0.0.1"],
+        "mapped.example.test": ["::ffff:192.168.0.1"],
+    })
+    hits = []
+    mock_verify_client(monkeypatch, recording_handler(hits))
+    urls = [f"http://{host}/admin" for host in dns] + ["https://public.example.test/ok"]
+    result = await verify.verify_answer("x", [{"url": u} for u in urls], check_urls=True, timeout_s=5)
+    assert hits == ["https://public.example.test/ok"]
+    assert [u["url"] for u in result["urls"]] == ["https://public.example.test/ok"]
+    reasons = {item["value"]: item["reason"] for item in result["skipped"]}
+    assert set(reasons) == set(urls[:-1])
+    assert reasons["http://nas/admin"] == "blocked: nas resolves to 192.168.1.10, which is not a public address"
+    assert "10.0.0.1" in reasons["http://mixed.example.test/admin"]  # one private address is enough
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target, blocked_host", [
+    ("http://nas/admin", "nas"),
+    ("http://2130706433/", "2130706433"),
+    ("http://intranet.example.test/", "intranet.example.test"),
+])
+async def test_redirects_are_checked_hop_by_hop(monkeypatch, dns, target, blocked_host):
+    dns.update({"nas": ["192.168.1.10"], "intranet.example.test": ["10.1.2.3"]})
+    hits = []
+    start = "https://public.example.test/r"
+    mock_verify_client(monkeypatch, recording_handler(hits, {start: target}))
+    result = await verify.verify_answer("x", [{"url": start}], check_urls=True, timeout_s=5)
+    assert hits == [start] and result["urls"] == []
+    assert result["skipped"][0]["reason"].startswith(f"blocked: redirect target {blocked_host} ")
+
+
+@pytest.mark.asyncio
+async def test_fake_ip_answers_are_reported_not_requested(monkeypatch, dns):
+    dns["clash.example.test"] = ["198.18.0.7"]
+    hits = []
+    mock_verify_client(monkeypatch, recording_handler(hits))
+    result = await verify.verify_answer("x", [{"url": "https://clash.example.test/"}], check_urls=True, timeout_s=5)
+    assert hits == [] and "fake-ip" in result["skipped"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_dns_failure_is_unresolved(monkeypatch, dns):
+    import socket
+    dns["gone.example.test"] = socket.gaierror(-2, "Name or service not known")
+    hits = []
+    mock_verify_client(monkeypatch, recording_handler(hits))
+    result = await verify.verify_answer("x", [{"url": "https://gone.example.test/"}], check_urls=True, timeout_s=5)
+    assert hits == [] and result["skipped"] == []
+    assert result["unresolved"][0]["reason"].startswith("dns lookup failed: gone.example.test: gaierror")
+
+
+@pytest.mark.asyncio
+async def test_registry_lookups_are_not_guarded(monkeypatch):
+    async def fake_ip_everywhere(host, port):
+        return ["198.18.0.1"]
+
+    monkeypatch.setattr(verify, "resolve_host", fake_ip_everywhere)
+    hosts = []
 
     async def handler(request):
-        hits.append(request.url.host)
-        if request.url.host == "example.test":
-            return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
-        return httpx.Response(200, text="<title>metadata</title>")
+        hosts.append(request.url.host)
+        if request.url.host == "export.arxiv.org":
+            return httpx.Response(200, text=ATOM)
+        if request.url.host == "api.crossref.org":
+            return httpx.Response(200, json={"message": {"title": ["T"], "container-title": ["C"], "type": "journal-article"}})
+        return httpx.Response(200, text="<title>x</title>")
 
     mock_verify_client(monkeypatch, handler)
-    result = await verify.verify_answer("x", [{"url": "https://example.test/r"}], check_urls=True, timeout_s=5)
-    assert hits == ["example.test"] and result["urls"] == []
-    assert result["unresolved"] == [{"kind": "url", "value": "https://example.test/r", "reason": "blocked: redirect to a private or local address"}]
+    result = await verify.verify_answer("see 2607.06065 and 10.1234/abc", [{"url": "https://example.test/p"}], check_urls=True, timeout_s=5)
+    assert [x["id"] for x in result["arxiv"]] == ["2607.06065"] and [x["doi"] for x in result["doi"]] == ["10.1234/abc"]
+    assert "example.test" not in hosts and "fake-ip" in result["skipped"][0]["reason"]
+
+
+@pytest.mark.parametrize("address, problem", [
+    ("127.0.0.1", "non_public"), ("10.0.0.1", "non_public"), ("100.64.0.1", "non_public"),
+    ("169.254.169.254", "non_public"), ("0.0.0.0", "non_public"), ("198.18.0.1", "fake_ip"), ("8.8.8.8", None),
+    ("::1", "non_public"), ("fe80::1%eth0", "non_public"), ("fc00::1", "non_public"),
+    ("::ffff:127.0.0.1", "non_public"), ("::ffff:198.18.0.1", "fake_ip"), ("::ffff:8.8.8.8", None),
+    ("2002:7f00:1::1", "non_public"), ("64:ff9b::a00:1", "non_public"), ("64:ff9b::808:808", None),
+    ("2606:4700:4700::1111", None),
+])
+def test_address_classification(address, problem):
+    # IPv4-mapped, 6to4 and NAT64 addresses are judged by the IPv4 address they carry, on every Python version.
+    assert verify.address_problem(address) == problem
+
+
+@pytest.mark.parametrize("host, expected", [
+    ("127.1", "127.0.0.1"), ("2130706433", "127.0.0.1"), ("0x7f.0.0.1", "127.0.0.1"), ("0177.0.0.1", "127.0.0.1"),
+    ("10.1", "10.0.0.1"), ("8.8.8.8", "8.8.8.8"), ("256.1.1.1", None), ("08.1.1.1", None), ("1.2.3.4.example", None), ("nas", None),
+])
+def test_numeric_ipv4_follows_inet_aton(host, expected):
+    parsed = verify.parse_numeric_ipv4(host)
+    assert (str(parsed) if parsed is not None else None) == expected

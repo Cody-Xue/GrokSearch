@@ -4,9 +4,10 @@ Two mechanisms:
 
 * a concurrency semaphore, so a parallel fan-out from the MCP client cannot
   fire more simultaneous requests than the proxy tolerates;
-* a circuit breaker keyed by (api_url, model), so repeated 429s or an
-  exhausted account pool for one model tier fail fast instead of being
-  retried by every in-flight call.
+* a circuit breaker keyed by (api_url, base model), so repeated 429s or an
+  exhausted account pool for one model fail fast instead of being retried by
+  every in-flight call. Thinking suffixes such as "(high)" or "(8192)" are not
+  part of the key: the proxy routes every level of a model to the same pool.
 """
 import asyncio
 import threading

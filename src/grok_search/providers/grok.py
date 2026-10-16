@@ -8,6 +8,8 @@ from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait
 from tenacity.stop import stop_base
 from tenacity.wait import wait_base
 from .base import BaseSearchProvider
+from ..errors import redact
+from ..models import routing_base
 from ..utils import build_search_prompt
 from ..logger import log_info, logger
 from ..config import config
@@ -54,7 +56,11 @@ _RATE_LIMIT_MARKERS = ("rate limit", "rate_limit", "too many requests", "ratelim
 
 
 class GrokUpstreamError(Exception):
-    """An upstream failure that the caller should see, with retry metadata."""
+    """An upstream failure that the caller should see, with retry metadata.
+
+    The message is redacted (API keys, bearer tokens) because it reaches the tool output,
+    the log file and the breaker state, and proxies sometimes echo request headers.
+    """
 
     def __init__(
         self,
@@ -66,7 +72,7 @@ class GrokUpstreamError(Exception):
         status: Optional[int] = None,
         exhausted: bool = False,
     ):
-        super().__init__(message)
+        super().__init__(redact(message, 600))
         self.error_type = error_type
         self.retryable = retryable
         self.retry_after = retry_after
@@ -202,7 +208,9 @@ class GrokSearchProvider(BaseSearchProvider):
 
     @property
     def _breaker_key(self) -> tuple[str, str]:
-        return (self.api_url, self.model)
+        # Keyed by the routed base model: thinking levels of one model share its account pool,
+        # so "grok-4(high)" and "grok-4(low)" must not have separate breaker states.
+        return (self.api_url, routing_base(self.model))
 
     async def search(self, query: str, platform: str = "", min_results: int = 3, max_results: int = 10, ctx=None, instructions: str = "") -> str:
         """Keep the text-only provider API for existing callers."""
@@ -336,7 +344,7 @@ class GrokSearchProvider(BaseSearchProvider):
                 if status == 429:
                     retry_after = _parse_retry_after(response)
                     exhausted = _is_exhausted(body)
-                    breaker.record_failure(key, retry_after=retry_after, exhausted=exhausted, reason=body.strip()[:120])
+                    breaker.record_failure(key, retry_after=retry_after, exhausted=exhausted, reason=redact(body, 120))
                     raise GrokUpstreamError(
                         f"HTTP 429: {body.strip()[:300]}",
                         error_type="rate_limit",
@@ -355,7 +363,7 @@ class GrokSearchProvider(BaseSearchProvider):
                 result = await self._parse_streaming_result(response, ctx)
             except GrokUpstreamError as e:
                 if e.is_rate_limit:
-                    breaker.record_failure(key, retry_after=e.retry_after, exhausted=e.exhausted, reason=str(e)[:120])
+                    breaker.record_failure(key, retry_after=e.retry_after, exhausted=e.exhausted, reason=redact(str(e), 120))
                 raise
         if not result.content and not result.annotations:
             raise GrokUpstreamError(
@@ -382,7 +390,7 @@ class GrokSearchProvider(BaseSearchProvider):
             sleep = getattr(retry_state.next_action, "sleep", "?")
             logger.warning(
                 f"Grok request failed (model={payload.get('model')}, attempt {retry_state.attempt_number}), "
-                f"retrying in {sleep}s: {exc}"
+                f"retrying in {sleep}s: {redact(str(exc), 300)}"
             )
 
         settled = False

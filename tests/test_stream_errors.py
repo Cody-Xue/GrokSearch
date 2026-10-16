@@ -217,3 +217,28 @@ async def test_slow_first_attempt_still_retries_on_transient_error(provider, mon
     monkeypatch.setenv("GROK_RETRY_BUDGET_S", "0.1")  # far below the request time
     result = await provider.search_with_sources("q")
     assert result.content == "recovered" and calls == 2
+
+
+@pytest.mark.asyncio
+async def test_thinking_levels_of_one_model_share_one_breaker(monkeypatch):
+    sent = []
+
+    async def handler(request):
+        model = json.loads(request.content)["model"]
+        sent.append(model)
+        if model.startswith("grok-4.7"):
+            return httpx.Response(429, text="No available accounts for this model tier")
+        return httpx.Response(200, text=sse({"content": "ok"}))
+
+    mock_client(monkeypatch, handler)
+    url = KEY[0]
+    with pytest.raises(GrokUpstreamError) as info:
+        await GrokSearchProvider(url, "test-key", "grok-4.7(high)").search_with_sources("q")
+    assert info.value.exhausted
+    for model in ("grok-4.7(low)", "grok-4.7(8192)", "grok-4.7"):
+        with pytest.raises(BreakerOpen):
+            await GrokSearchProvider(url, "test-key", model).search_with_sources("q")
+    assert sent == ["grok-4.7(high)"]  # the other levels were refused locally, not retried upstream
+    other = await GrokSearchProvider(url, "test-key", "grok-4.8(high)").search_with_sources("q")
+    assert other.content == "ok" and sent[-1] == "grok-4.8(high)"  # the full name is still sent
+    assert list(breaker.snapshot()) == [f"grok-4.7 @ {url}"]

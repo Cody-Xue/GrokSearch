@@ -38,8 +38,7 @@ except ImportError:
 
 import asyncio
 import os
-import re
-from urllib.parse import unquote, urlparse
+from urllib.parse import urlparse
 
 
 def _package_version() -> str:
@@ -334,15 +333,15 @@ async def web_search(
             kwargs = {"instructions": instructions} if instructions else {}
             return await grok_provider.search_with_sources(query, platform, **kwargs)
         except BreakerOpen as e:
-            grok_error.update(error=str(e), error_type="circuit_open", retry_after_s=round(e.retry_after_s, 1))
+            grok_error.update(error=redact(str(e), 600), error_type="circuit_open", retry_after_s=round(e.retry_after_s, 1))
         except GrokUpstreamError as e:
-            grok_error.update(error=str(e), error_type=e.error_type, exhausted=e.exhausted)
+            grok_error.update(error=redact(str(e), 600), error_type=e.error_type, exhausted=e.exhausted)
             if e.retry_after is not None:
                 grok_error["retry_after_s"] = round(float(e.retry_after), 1)
             if e.status is not None:
                 grok_error["status"] = e.status
         except Exception as e:
-            grok_error.update(error=str(e) or type(e).__name__, error_type="unknown")
+            grok_error.update(error=redact(str(e) or type(e).__name__, 600), error_type="unknown")
         await log_error(None, f"web_search upstream failed (model={effective_model}): {grok_error}")
         return GrokResponse()
 
@@ -383,7 +382,7 @@ async def web_search(
         if grok_error.get("retry_after_s") is not None:
             hint += f"，建议 {grok_error['retry_after_s']:.0f} 秒后重试"
         if grok_error.get("exhausted"):
-            hint += "，该档位账号池已耗尽，可用 model 参数临时换用其他档位"
+            hint += "，该模型的账号池已耗尽（同一模型的不同思考档位共用状态），可用 model 参数临时换用其他模型"
         result = {
             "session_id": session_id,
             "content": f"[搜索失败] {detail}。模型: {effective_model}{hint}。",
@@ -790,36 +789,8 @@ def _find_project_root(start: Path) -> Optional[Path]:
     return None
 
 
-def _path_from_file_uri(uri: str) -> Optional[Path]:
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        return None
-    path = unquote(parsed.path)
-    if re.match(r"^/[A-Za-z]:", path):  # file:///C:/x -> C:/x
-        path = path[1:]
-    if parsed.netloc and parsed.netloc != "localhost":  # UNC share
-        path = f"//{parsed.netloc}{path}"
-    return Path(path)
-
-
-async def _client_roots(ctx) -> list[Path]:
-    """Workspace roots reported by the MCP client, if it supports roots."""
-    if ctx is None:
-        return []
-    try:
-        roots = await asyncio.wait_for(ctx.list_roots(), timeout=3.0)
-    except Exception:
-        return []
-    paths: list[Path] = []
-    for root in roots or []:
-        path = _path_from_file_uri(str(getattr(root, "uri", "") or ""))
-        if path is not None and path.is_dir():
-            paths.append(path.resolve())
-    return paths
-
-
-async def _resolve_project_dir(project_dir: str, ctx) -> tuple[Optional[Path], str, str]:
-    """(directory, source, error). Order: argument, CLAUDE_PROJECT_DIR, a single MCP root, nearest .git/.claude above cwd."""
+def _resolve_project_dir(project_dir: str) -> tuple[Optional[Path], str, str]:
+    """(directory, source, error). Order: argument, CLAUDE_PROJECT_DIR, nearest .git/.claude above cwd."""
     if project_dir and project_dir.strip():
         path = Path(project_dir.strip()).expanduser()
         if not path.is_dir():
@@ -831,16 +802,12 @@ async def _resolve_project_dir(project_dir: str, ctx) -> tuple[Optional[Path], s
     env_dir = os.getenv("CLAUDE_PROJECT_DIR", "").strip()
     if env_dir and Path(env_dir).is_dir() and not _is_fs_root(Path(env_dir).resolve()):
         return Path(env_dir).resolve(), "CLAUDE_PROJECT_DIR", ""
-    roots = [root for root in await _client_roots(ctx) if not _is_fs_root(root)]
-    if len(roots) == 1:
-        return roots[0], "mcp_roots", ""
     found = _find_project_root(Path.cwd().resolve())
     if found is not None:
         return found, "cwd", ""
-    hint = "；客户端提供了多个 MCP roots，无法确定用哪一个" if len(roots) > 1 else ""
     return None, "", (
-        "无法确定项目目录：未提供 CLAUDE_PROJECT_DIR 或唯一的 MCP root，且从当前目录向上到用户主目录之前都没有 .git 或 .claude"
-        f"{hint}。请用 project_dir 参数传入项目根目录，未做任何修改。"
+        "无法确定项目目录：未设置 CLAUDE_PROJECT_DIR，且从当前目录向上到用户主目录之前都没有 .git 或 .claude。"
+        "请用 project_dir 参数传入项目根目录，未做任何修改。"
     )
 
 
@@ -855,10 +822,9 @@ async def _resolve_project_dir(project_dir: str, ctx) -> tuple[Optional[Path], s
         - **Project Scope:** Changes apply to <project>/.claude/settings.json.
         - **Status Check:** Query current state without making changes.
 
-    **Project directory:** project_dir if given, else CLAUDE_PROJECT_DIR, else the single workspace root
-    reported by the MCP client, else the nearest directory containing .git or .claude above the server's
-    working directory (never the home directory or a filesystem root). If none applies, nothing is
-    written and the tool asks for project_dir.
+    **Project directory:** project_dir if given, else CLAUDE_PROJECT_DIR, else the nearest directory
+    containing .git or .claude above the server's working directory (never the home directory or a
+    filesystem root). If none applies, nothing is written and the tool asks for project_dir.
 
     **Edge Cases & Best Practices:**
         - Use "on" to block built-in tools when preferring this MCP server's implementation.
@@ -869,8 +835,7 @@ async def _resolve_project_dir(project_dir: str, ctx) -> tuple[Optional[Path], s
 )
 async def toggle_builtin_tools(
     action: Annotated[str, "Action to perform: 'on' (block built-in), 'off' (allow built-in), or 'status' (check current state)."] = "status",
-    project_dir: Annotated[str, "Project root whose .claude/settings.json is read or changed. Optional when CLAUDE_PROJECT_DIR, the client's workspace root or a .git/.claude directory identifies the project."] = "",
-    ctx: Context = None,
+    project_dir: Annotated[str, "Project root whose .claude/settings.json is read or changed. Optional when CLAUDE_PROJECT_DIR or a .git/.claude directory above the server's working directory identifies the project."] = "",
 ) -> str:
     import json
 
@@ -878,7 +843,7 @@ async def toggle_builtin_tools(
         return json.dumps(data, ensure_ascii=False, indent=2)
 
     tools = ["WebFetch", "WebSearch"]
-    root, source, error = await _resolve_project_dir(project_dir, ctx)
+    root, source, error = _resolve_project_dir(project_dir)
     if root is None:
         return reply(blocked=None, project_dir=None, error=error)
 

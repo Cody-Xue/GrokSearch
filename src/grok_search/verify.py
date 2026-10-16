@@ -4,7 +4,8 @@ What is checked:
 * arXiv IDs are resolved in one batch through the arXiv export API.
 * DOIs are resolved through Crossref.
 * Other cited URLs get a bounded GET (first 64 KB) to record status and title.
-  Private, loopback and link-local addresses are never fetched, also not via redirects.
+  Before the request and before every redirect hop the host is resolved and the
+  request is refused unless all addresses are public (see "destination guard").
 * When the answer writes a paper title next to an arXiv ID or DOI, that title is
   compared with the registry title (title_checks).
 
@@ -17,6 +18,7 @@ import difflib
 import html
 import ipaddress
 import re
+import socket
 import time
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -30,8 +32,9 @@ CROSSREF_API = "https://api.crossref.org/works/"
 
 SCOPE = (
     "Existence and reachability only: arXiv IDs and DOIs are resolved against arXiv and Crossref, "
-    "cited URLs are fetched, and paper titles written next to an identifier are compared with the "
-    "registry title. Whether a source supports the sentence it is attached to is NOT checked."
+    "cited URLs are fetched when their host resolves to public addresses only, and paper titles written "
+    "next to an identifier are compared with the registry title. Whether a source supports the sentence "
+    "it is attached to is NOT checked."
 )
 MAX_SKIPPED_LISTED = 50
 
@@ -172,33 +175,135 @@ async def lookup_doi(doi: str, client: httpx.AsyncClient) -> Optional[dict]:
     }
 
 
+# ---------------------------------------------------------------- destination guard
+# URL checks fetch addresses that come from the model's answer. Before the first request and
+# before every redirect hop the host is resolved, and the request is refused unless every
+# address is public (is_global; IPv4-mapped, 6to4 and NAT64 addresses are judged by the IPv4
+# address they carry). Limits: the check resolves the name separately from the connection, so
+# DNS rebinding between the two is not prevented; when an HTTP(S)/SOCKS proxy carries the
+# request, the proxy decides the real destination; behind a fake-ip resolver (Clash/mihomo)
+# the real destination is unknown, so such hosts are refused. Registry lookups (arXiv,
+# Crossref) use fixed hosts and are not guarded.
+FAKE_IP_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
+NAT64_NETWORK = ipaddress.IPv6Network("64:ff9b::/96")
+RESOLVE_TIMEOUT_S = 5.0
+_NUMERIC_PART_RE = re.compile(r"^(?:0[xX][0-9a-fA-F]*|0[0-7]*|[1-9][0-9]*)$")
+
+
 class BlockedAddress(Exception):
-    """A URL check was redirected to a private or local address."""
+    """A URL check was refused because its host is, or resolves to, a non-public address."""
+
+    def __init__(self, host: str, address: str, kind: str, literal: bool = False):
+        self.host = host
+        self.address = address
+        self.kind = kind
+        if host == address:
+            subject = address
+        elif literal:
+            subject = f"{host} (= {address})"
+        else:
+            subject = f"{host} resolves to {address}, which"
+        if kind == "fake_ip":
+            text = f"{subject} is in 198.18.0.0/15, the fake-ip range of Clash/mihomo-style proxies, so the real destination cannot be checked"
+        else:
+            text = f"{subject} is not a public address"
+        super().__init__(text)
 
 
-_LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa")
+class ResolveFailed(Exception):
+    """The host of a URL check could not be resolved."""
 
 
-def is_private_host(host: Optional[str]) -> bool:
-    """True for localhost-style names and private, loopback, link-local or reserved IP literals.
+def parse_numeric_ipv4(host: str) -> Optional[ipaddress.IPv4Address]:
+    """An IPv4 literal in any notation inet_aton() accepts: 127.1, 2130706433, 0x7f.0.0.1, 0177.0.0.1."""
+    parts = (host or "").split(".")
+    if not 1 <= len(parts) <= 4 or not all(_NUMERIC_PART_RE.match(part) for part in parts):
+        return None
+    values = []
+    for part in parts:
+        if part[:2] in ("0x", "0X"):
+            values.append(int(part[2:] or "0", 16))
+        elif len(part) > 1 and part.startswith("0"):
+            values.append(int(part, 8))
+        else:
+            values.append(int(part))
+    *head, last = values
+    if any(value > 255 for value in head) or last >= 256 ** (4 - len(head)):
+        return None
+    number = 0
+    for value in head:
+        number = number * 256 + value
+    return ipaddress.IPv4Address(number * 256 ** (4 - len(head)) + last)
 
-    Hostnames are not resolved, so a public name that resolves to a private address is not caught.
-    """
-    host = (host or "").strip().strip("[]").lower().rstrip(".")
-    if not host:
-        return True
-    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
-        return True
+
+def literal_address(host: str):
+    """The IP address of an IP-literal host (any IPv4 notation, IPv6 with or without brackets), else None."""
+    host = (host or "").strip().strip("[]")
+    ipv4 = parse_numeric_ipv4(host)
+    if ipv4 is not None:
+        return ipv4
     try:
-        ip = ipaddress.ip_address(host.split("%", 1)[0])
+        return ipaddress.IPv6Address(host.split("%", 1)[0])
     except ValueError:
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        return None
 
 
-async def _refuse_private_hosts(request: httpx.Request) -> None:
-    if is_private_host(request.url.host):
-        raise BlockedAddress(request.url.host)
+def address_problem(address) -> Optional[str]:
+    """None for a public address, else "fake_ip" or "non_public"."""
+    ip = ipaddress.ip_address(str(address).split("%", 1)[0])
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    if ip.version == 4 and ip in FAKE_IP_NETWORK:
+        return "fake_ip"
+    embedded = []
+    if ip.version == 6:
+        if ip.sixtofour is not None:
+            embedded.append(ip.sixtofour)
+        if ip in NAT64_NETWORK:
+            embedded.append(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+    if not ip.is_global or any(not inner.is_global for inner in embedded):
+        return "non_public"
+    return None
+
+
+async def resolve_host(host: str, port: int) -> list[str]:
+    """Addresses from the system resolver (hosts file, search domains and LAN name resolution included)."""
+    loop = asyncio.get_running_loop()
+    infos = await asyncio.wait_for(loop.getaddrinfo(host, port, type=socket.SOCK_STREAM), timeout=RESOLVE_TIMEOUT_S)
+    return list(dict.fromkeys(str(info[4][0]).split("%", 1)[0] for info in infos))
+
+
+async def check_destination(host: str, port: int) -> None:
+    """Raise BlockedAddress unless every address of host is public, ResolveFailed when it does not resolve."""
+    literal = literal_address(host)
+    if literal is not None:
+        kind = address_problem(literal)
+        if kind:
+            raise BlockedAddress(host, str(literal), kind, literal=True)
+        return
+    try:
+        addresses = await resolve_host(host, port)
+    except (OSError, asyncio.TimeoutError, UnicodeError, ValueError) as e:
+        raise ResolveFailed(f"{host}: {type(e).__name__}" + (f" {e}" if str(e) else "")) from e
+    if not addresses:
+        raise ResolveFailed(f"{host}: no addresses")
+    for address in addresses:
+        kind = address_problem(address)
+        if kind:
+            raise BlockedAddress(host, address, kind)
+
+
+def _host_of(url) -> Optional[str]:
+    try:
+        return httpx.URL(str(url)).raw_host.decode("ascii", "replace")
+    except Exception:
+        return None
+
+
+async def _guard_destination(request: httpx.Request) -> None:
+    """httpx request hook: runs before the first request and before every redirect hop."""
+    url = request.url
+    await check_destination(url.raw_host.decode("ascii", "replace"), url.port or (443 if url.scheme == "https" else 80))
 
 
 async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536) -> dict:
@@ -211,8 +316,12 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
                     if len(buf) >= max_bytes:
                         break
             status = response.status_code
-    except BlockedAddress:
-        return {"url": url, "status": None, "error": "blocked: redirect to a private or local address"}
+    except BlockedAddress as e:
+        first = _host_of(url)
+        where = "redirect target " if first is not None and e.host.lower() != first.lower() else ""
+        return {"url": url, "status": None, "blocked": True, "error": f"blocked: {where}{e}"}
+    except ResolveFailed as e:
+        return {"url": url, "status": None, "error": f"dns lookup failed: {e}"}
     except Exception as e:
         return {"url": url, "status": None, "error": type(e).__name__}
     title = ""
@@ -372,8 +481,10 @@ async def verify_answer(
             if doi and doi not in dois:
                 dois.append(doi)
             continue
-        if is_private_host(host):
-            skipped.append({"kind": "url", "value": url, "reason": "private or local address (not fetched)"})
+        literal = literal_address(host)
+        problem = address_problem(literal) if literal is not None else None
+        if problem:
+            skipped.append({"kind": "url", "value": url, "reason": f"blocked: {BlockedAddress(host, str(literal), problem, literal=True)} (not fetched)"})
             continue
         if url not in urls:
             urls.append(url)
@@ -389,12 +500,12 @@ async def verify_answer(
     sem = asyncio.Semaphore(5)
 
     # arXiv answers slowly (15 s and more) once it has throttled a client, so reads get more room than connects.
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=None),
-        follow_redirects=True,
-        headers={"User-Agent": user_agent},
-        event_hooks={"request": [_refuse_private_hosts]},
-    ) as client:
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=None)
+    headers = {"User-Agent": user_agent}
+    # Registry lookups go to fixed hosts; only the URL checks, whose targets come from the answer, are guarded.
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client, \
+            httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers,
+                              event_hooks={"request": [_guard_destination]}) as url_client:
 
         async def run_arxiv():
             if not arxiv_ids:
@@ -420,9 +531,11 @@ async def verify_answer(
 
         async def run_url(url: str):
             async with sem:
-                info = await check_url(url, client)
+                info = await check_url(url, url_client)
             status = info.get("status")
-            if status and status < 400:
+            if info.get("blocked"):
+                skipped.append({"kind": "url", "value": url, "reason": info["error"]})
+            elif status and status < 400:
                 result["urls"].append(info)
             else:
                 reason = f"status {status}" if status else info.get("error", "unreachable")
@@ -436,7 +549,7 @@ async def verify_answer(
         except asyncio.TimeoutError:
             result["timed_out"] = True
             # Whatever the cancelled lookups had not settled is reported explicitly rather than dropped.
-            seen = {(u["kind"], u["value"]) for u in result["unresolved"]}
+            seen = {(u["kind"], u["value"]) for u in result["unresolved"] + skipped}
             done_arxiv = {x["id"] for x in result["arxiv"]}
             done_doi = {x["doi"] for x in result["doi"]}
             done_url = {x["url"] for x in result["urls"]}

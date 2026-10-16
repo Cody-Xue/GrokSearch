@@ -6,9 +6,8 @@ from fastmcp import Client
 from grok_search import server
 
 
-async def toggle(arguments, roots=None):
-    kwargs = {"roots": roots} if roots else {}
-    async with Client(server.mcp, **kwargs) as client:
+async def toggle(arguments):
+    async with Client(server.mcp) as client:
         result = await client.call_tool("toggle_builtin_tools", arguments)
     return json.loads(next(block.text for block in result.content if block.type == "text"))
 
@@ -61,14 +60,6 @@ async def test_claude_project_dir_env(home, monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
     data = await toggle({"action": "status"})
     assert data["project_dir"] == str(project.resolve()) and data["project_dir_source"] == "CLAUDE_PROJECT_DIR"
-
-
-@pytest.mark.asyncio
-async def test_single_mcp_root(home, tmp_path):
-    project = tmp_path / "workspace"
-    project.mkdir()
-    data = await toggle({"action": "status"}, roots=[project.as_uri()])
-    assert data["project_dir"] == str(project.resolve()) and data["project_dir_source"] == "mcp_roots"
 
 
 @pytest.mark.asyncio

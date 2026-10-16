@@ -7,11 +7,13 @@ suffix in parentheses after the model name -- "grok-4(high)", "gemini(8192)",
 *base* name against that list and still sends the full name upstream.
 
 The list is cached per (url, key) for GROK_MODELS_CACHE_TTL_S seconds. Failed or
-empty fetches are never cached (a failure only suppresses refetching for a short
-backoff so a burst of parallel calls does not queue behind a dead endpoint), a
-name missing from a cached list triggers one forced refresh before it is
-rejected, a stale list never rejects a name, and get_config_info refreshes the
-cache whenever it runs.
+empty fetches are never cached; a failure only suppresses refetching for
+FAILURE_BACKOFF_S, and that backoff also applies to the refresh a cache miss
+triggers, so a dead /models endpoint costs one timeout per backoff window rather
+than one per waiting call. A name missing from a list older than
+MISS_REFRESH_MIN_AGE_S triggers one refresh before it is rejected; concurrent
+misses share that refresh. A stale list never rejects a name, and
+get_config_info refreshes the cache whenever it runs.
 """
 import asyncio
 import difflib
@@ -59,6 +61,19 @@ def parse_model_name(model: str) -> ModelName:
     else:
         kind = "unknown"
     return ModelName(raw, match.group("base"), value, kind)
+
+
+def routing_base(model: str) -> str:
+    """The model a CPA-style proxy actually routes to: thinking suffix and ":online" removed.
+
+    Used as the circuit-breaker key, so "grok-4(high)", "grok-4(low)" and "grok-4(8192)"
+    share one breaker state. Parentheses that are not a thinking suffix are kept.
+    """
+    raw = (model or "").strip()
+    if raw.endswith(":online"):
+        raw = raw[: -len(":online")]
+    name = parse_model_name(raw)
+    return name.base if name.suffix_kind in ("level", "budget", "empty") else name.raw
 
 
 def base_is_listed(base: str, models) -> bool:
@@ -122,29 +137,40 @@ class ModelListCache:
         self._entries.clear()
         self._failures.clear()
 
-    async def get(self, api_url: str, api_key: str, *, force_refresh: bool = False) -> ModelList:
+    async def get(self, api_url: str, api_key: str, *, refresh_older_than: Optional[float] = None) -> ModelList:
+        """Cached list, fetched when expired.
+
+        refresh_older_than: also refetch a list that is still within its TTL when it is at least
+        this old (used after a cache miss). A list younger than that is returned as-is, so callers
+        that queued behind a refresh reuse its result. A failure within FAILURE_BACKOFF_S is
+        returned without fetching, for refreshes too.
+        """
         key = (api_url, api_key)
         async with self._lock(key):
             cached = self._entries.get(key)
             now = self._clock()
-            if cached and not force_refresh and now - cached[0] < config.models_cache_ttl_s:
-                return ModelList(list(cached[1]), cached[0], from_cache=True)
+            if cached:
+                age = now - cached[0]
+                limit = config.models_cache_ttl_s if refresh_older_than is None else min(refresh_older_than, config.models_cache_ttl_s)
+                if age < limit:
+                    return ModelList(list(cached[1]), cached[0], from_cache=True)
             failure = self._failures.get(key)
-            if failure and not force_refresh and now - failure[0] < FAILURE_BACKOFF_S:
+            if failure and now - failure[0] < FAILURE_BACKOFF_S:
                 return self._failed(cached, failure[1])
             try:
                 models = await fetch_available_models(api_url, api_key)
             except Exception as e:
                 error = classify_exception("models", e)
-                self._failures[key] = (now, error)
+                self._failures[key] = (self._clock(), error)  # backoff starts when the attempt ended
                 return self._failed(cached, error)
+            done = self._clock()
             if not models:
                 error = ProviderError("models", "empty_content", "/models returned no model IDs")
-                self._failures[key] = (now, error)
+                self._failures[key] = (done, error)
                 return self._failed(cached, error)
-            self._entries[key] = (now, list(models))
+            self._entries[key] = (done, list(models))
             self._failures.pop(key, None)
-            return ModelList(list(models), now)
+            return ModelList(list(models), done)
 
     @staticmethod
     def _failed(cached, error: ProviderError) -> ModelList:
@@ -199,7 +225,8 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
     if listed(listing.models):
         return ModelCheck(True, requested, "listed", name.base)
     if listing.models and not listing.stale and listing.from_cache and cache.now() - listing.fetched_at >= MISS_REFRESH_MIN_AGE_S:
-        listing = await cache.get(api_url, api_key, force_refresh=True)
+        # One refresh for a miss; it honours the failure backoff and concurrent misses share it.
+        listing = await cache.get(api_url, api_key, refresh_older_than=MISS_REFRESH_MIN_AGE_S)
         if not listing.stale and listed(listing.models):
             return ModelCheck(True, requested, "listed_after_refresh", name.base)
     if not listing.models or listing.stale:
