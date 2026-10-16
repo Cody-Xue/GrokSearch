@@ -1,16 +1,24 @@
-"""Deterministic post-verification of identifiers cited in a search answer.
+"""Deterministic post-verification of identifiers and links cited in a search answer.
 
+What is checked:
 * arXiv IDs are resolved in one batch through the arXiv export API.
 * DOIs are resolved through Crossref.
 * Other cited URLs get a bounded GET (first 64 KB) to record status and title.
+  Private, loopback and link-local addresses are never fetched, also not via redirects.
+* When the answer writes a paper title next to an arXiv ID or DOI, that title is
+  compared with the registry title (title_checks).
 
-Nothing here depends on a model; the caller can compare the returned titles
-with what the answer claims and treat `unresolved` entries as suspect.
+What is NOT checked: whether a source supports the statement it is attached to.
+"Resolved" means "exists / reachable", not "true". Every identifier or URL that
+was not checked is listed in skipped with a reason. Nothing here depends on a model.
 """
 import asyncio
+import difflib
 import html
+import ipaddress
 import re
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 from typing import Optional
 from urllib.parse import unquote, urlparse
@@ -19,6 +27,13 @@ import httpx
 
 ARXIV_API = "https://export.arxiv.org/api/query"
 CROSSREF_API = "https://api.crossref.org/works/"
+
+SCOPE = (
+    "Existence and reachability only: arXiv IDs and DOIs are resolved against arXiv and Crossref, "
+    "cited URLs are fetched, and paper titles written next to an identifier are compared with the "
+    "registry title. Whether a source supports the sentence it is attached to is NOT checked."
+)
+MAX_SKIPPED_LISTED = 50
 
 # The arXiv API is reachable but flaky from some networks (sporadic 406 / connect
 # timeouts between otherwise healthy responses). One retry after the 3-second
@@ -157,6 +172,35 @@ async def lookup_doi(doi: str, client: httpx.AsyncClient) -> Optional[dict]:
     }
 
 
+class BlockedAddress(Exception):
+    """A URL check was redirected to a private or local address."""
+
+
+_LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".lan", ".home.arpa")
+
+
+def is_private_host(host: Optional[str]) -> bool:
+    """True for localhost-style names and private, loopback, link-local or reserved IP literals.
+
+    Hostnames are not resolved, so a public name that resolves to a private address is not caught.
+    """
+    host = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not host:
+        return True
+    if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
+        return True
+    try:
+        ip = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return False
+    return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+
+
+async def _refuse_private_hosts(request: httpx.Request) -> None:
+    if is_private_host(request.url.host):
+        raise BlockedAddress(request.url.host)
+
+
 async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536) -> dict:
     try:
         async with client.stream("GET", url) as response:
@@ -167,6 +211,8 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
                     if len(buf) >= max_bytes:
                         break
             status = response.status_code
+    except BlockedAddress:
+        return {"url": url, "status": None, "error": "blocked: redirect to a private or local address"}
     except Exception as e:
         return {"url": url, "status": None, "error": type(e).__name__}
     title = ""
@@ -174,6 +220,119 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
     if m:
         title = html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()[:200]
     return {"url": url, "status": status, "title": title}
+
+
+# --------------------------------------------------------------- title checks
+_LATEX_CMD_RE = re.compile(r"\\[a-zA-Z]+")
+_STRONG_TITLE_PATTERNS = (
+    re.compile(r'"([^"\n]{4,400}?)"'),
+    re.compile(r"“([^”\n]{4,400}?)”"),
+    re.compile(r"《([^》\n]{2,400}?)》"),
+    re.compile(r"「([^」\n]{2,400}?)」"),
+    re.compile(r"『([^』\n]{2,400}?)』"),
+    re.compile(r"«([^»\n]{4,400}?)»"),
+    re.compile(r"\[([^\[\]\n]{4,400}?)\]\(https?://[^)\s]+\)"),
+    re.compile(r"(?i)(?:\btitled\b|\btitle(?:\s+is)?\b|标题(?:为|是)?|题为|题目(?:为|是)?)\s*[:：]?\s*(.{4,400}?)(?=\s*(?:[.;。；\n]|\[\[|$))"),
+)
+_EMPHASIS_PATTERNS = (
+    re.compile(r"\*\*([^*\n]{4,400}?)\*\*"),
+    re.compile(r"(?<![\w*])\*([^*\n]{4,400}?)\*(?![\w*])"),
+    re.compile(r"(?<![\w_])_([^_\n]{4,400}?)_(?![\w_])"),
+)
+_ID_LEAD_RE = re.compile(r"(?i)[\s(（\[]*(?:arxiv|doi)?\s*(?:id|号)?\s*[:：]?\s*$")
+_BOUNDARY_RE = re.compile(r"[.;。；|](?:\s|$)|[。；|]|\n")
+_TRIM = " *_\"'“”《》()（）[]-—:：,，"
+
+
+def _norm_title(text: str) -> str:
+    text = html.unescape(text or "")
+    text = _LATEX_CMD_RE.sub(" ", text).replace("$", " ")
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = re.sub(r"[\W_]+", " ", text)
+    return " ".join(text.split())
+
+
+def _identifier_windows(answer: str, identifier: str, radius: int = 300) -> list[tuple[str, int, int]]:
+    """(window, id_start, id_end) for every occurrence of identifier, clipped to its line."""
+    windows = []
+    lowered, needle = answer.lower(), identifier.lower()
+    pos = lowered.find(needle)
+    while pos != -1:
+        line_start = answer.rfind("\n", 0, pos) + 1
+        line_end = answer.find("\n", pos)
+        line_end = len(answer) if line_end == -1 else line_end
+        start = max(line_start, pos - radius)
+        end = min(line_end, pos + len(identifier) + radius)
+        windows.append((answer[start:end], pos - start, pos - start + len(identifier)))
+        pos = lowered.find(needle, pos + len(needle))
+    return windows
+
+
+def _title_candidates(window: str, id_start: int, id_end: int, identifier: str, registry_len: int):
+    """Yield (candidate, strong). Strong candidates are explicitly marked as titles."""
+    ident = identifier.lower()
+    for pattern in _STRONG_TITLE_PATTERNS:
+        for m in pattern.finditer(window):
+            cand = m.group(1).strip()
+            if ident not in cand.lower():
+                yield cand, True
+    for pattern in _EMPHASIS_PATTERNS:
+        for m in pattern.finditer(window):
+            cand = m.group(1).strip()
+            if ident in cand.lower():
+                continue
+            # Bold is also used for whole sentences; only short, unpunctuated spans count as titles.
+            strong = not re.search(r"[.!?。！？]$", cand) and len(cand) <= max(80, int(registry_len * 1.5))
+            yield cand, strong
+    before = _BOUNDARY_RE.split(window[:id_start])[-1]
+    before = _ID_LEAD_RE.sub("", before).strip(_TRIM)
+    if before:
+        yield before, False
+    after = re.sub(r"^(?:v\d+)?[)\]）]*\s*[:：—–-]*\s*", "", window[id_end:])
+    after = _BOUNDARY_RE.split(after)[0].strip(_TRIM)
+    if after:
+        yield after, False
+
+
+def compare_title(answer: str, identifier: str, registry_title: str) -> Optional[dict]:
+    """Compare the title the answer gives for identifier with the registry title.
+
+    status: match | partial | possible_mismatch | not_stated. None when the
+    identifier does not occur in the answer text at all.
+    """
+    windows = _identifier_windows(answer or "", identifier)
+    if not windows:
+        return None
+    entry = {"registry_title": registry_title}
+    registry = _norm_title(registry_title)
+    if not registry:
+        return {**entry, "status": "not_stated"}
+    if any(registry in _norm_title(window) for window, _, _ in windows):
+        return {**entry, "status": "match"}
+    short = _norm_title(registry_title.split(":", 1)[0]) if ":" in registry_title else ""
+    scored = []
+    for window, start, end in windows:
+        for cand, strong in _title_candidates(window, start, end, identifier, len(registry_title)):
+            norm = _norm_title(cand)
+            if len(norm) < 3:
+                continue
+            ratio = difflib.SequenceMatcher(None, norm, registry).ratio()
+            if short and norm == short:
+                ratio = max(ratio, 0.95)  # "SWE-Review" for "SWE-Review: Closing the Loop"
+            scored.append((ratio, strong, cand))
+    if not scored:
+        return {**entry, "status": "not_stated"}
+    best = max(scored, key=lambda x: (x[0], x[1]))
+    if best[0] >= 0.9:
+        status, pick = "match", best
+    elif best[0] >= 0.6:
+        status, pick = "partial", best
+    else:
+        strong = [x for x in scored if x[1]]
+        if not strong:
+            return {**entry, "status": "not_stated"}
+        status, pick = "possible_mismatch", max(strong, key=lambda x: x[0])
+    return {**entry, "status": status, "answer_title": pick[2][:200], "similarity": round(pick[0], 2)}
 
 
 async def verify_answer(
@@ -186,15 +345,23 @@ async def verify_answer(
     max_urls: int = 30,
     max_dois: int = 30,
 ) -> dict:
-    arxiv_ids = extract_arxiv_ids(answer)
-    dois = extract_dois(answer)
+    answer = answer or ""
+    answer_arxiv = extract_arxiv_ids(answer)
+    answer_dois = extract_dois(answer)
+    arxiv_ids = list(answer_arxiv)
+    dois = list(answer_dois)
     urls: list[str] = []
+    skipped: list[dict] = []
     for source in sources or []:
         url = (source or {}).get("url")
-        if not isinstance(url, str) or not url.startswith("http"):
+        if not isinstance(url, str) or not url.strip():
             continue
+        url = url.strip()
         parsed = urlparse(url)
-        host = parsed.netloc.lower()
+        if parsed.scheme not in ("http", "https"):
+            skipped.append({"kind": "url", "value": url, "reason": "unsupported scheme (only http/https are checked)"})
+            continue
+        host = (parsed.hostname or "").lower()
         if host.endswith("arxiv.org"):
             idv = _arxiv_id_from_url(url)
             if idv and idv not in arxiv_ids:
@@ -205,17 +372,29 @@ async def verify_answer(
             if doi and doi not in dois:
                 dois.append(doi)
             continue
+        if is_private_host(host):
+            skipped.append({"kind": "url", "value": url, "reason": "private or local address (not fetched)"})
+            continue
         if url not in urls:
             urls.append(url)
+    skipped += [{"kind": "url", "value": u, "reason": f"over the per-answer limit of {max_urls} URL checks"} for u in urls[max_urls:]]
+    skipped += [{"kind": "doi", "value": d, "reason": f"over the per-answer limit of {max_dois} DOI lookups"} for d in dois[max_dois:]]
     urls = urls[:max_urls]
     dois = dois[:max_dois]
+    if not check_urls:
+        skipped += [{"kind": "url", "value": u, "reason": "URL checks disabled (GROK_VERIFY_URLS=false)"} for u in urls]
 
-    result: dict = {"arxiv": [], "doi": [], "urls": [], "unresolved": []}
-    user_agent = "grok-search-verify/1.10" + (f" (mailto:{mailto})" if mailto else "")
+    result: dict = {"scope": SCOPE, "claim_support": "not_checked", "arxiv": [], "doi": [], "urls": [], "unresolved": []}
+    user_agent = "grok-search-verify/1.11" + (f" (mailto:{mailto})" if mailto else "")
     sem = asyncio.Semaphore(5)
 
     # arXiv answers slowly (15 s and more) once it has throttled a client, so reads get more room than connects.
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=None), follow_redirects=True, headers={"User-Agent": user_agent}) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=None),
+        follow_redirects=True,
+        headers={"User-Agent": user_agent},
+        event_hooks={"request": [_refuse_private_hosts]},
+    ) as client:
 
         async def run_arxiv():
             if not arxiv_ids:
@@ -268,5 +447,30 @@ async def verify_answer(
 
     result["arxiv"].sort(key=lambda x: x["id"])
     result["doi"].sort(key=lambda x: x["doi"])
+
+    title_checks: list[dict] = []
+    for entry in result["arxiv"]:
+        if entry["id"] in answer_arxiv:
+            check = compare_title(answer, entry["id"], entry.get("title", ""))
+            if check:
+                title_checks.append({"kind": "arxiv", "id": entry["id"], **check})
+    for entry in result["doi"]:
+        if entry["doi"] in answer_dois:
+            check = compare_title(answer, entry["doi"], entry.get("title", ""))
+            if check:
+                title_checks.append({"kind": "doi", "id": entry["doi"], **check})
+    result["title_checks"] = title_checks
+    result["skipped"] = skipped[:MAX_SKIPPED_LISTED]
     result["checked"] = {"arxiv": len(arxiv_ids), "doi": len(dois), "urls": len(urls) if check_urls else 0}
+    statuses = [t["status"] for t in title_checks]
+    result["summary"] = {
+        "identifiers_found": len(result["arxiv"]) + len(result["doi"]),
+        "urls_reachable": len(result["urls"]),
+        "unresolved": len(result["unresolved"]),
+        "skipped": len(skipped),
+        "title_match": statuses.count("match"),
+        "title_partial": statuses.count("partial"),
+        "title_possible_mismatch": statuses.count("possible_mismatch"),
+        "title_not_stated": statuses.count("not_stated"),
+    }
     return result

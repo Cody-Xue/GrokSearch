@@ -164,3 +164,67 @@ async def test_verify_timeout_marks_pending_lookups(monkeypatch):
     assert result["timed_out"] is True
     assert {(u["kind"], u["value"], u["reason"]) for u in result["unresolved"]} == {
         ("arxiv", "2607.06065", "timed out"), ("doi", "10.1038/x", "timed out"), ("url", "https://example.test/slow", "timed out")}
+
+
+def mock_verify_client(monkeypatch, handler):
+    real = httpx.AsyncClient
+    monkeypatch.setattr(verify.httpx, "AsyncClient", lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs))
+
+
+async def atom_handler(request):
+    return httpx.Response(200, text=ATOM)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer, status", [
+    ("See [SWE-Review: Closing the Loop](https://arxiv.org/abs/2607.06065).", "match"),
+    ("SWE-Review (arXiv:2607.06065) closes the loop.", "match"),
+    ("The paper \u201cScaling Laws for Neural Language Models\u201d (arXiv:2607.06065) is relevant.", "possible_mismatch"),
+    ("**The paper arXiv 2607.06065 is about code review.**", "not_stated"),
+])
+async def test_title_checks(monkeypatch, answer, status):
+    mock_verify_client(monkeypatch, atom_handler)
+    result = await verify.verify_answer(answer, [], check_urls=False, timeout_s=5)
+    assert [(t["id"], t["status"]) for t in result["title_checks"]] == [("2607.06065", status)]
+    assert result["title_checks"][0]["registry_title"] == "SWE-Review: Closing the Loop"
+    assert result["summary"]["title_" + status] == 1
+
+
+@pytest.mark.asyncio
+async def test_scope_and_skipped_entries(monkeypatch):
+    async def handler(request):
+        return httpx.Response(200, text="<title>ok</title>")
+
+    mock_verify_client(monkeypatch, handler)
+    sources = [{"url": f"https://example.test/{i}"} for i in range(3)] + [
+        {"url": "http://127.0.0.1:8080/admin"}, {"url": "http://localhost/x"}, {"url": "ftp://example.test/file"}]
+    result = await verify.verify_answer("no identifiers here", sources, check_urls=True, timeout_s=5, max_urls=2)
+    assert result["claim_support"] == "not_checked" and "NOT checked" in result["scope"]
+    reasons = {item["value"]: item["reason"] for item in result["skipped"]}
+    assert reasons["https://example.test/2"] == "over the per-answer limit of 2 URL checks"
+    assert "private" in reasons["http://127.0.0.1:8080/admin"] and "private" in reasons["http://localhost/x"]
+    assert "scheme" in reasons["ftp://example.test/file"]
+    assert result["checked"]["urls"] == 2 and len(result["urls"]) == 2 and result["summary"]["skipped"] == 4
+
+
+@pytest.mark.asyncio
+async def test_disabled_url_checks_are_listed_as_skipped(monkeypatch):
+    mock_verify_client(monkeypatch, atom_handler)
+    result = await verify.verify_answer("see 2607.06065", [{"url": "https://example.test/x"}], check_urls=False, timeout_s=5)
+    assert result["skipped"] == [{"kind": "url", "value": "https://example.test/x", "reason": "URL checks disabled (GROK_VERIFY_URLS=false)"}]
+
+
+@pytest.mark.asyncio
+async def test_redirect_to_a_private_address_is_not_followed(monkeypatch):
+    hits = []
+
+    async def handler(request):
+        hits.append(request.url.host)
+        if request.url.host == "example.test":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+        return httpx.Response(200, text="<title>metadata</title>")
+
+    mock_verify_client(monkeypatch, handler)
+    result = await verify.verify_answer("x", [{"url": "https://example.test/r"}], check_urls=True, timeout_s=5)
+    assert hits == ["example.test"] and result["urls"] == []
+    assert result["unresolved"] == [{"kind": "url", "value": "https://example.test/r", "reason": "blocked: redirect to a private or local address"}]

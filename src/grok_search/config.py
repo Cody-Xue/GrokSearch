@@ -29,7 +29,7 @@ class Config:
     _SETUP_COMMAND = (
         'claude mcp add-json grok-search --scope user '
         '\'{"type":"stdio","command":"uvx","args":["--from",'
-        '"git+https://github.com/GuDaStudio/GrokSearch","grok-search"],'
+        '"git+https://github.com/Cody-Xue/GrokSearch@main","grok-search"],'
         '"env":{"GROK_API_URL":"your-api-url","GROK_API_KEY":"your-api-key"}}\''
     )
     _DEFAULT_MODEL = "grok-4-fast"
@@ -115,8 +115,14 @@ class Config:
     # ---------------------------------------------------------------- search
     @property
     def search_style(self) -> str:
-        style = os.getenv("GROK_SEARCH_STYLE", "explanatory").strip().lower()
-        return style if style in ("explanatory", "concise") else "explanatory"
+        """concise (default) or explanatory; unknown values fall back to concise."""
+        style = os.getenv("GROK_SEARCH_STYLE", "concise").strip().lower()
+        return style if style in ("explanatory", "concise") else "concise"
+
+    @property
+    def models_cache_ttl_s(self) -> float:
+        """How long a successful /models list is trusted; 0 refetches on every check."""
+        return max(0.0, _env_float("GROK_MODELS_CACHE_TTL_S", 600.0))
 
     @property
     def verify_ids(self) -> bool:
@@ -150,6 +156,11 @@ class Config:
     @property
     def tavily_extract_timeout_s(self) -> float:
         return max(5.0, _env_float("TAVILY_EXTRACT_TIMEOUT_S", 30.0))
+
+    @property
+    def fetch_snapshot_ttl_s(self) -> float:
+        """Idle lifetime of a web_fetch page snapshot used for paging."""
+        return max(30.0, _env_float("GROK_FETCH_SNAPSHOT_TTL_S", 900.0))
 
     # ------------------------------------------------------------- endpoints
     @property
@@ -185,12 +196,32 @@ class Config:
         return os.getenv("TAVILY_API_KEY")
 
     @property
+    def tavily_active(self) -> bool:
+        """Tavily is used only when it is enabled *and* has a key."""
+        return self.tavily_enabled and bool(self.tavily_api_key)
+
+    @property
     def firecrawl_api_url(self) -> str:
         return os.getenv("FIRECRAWL_API_URL", "https://api.firecrawl.dev/v2")
 
     @property
     def firecrawl_api_key(self) -> str | None:
         return os.getenv("FIRECRAWL_API_KEY")
+
+    @property
+    def firecrawl_active(self) -> bool:
+        return bool(self.firecrawl_api_key)
+
+    def provider_status(self) -> dict:
+        """Effective state of the optional engines, as used by web_fetch, web_map and extra_sources."""
+        if not self.tavily_enabled:
+            tavily = "disabled (TAVILY_ENABLED=false)"
+        elif not self.tavily_api_key:
+            tavily = "not configured (TAVILY_API_KEY)"
+        else:
+            tavily = "active"
+        firecrawl = "active" if self.firecrawl_active else "not configured (FIRECRAWL_API_KEY)"
+        return {"tavily": tavily, "firecrawl": firecrawl}
 
     @property
     def log_level(self) -> str:
@@ -287,6 +318,7 @@ class Config:
             "GROK_LOG_LEVEL": self.log_level,
             "GROK_LOG_DIR": str(self.log_dir),
             "GROK_SEARCH_STYLE": self.search_style,
+            "GROK_MODELS_CACHE_TTL_S": self.models_cache_ttl_s,
             "GROK_MAX_CONCURRENCY": self.max_concurrency,
             "GROK_RETRY_MAX_ATTEMPTS": self.retry_max_attempts,
             "GROK_RETRY_BUDGET_S": self.retry_budget_s,
@@ -301,12 +333,14 @@ class Config:
             "GROK_PLANNING_TOOLS": self.planning_tools_enabled,
             "GROK_FETCH_MIN_CHARS": self.fetch_min_chars,
             "GROK_FETCH_MAX_CHARS": self.fetch_max_chars,
+            "GROK_FETCH_SNAPSHOT_TTL_S": self.fetch_snapshot_ttl_s,
             "TAVILY_API_URL": self.tavily_api_url,
             "TAVILY_ENABLED": self.tavily_enabled,
             "TAVILY_EXTRACT_TIMEOUT_S": self.tavily_extract_timeout_s,
             "TAVILY_API_KEY": self._mask_api_key(self.tavily_api_key) if self.tavily_api_key else "未配置",
             "FIRECRAWL_API_URL": self.firecrawl_api_url,
             "FIRECRAWL_API_KEY": self._mask_api_key(self.firecrawl_api_key) if self.firecrawl_api_key else "未配置",
+            "providers": self.provider_status(),
             "config_status": config_status
         }
 

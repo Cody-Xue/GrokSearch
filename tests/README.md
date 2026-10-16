@@ -18,9 +18,12 @@ entries use `provider: "grok"` and retain repeated citation locations in a
 `citations` list. Numeric upstream titles become `label`; document titles stay
 in `title`. Both flat and nested `url_citation` shapes are accepted.
 
-Citation offsets are passed through in the upstream API's indexing convention.
-When native citations exist, `web_search.content` preserves the original answer,
-including whitespace and any sources section, so removing text does not shift
-those offsets. Existing text-source extraction remains the fallback for APIs
+When native citations exist, `web_search.content` keeps the original answer (whitespace and any
+sources section included) except that adjacent repeated citation markers are collapsed;
+every offset is then checked against that content. Offsets that point exactly at a
+`[[n]](url)` marker for the same URL (or at exactly one Markdown link to it) are kept and shifted
+if markers were collapsed; others are relocated to the next unclaimed marker for that URL
+or lose their coordinates. The upstream values stay in `upstream_start_index`/`upstream_end_index`
+and `position` says `relocated` or `removed`. Existing text-source extraction remains the fallback for APIs
 without annotations. Native sources, text sources, and optional extra search
 results are merged by URL, with native citation metadata taking precedence.

@@ -33,9 +33,11 @@ Claude ──MCP──► Grok Search Server
 - **只读工具注解**：`web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` 声明 `readOnlyHint`，Claude Code 会并行执行同一轮里的多次调用，而不是逐个排队
 - **并发上限 + 按模型熔断**：`GROK_MAX_CONCURRENCY` 限制同时在途的 Grok 请求；连续 429 或账号池耗尽时按模型档位熔断并返回结构化错误，冷却后自动探测恢复
 - **失败必有回声**：上游流内错误帧、429、空响应都会变成 `error`/`error_type`/`retry_after_s` 字段，不再静默返回空正文
-- **引用核验层**：回答里的 arXiv 号、DOI 和被引用 URL 分别经 arXiv API、Crossref 与实际页面核验，未命中的列入 `unresolved`
-- **抓取质量门槛与分页**：Tavily 结果过短时回退 Firecrawl 取较长者；arXiv 摘要页直接走 arXiv API；`max_chars`/`offset` 分页读取超长页面
-- **输出风格开关**：`GROK_SEARCH_STYLE=concise` 去掉术语定义与类比段落；两种风格都附带数字原样引用、不跨来源拼区间的硬规则
+- **按次换模型**：`web_search(model=...)` 支持 CPA 风格的思考后缀（如 `grok-4.7(high)`、`grok-4.7(8192)`），按基础名称对照 `/models` 校验、请求时保留完整名称；模型列表缓存有有效期，获取失败不缓存
+- **额外信源双引擎分配**：`extra_sources` 在 Tavily 与 Firecrawl 之间对半分配，与 Grok 已引用的链接及引擎之间去重，一方失败由另一方补位，过程写入 `extra_sources_report`
+- **核验层（不是事实核验）**：回答里的 arXiv 号、DOI 经 arXiv API / Crossref 确认存在，被引用 URL 确认可访问，回答中写出的论文标题与登记标题自动比对（`title_checks`）；**不检查来源是否支持对应论断**（`claim_support: not_checked`）。没检查的条目连同原因列在 `skipped`，内网与本机地址不访问
+- **抓取质量门槛与快照分页**：Tavily 结果过短时回退 Firecrawl 取较长者；arXiv 摘要页直接走 arXiv API；超长页面首屏返回 `snapshot_id`，后续页按 `offset` + `snapshot_id` 固定读取同一份内容，不会错页；失败时逐个列出各后端的错误类别、HTTP 状态和脱敏详情
+- **输出风格与引用规则**：默认 `concise`，`explanatory` 增加术语解释与类比。两种风格都只给来源直接陈述的事实挂引用；推断须标注“Inference:/推断：”，自写的解释与类比不挂引用；查不到的东西只表述为“本次检索未找到”；并附数字原样引用、不跨来源拼区间的硬规则
 - 一键禁用 Claude Code 官方 WebSearch/WebFetch，强制路由到本工具
 - 智能重试（支持 Retry-After 头解析 + 指数退避）
 - 父进程监控（Windows 下自动检测父进程退出，防止僵尸进程）
@@ -78,7 +80,7 @@ claude mcp remove grok-search
 ```
 
 
-将以下命令中的环境变量替换为你自己的值后执行。Grok 接口需为 OpenAI 兼容格式；Tavily 为可选配置，未配置时工具 `web_fetch` 和 `web_map` 不可用。
+将以下命令中的环境变量替换为你自己的值后执行。Grok 接口需为 OpenAI 兼容格式；Tavily 与 Firecrawl 为可选配置：`web_fetch` 至少需要其中之一，`web_map` 需要 Tavily。
 
 ```bash
 claude mcp add-json grok-search --scope user '{
@@ -86,7 +88,7 @@ claude mcp add-json grok-search --scope user '{
   "command": "uvx",
   "args": [
     "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
+    "git+https://github.com/Cody-Xue/GrokSearch@main",
     "grok-search"
   ],
   "env": {
@@ -107,13 +109,14 @@ self signed certificate in certificate chain
 
 可以在 uvx 参数中添加 --native-tls，使其使用系统证书库：
 
+```bash
 claude mcp add-json grok-search --scope user '{
   "type": "stdio",
   "command": "uvx",
   "args": [
     "--native-tls",
     "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
+    "git+https://github.com/Cody-Xue/GrokSearch@main",
     "grok-search"
   ],
   "env": {
@@ -123,7 +126,9 @@ claude mcp add-json grok-search --scope user '{
     "TAVILY_API_URL": "https://api.tavily.com"
   }
 }'
-</details> ```
+```
+
+</details>
 
 除此之外，你还可以在`env`字段中配置更多环境变量
 
@@ -134,7 +139,7 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_MODEL` | ❌ | `grok-4-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json`） |
 | `TAVILY_API_KEY` | ❌ | - | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `https://api.tavily.com` | Tavily API 地址 |
-| `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily |
+| `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily；`false` 时 `web_fetch`、`web_map`、`extra_sources` 都不会调用 Tavily（即使配置了 key） |
 | `FIRECRAWL_API_KEY` | ❌ | - | Firecrawl API 密钥（Tavily 失败时托底） |
 | `FIRECRAWL_API_URL` | ❌ | `https://api.firecrawl.dev/v2` | Firecrawl API 地址 |
 | `GROK_DEBUG` | ❌ | `false` | 调试模式 |
@@ -149,14 +154,16 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_BREAKER_WINDOW_S` | ❌ | `60` | 熔断计数窗口（秒） |
 | `GROK_BREAKER_COOLDOWN_S` | ❌ | `60` | 初始冷却时间（秒），探测失败后倍增 |
 | `GROK_BREAKER_MAX_COOLDOWN_S` | ❌ | `300` | 冷却时间上限（秒） |
-| `GROK_SEARCH_STYLE` | ❌ | `explanatory` | 输出风格：`explanatory` 或 `concise` |
+| `GROK_SEARCH_STYLE` | ❌ | `concise` | 输出风格：`concise` 或 `explanatory`（增加术语解释与类比，类比不挂引用） |
+| `GROK_MODELS_CACHE_TTL_S` | ❌ | `600` | `/models` 列表缓存有效期（秒），用于校验 `web_search(model=...)`；获取失败不缓存，`get_config_info` 会刷新 |
 | `GROK_VERIFY_IDS` | ❌ | `true` | 回答里的 arXiv 号与 DOI 是否自动核验 |
-| `GROK_VERIFY_URLS` | ❌ | `true` | 被引用的 URL 是否做可达性与标题核验 |
+| `GROK_VERIFY_URLS` | ❌ | `true` | 被引用的 URL 是否做可达性与标题核验（不访问内网、本机与链路本地地址，重定向到这些地址也会拦截） |
 | `GROK_VERIFY_TIMEOUT_S` | ❌ | `30` | 核验层总超时（秒）；超时未完成的条目以 `timed out` 列入 `unresolved`。所有 arXiv API 调用共用 3 秒间隔的闸门并缓存一小时 |
 | `GROK_VERIFY_MAILTO` | ❌ | 空 | 核验请求的 User-Agent 联系邮箱（Crossref 礼貌池） |
 | `GROK_PLANNING_TOOLS` | ❌ | `false` | 是否注册 `plan_*` 六个搜索规划工具 |
 | `GROK_FETCH_MIN_CHARS` | ❌ | `2000` | Tavily 抓取结果低于此长度时回退 Firecrawl |
 | `GROK_FETCH_MAX_CHARS` | ❌ | `40000` | `web_fetch` 单次默认返回字符数 |
+| `GROK_FETCH_SNAPSHOT_TTL_S` | ❌ | `900` | `web_fetch` 分页快照的空闲有效期（秒），过期后需从 `offset=0` 重新抓取 |
 | `TAVILY_EXTRACT_TIMEOUT_S` | ❌ | `30` | Tavily 提取超时（秒） |
 
 
@@ -177,7 +184,7 @@ claude mcp list
 ## 三、MCP 工具介绍
 
 <details>
-<summary>本项目提供八个 MCP 工具（展开查看）</summary>
+<summary>默认提供 7 个 MCP 工具；设置 `GROK_PLANNING_TOOLS=true` 后另加 6 个 `plan_*` 规划工具（展开查看）</summary>
 
 ### `web_search` — AI 网络搜索
 
@@ -185,21 +192,30 @@ claude mcp list
 
 `web_search` 输出不展开信源，仅返回 `sources_count`；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。
 
-新增参数：`instructions`（按次追加给搜索模型的要求，例如"至少覆盖 15 个不同域名"或"只列 arXiv 号和标题"）、`verify`（默认 `true`，对回答里的 arXiv 号、DOI 与被引用 URL 做核验）。返回值除 `content`/`sources_count` 外还有 `distinct_domains`（引用了多少个不同站点）、`verification`（`arxiv`/`doi`/`urls` 三组核验结果与 `unresolved` 列表），失败时有 `error`/`error_type`/`retry_after_s`，正文以 `[搜索失败]` 开头。`extra_sources > 0` 时，Tavily/Firecrawl 的独立结果会以 "Extra sources" 小节附在正文末尾。
+参数 `instructions` 用于按次追加给搜索模型的要求（例如"至少覆盖 15 个不同域名"或"只列 arXiv 号和标题"）。返回值除 `content`/`sources_count` 外还有 `distinct_domains`（引用了多少个不同站点）；失败时有 `error`/`error_type`/`retry_after_s`，正文以 `[搜索失败]` 开头。
+
+- **引用位置**：有原生引用时，相邻重复的引用标记（如 `[[1]](u)[[1]](u)`）会合并，`get_sources` 返回的 `start_index`/`end_index` 一律对应最终返回的正文。对不上的位置会重新定位（`position: relocated`）或去掉坐标（`position: removed`），上游原值保留在 `upstream_start_index`/`upstream_end_index`，统计见 `citation_positions`。
+- **核验层 `verification`**：只检查标识符是否存在（arXiv / Crossref）、被引用链接能否访问，以及回答里写在 arXiv 号或 DOI 旁边的论文标题与登记标题是否一致（`title_checks`：`match` / `partial` / `possible_mismatch` / `not_stated`）。**不检查来源是否支持对应论断**，`claim_support` 固定为 `not_checked`；未检查的条目及原因（超出数量上限、URL 检查已关闭、内网地址、非 http 链接）列在 `skipped`，汇总见 `summary`。
+- **模型 `model`**：可带 CPA 思考后缀，如 `grok-4.7(high)`、`grok-4.7(8192)`、`grok-4.7(auto)`。与默认模型完全相同（含后缀）或基础名称相同时直接放行；其他模型按基础名称对照 `/models` 校验，请求时保留完整名称。列表获取失败时不拦截（`model_check.status = unverified`）。
+- **额外信源 `extra_sources`**（0–20）：两个引擎都可用时 Tavily 分 ⌈n/2⌉、Firecrawl 分 ⌊n/2⌋，每个引擎多取 2 条备用；与 Grok 已引用的链接及引擎之间去重（忽略协议、`www.`、片段、末尾斜杠和跟踪参数），按轮流顺序选取；某个引擎失败或结果不足时，由另一个引擎补一次。结果附在正文末尾的 "Extra sources" 小节，过程见 `extra_sources_report`。
+- **“没找到”的含义**：回答中的“本次检索未找到”只代表这次搜索没找到；需要确定结论时，直接到对应平台核实（例如用 `web_fetch` 打开仓库的 issue 搜索页）。
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `query` | string | ✅ | - | 搜索查询语句 |
 | `platform` | string | ❌ | `""` | 聚焦平台（如 `"Twitter"`, `"GitHub, Reddit"`） |
-| `model` | string | ❌ | `null` | 按次指定 Grok 模型 ID |
-| `extra_sources` | int | ❌ | `0` | 额外补充信源数量（Tavily/Firecrawl，可为 0 关闭） |
+| `model` | string | ❌ | `""` | 按次指定 Grok 模型 ID，可带思考后缀 |
+| `extra_sources` | int | ❌ | `0` | 额外补充信源数量（0–20，Tavily/Firecrawl，0 关闭） |
+| `instructions` | string | ❌ | `""` | 按次追加给搜索模型的要求 |
+| `verify` | bool | ❌ | `true` | 是否附加核验层（同时受 `GROK_VERIFY_IDS` 控制） |
 
 每次搜索自动注入本地日期、时间与时区上下文，以提升时效性搜索的准确度。
 
 返回值（结构化字典）：
 - `session_id`: 本次查询的会话 ID
-- `content`: Grok 回答正文（已自动剥离信源）
-- `sources_count`: 已缓存的信源数量
+- `content`: Grok 回答正文（无原生引用时剥离信源小节；有原生引用时保留原文，只合并重复标记）
+- `sources_count` / `distinct_domains`: 已缓存的信源数量 / 不同站点数
+- `citation_positions`、`verification`、`extra_sources_report`、`model_check`：见上文，按需出现
 
 ### `get_sources` — 获取信源
 
@@ -216,11 +232,18 @@ claude mcp list
 
 ### `web_fetch` — 网页内容抓取
 
-通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily 失败时自动降级到 Firecrawl Scrape 进行托底抓取。
+通过 Tavily Extract API 获取完整网页内容，返回 Markdown 格式。Tavily 失败或结果过短时自动降级到 Firecrawl Scrape；arXiv 摘要页直接走 arXiv API。
 
-| 参数 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| `url` | string | ✅ | 目标网页 URL |
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `url` | string | ✅ | - | 目标网页 URL |
+| `max_chars` | int | ❌ | `0` | 本次最多返回的字符数，`0` 使用 `GROK_FETCH_MAX_CHARS` |
+| `offset` | int | ❌ | `0` | 从第几个字符开始读；大于 0 时必须同时传 `snapshot_id` |
+| `snapshot_id` | string | ❌ | `""` | 首屏返回的快照 ID，用于读取后续页 |
+
+首行是元数据：`[web_fetch] source=… total_chars=… offset=… returned=… truncated=… [next_offset=… snapshot_id=… expires_in_s=…]`。页面超过一次能返回的长度时，服务端保存整页快照；后续用相同 `url` 加 `offset=next_offset` 与 `snapshot_id` 翻页，每一页都切自同一份内容。不带 `snapshot_id` 的 `offset>0` 会被拒绝；快照过期（默认空闲 900 秒）后返回 `error=snapshot_expired`，需从 `offset=0` 重新抓取。
+
+失败时首行为 `[web_fetch] error=…`，随后逐行列出每个后端的错误类别（`auth`、`quota`、`rate_limit`、`timeout`、`proxy_config`、`network`、`upstream_error`、`bad_request`、`extract_failed`、`empty_content`、`disabled`、`not_configured` 等）、HTTP 状态和脱敏后的详情。
 
 ### `web_map` — 站点结构映射
 
@@ -234,10 +257,17 @@ claude mcp list
 | `max_breadth` | int | ❌ | `20` | 每页最大跟踪链接数（1-500） |
 | `limit` | int | ❌ | `50` | 总链接处理数上限（1-500） |
 | `timeout` | int | ❌ | `150` | 超时秒数（10-150） |
+| `allow_external` | bool | ❌ | `true` | 是否包含站外链接（与 Tavily 默认一致）；设为 `false` 只保留起始站点 |
+| `select_paths` | string[] | ❌ | - | 只保留路径匹配这些正则的 URL，如 `["/docs/.*"]` |
+| `select_domains` | string[] | ❌ | - | 只在匹配这些正则的域名/子域名内遍历 |
+| `exclude_paths` | string[] | ❌ | - | 跳过路径匹配这些正则的 URL |
+| `exclude_domains` | string[] | ❌ | - | 跳过匹配这些正则的域名/子域名 |
+
+`TAVILY_ENABLED=false` 时 `web_map` 不可用。结果较少或返回很快不一定是故障，可用上述参数与 `max_depth` 调整范围。
 
 ### `get_config_info` — 配置诊断
 
-无需参数。显示所有配置状态、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏）。
+无需参数。显示所有配置状态（含 Tavily/Firecrawl 实际是否启用）、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏），并刷新 `web_search(model=...)` 校验用的模型列表缓存。本地代理环境错误（如 `NO_PROXY` 中的 `[::1]`）会单独标为“本地代理环境错误”。
 
 ### `switch_model` — 模型切换
 
@@ -252,12 +282,13 @@ claude mcp list
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | `action` | string | ❌ | `"status"` | `"on"` 禁用官方工具 / `"off"` 启用官方工具 / `"status"` 查看状态 |
+| `project_dir` | string | ❌ | `""` | 项目根目录；不传时按下述顺序确定 |
 
-修改项目级 `.claude/settings.json` 的 `permissions.deny`，一键禁用 Claude Code 官方的 WebSearch 和 WebFetch。
+修改 `<项目目录>/.claude/settings.json` 的 `permissions.deny`，一键禁用 Claude Code 官方的 WebSearch 和 WebFetch。项目目录依次取：`project_dir` 参数 → 环境变量 `CLAUDE_PROJECT_DIR` → 客户端通过 MCP roots 提供的唯一工作区 → 从服务进程当前目录向上找到的、含 `.git` 或 `.claude` 的最近目录（不会取到用户主目录或文件系统根目录）。都找不到时不写任何文件，并提示传入 `project_dir`；配置文件无法解析时也不会覆盖。
 
-### `search_planning` — 搜索规划
+### `plan_*` — 搜索规划（可选，默认不注册）
 
-结构化搜索规划脚手架（分阶段、多轮），用于在执行复杂搜索前先生成可执行的搜索计划。
+设置 `GROK_PLANNING_TOOLS=true` 后额外注册 6 个工具，按阶段记录复杂搜索的计划：`plan_intent` → `plan_complexity` → `plan_sub_query` → `plan_search_term` → `plan_tool_mapping` → `plan_execution`。它们只做记录，不发起搜索。
 </details>
 
 ## 四、常见问题
@@ -266,7 +297,7 @@ claude mcp list
 <summary>
 Q: 必须同时配置 Grok 和 Tavily 吗？
 </summary>
-A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；两者均未配置时 `web_fetch` 将返回配置错误提示。`web_map` 依赖 Tavily。
+A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；两者均未配置时 `web_fetch` 将返回配置错误提示。`web_map` 依赖 Tavily。设置 `TAVILY_ENABLED=false` 可以在保留 key 的情况下停用 Tavily：此时 `web_fetch` 只用 Firecrawl，`web_map` 不可用，`extra_sources` 只走 Firecrawl。
 </details>
 
 <details>
@@ -297,6 +328,19 @@ A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 AP
 </div>
 
 ## 变更记录
+
+### v1.11.0（2026-10-16）
+
+- `web_search(model=...)` 支持 CPA 思考后缀（如 `(high)`、`(8192)`）：默认模型及其同名档位直接放行，其他模型按基础名称校验、请求时保留完整名称；`/models` 列表缓存加有效期（`GROK_MODELS_CACHE_TTL_S`），失败不缓存，旧列表不再误拒新模型，`get_config_info` 会刷新缓存。
+- `extra_sources` 修正配额：Tavily/Firecrawl 对半分配、与 Grok 引用及引擎之间去重、失败互相补位，过程写入 `extra_sources_report`。
+- 默认输出风格改为 `concise`；提示词取消“每句话必须引用”，改为只给来源直接陈述的事实挂引用、推断明确标注、自写解释与类比不挂引用、“没找到”只表述为“本次检索未找到”。
+- 核验层明确只做存在性与可达性检查（`scope`、`claim_support: not_checked`），新增论文标题比对 `title_checks`、未检查项 `skipped` 与 `summary`；内网/本机地址（含重定向）不再访问。
+- `web_fetch` 改为快照分页（`snapshot_id`），翻页不再重新抓取；失败时按后端返回错误类别、HTTP 状态与脱敏详情。`TAVILY_ENABLED=false` 现在真正停用 Tavily（抓取、映射与额外信源）。
+- 原生引用位置按最终正文校验：合并重复标记后重算位置，对不上的重新定位或去掉坐标（保留上游原值），统计见 `citation_positions`。
+- `web_map` 新增 `allow_external`、`select_paths`、`select_domains`、`exclude_paths`、`exclude_domains`。
+- `toggle_builtin_tools` 新增 `project_dir`，按参数 → `CLAUDE_PROJECT_DIR` → MCP roots → 最近的 `.git`/`.claude` 目录确定项目，找不到时不再写到文件系统根目录。
+- 启动时修复 `NO_PROXY` 中 httpx 无法解析的方括号 IPv6 条目（如 `[::1]`），避免所有联网工具报 `Invalid port: ':1]'`；`get_config_info` 会把这类本地代理问题单独标出。
+- README：安装地址改为本仓库，工具数量更正为默认 7 个 + 可选 6 个规划工具；英文 README 删除代码中并不存在的 `GUDA_*` 配置说明。
 
 ### v1.10.0（2026-09-17）
 

@@ -11,6 +11,7 @@ from tenacity import wait_none
 from grok_search import server
 from grok_search.providers import grok
 from grok_search.providers.grok import GrokResponse, GrokSearchProvider
+from grok_search.citations import find_markers, normalize_citations
 from grok_search.sources import SourcesCache, sources_from_annotations
 
 
@@ -141,7 +142,8 @@ async def call(client, name, arguments):
 
 
 @pytest.mark.asyncio
-async def test_mcp_search_caches_native_sources_and_preserves_original_offsets(configured_server, captured, monkeypatch):
+async def test_offsets_that_miss_the_answer_lose_their_coordinates(configured_server, captured, monkeypatch):
+    # The captured offsets belong to an answer that was not retained; this body has no markers at all.
     body = "  " + "answer " * 300 + "\n\nSources:\n- [extra](https://example.test/extra)\n"
     monkeypatch.setattr(GrokSearchProvider, "search_with_sources", AsyncMock(return_value=GrokResponse(body, captured["annotations"])))
     async with Client(configured_server) as client:
@@ -150,7 +152,63 @@ async def test_mcp_search_caches_native_sources_and_preserves_original_offsets(c
     assert result["content"] == body
     assert result["sources_count"] == cached["sources_count"] == 8
     assert {item["url"] for item in cached["sources"][:7]} == set(captured["unique_urls"])
-    assert sum(len(item.get("citations", [])) for item in cached["sources"]) == 13
+    occurrences = [occ for item in cached["sources"] for occ in item.get("citations", [])]
+    assert len(occurrences) == 13
+    assert all(occ["position"] == "removed" and "start_index" not in occ for occ in occurrences)
+    assert (occurrences[0]["upstream_start_index"], occurrences[0]["upstream_end_index"]) == (54, 107)
+    assert result["citation_positions"] == {"markers": 0, "duplicate_markers_removed": 0, "checked": 13, "valid": 0, "relocated": 0, "removed": 13}
+
+
+U1, U2 = "https://example.test/one", "https://example.test/two"
+MARKED = f"[[1]]({U1})[[1]]({U1})[[2]]({U2}) First fact.[[1]]({U1})[[1]]({U1}) Second fact.[[2]]({U2})"
+CLEANED = f"[[1]]({U1})[[2]]({U2}) First fact.[[1]]({U1}) Second fact.[[2]]({U2})"
+
+
+async def search_with(server_app, monkeypatch, content, annotations):
+    monkeypatch.setattr(GrokSearchProvider, "search_with_sources", AsyncMock(return_value=GrokResponse(content, annotations)))
+    async with Client(server_app) as client:
+        result = await call(client, "web_search", {"query": "test"})
+        cached = await call(client, "get_sources", {"session_id": result["session_id"]})
+    return result, cached
+
+
+@pytest.mark.asyncio
+async def test_valid_offsets_follow_collapsed_duplicate_markers(configured_server, monkeypatch):
+    annotations = [citation(m.url, title=m.label, start_index=m.start, end_index=m.end) for m in find_markers(MARKED)]
+    result, cached = await search_with(configured_server, monkeypatch, MARKED, annotations)
+    assert result["content"] == CLEANED
+    report = result["citation_positions"]
+    assert report["duplicate_markers_removed"] == 2 and report["valid"] == 6 and report["relocated"] == report["removed"] == 0
+    occurrences = [(source["url"], occ) for source in cached["sources"] for occ in source["citations"]]
+    assert len(occurrences) == 4  # one per remaining marker
+    for url, occ in occurrences:
+        assert "position" not in occ
+        assert CLEANED[occ["start_index"]:occ["end_index"]] == f"[[{occ['label']}]]({url})"
+
+
+@pytest.mark.asyncio
+async def test_scaled_offsets_are_relocated_to_their_markers(configured_server, monkeypatch):
+    annotations = [citation(m.url, title=m.label, start_index=m.start * 2, end_index=m.end * 2) for m in find_markers(MARKED)]
+    result, cached = await search_with(configured_server, monkeypatch, MARKED, annotations)
+    assert result["content"] == CLEANED and result["citation_positions"]["relocated"] == 6
+    occurrences = [(source["url"], occ) for source in cached["sources"] for occ in source["citations"]]
+    assert len(occurrences) == 4
+    for url, occ in occurrences:
+        assert occ["position"] == "relocated" and "upstream_start_index" in occ
+        assert CLEANED[occ["start_index"]:occ["end_index"]] == f"[[{occ['label']}]]({url})"
+
+
+def test_markdown_link_spans_are_accepted():
+    text = "Fact ([example.test](https://example.test/a)). More."
+    start, end = text.index("("), text.index(")).") + 2
+    cleaned, sources, report = normalize_citations(text, [{"url": "https://example.test/a", "citations": [{"start_index": start, "end_index": end}]}])
+    assert cleaned == text and report["valid"] == 1
+    assert sources[0]["citations"] == [{"start_index": start, "end_index": end}]
+
+
+def test_markers_without_annotations_are_deduplicated():
+    cleaned, _, report = normalize_citations(MARKED, [])
+    assert cleaned == CLEANED and report["duplicate_markers_removed"] == 2 and report["checked"] == 0
 
 
 @pytest.mark.asyncio

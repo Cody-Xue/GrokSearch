@@ -69,9 +69,13 @@ def test_concise_style_drops_explanatory_rules_but_keeps_strategy():
     explanatory = build_search_prompt("explanatory")
     assert "real-world analogies" in explanatory and "Define every technical term" in explanatory
     assert "real-world analogies" not in concise and "Define every technical term" not in concise
+    assert build_search_prompt() == concise
     for prompt in (concise, explanatory):
         assert "Breadth-First Search" in prompt and "Depth-First Search" in prompt
         assert "Never combine numbers" in prompt and "Never invent identifiers" in prompt
+        assert "Every sentence must cite" not in prompt and "Every claim must be followed by a citation" not in prompt
+        assert "not found in this search" in prompt and "Inference:" in prompt
+        assert "never attach a citation to them" in prompt
 
 
 @pytest.mark.asyncio
@@ -82,6 +86,17 @@ async def test_style_env_selects_prompt(monkeypatch):
     monkeypatch.setenv("GROK_SEARCH_STYLE", "concise")
     await provider.search_with_sources("q")
     assert "real-world analogies" not in execute.call_args.args[1]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_default_style_is_concise(monkeypatch):
+    monkeypatch.delenv("GROK_SEARCH_STYLE", raising=False)
+    provider = GrokSearchProvider("https://api.example.test/v1", "test-key")
+    execute = AsyncMock(return_value=GrokResponse("ok"))
+    monkeypatch.setattr(provider, "_execute_stream_result_with_retry", execute)
+    await provider.search_with_sources("q")
+    system = execute.call_args.args[1]["messages"][0]["content"]
+    assert "real-world analogies" not in system and "Inference:" in system
 
 
 @pytest.mark.asyncio

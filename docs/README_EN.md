@@ -20,7 +20,7 @@ Grok Search MCP is an MCP server built on [FastMCP](https://github.com/jlowin/fa
 ```
 Claude --MCP--> Grok Search Server
                   ├─ web_search  ---> Grok API (AI Search)
-                  ├─ web_fetch   ---> Tavily Extract (Content Extraction)
+                  ├─ web_fetch   ---> Tavily Extract -> Firecrawl Scrape (extraction with fallback)
                   └─ web_map     ---> Tavily Map (Site Mapping)
 ```
 
@@ -32,9 +32,11 @@ Claude --MCP--> Grok Search Server
 - **Read-only tool annotations**: `web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` declare `readOnlyHint`, so Claude Code runs several calls from one turn in parallel instead of one after another
 - **Concurrency cap + per-model circuit breaker**: `GROK_MAX_CONCURRENCY` bounds in-flight Grok requests; repeated 429s or an exhausted account pool open a breaker for that model tier and return a structured error, with half-open probing to recover
 - **Failures are never silent**: in-stream error frames, HTTP 429 and empty responses become `error`/`error_type`/`retry_after_s` fields instead of an empty answer
-- **Citation verification layer**: arXiv IDs, DOIs and cited URLs in the answer are resolved through the arXiv API, Crossref and the live page; misses are listed under `unresolved`
-- **Fetch quality gate and paging**: short Tavily extracts fall back to Firecrawl and the longer result wins; arXiv abstract pages use the arXiv API; `max_chars`/`offset` page through long documents
-- **Output style switch**: `GROK_SEARCH_STYLE=concise` drops term definitions and analogies; both styles carry hard rules to quote numbers verbatim and never merge figures across sources
+- **Per-call models**: `web_search(model=...)` accepts CPA-style thinking suffixes (e.g. `grok-4.7(high)`, `grok-4.7(8192)`), validates the base name against `/models` and sends the full name; the model list is cached with a TTL and failures are not cached
+- **Dual-engine extra sources**: `extra_sources` is split between Tavily and Firecrawl, deduplicated against Grok's citations and across engines, and a failed engine is backfilled by the other (`extra_sources_report`)
+- **Verification layer (not fact-checking)**: arXiv IDs and DOIs are confirmed to exist via the arXiv API / Crossref, cited URLs are confirmed reachable, and paper titles written in the answer are compared with the registry title (`title_checks`). It does **not** check whether a source supports the claim (`claim_support: not_checked`); anything not checked is listed in `skipped` with a reason, and private or local addresses are never fetched
+- **Fetch quality gate and snapshot paging**: short Tavily extracts fall back to Firecrawl and the longer result wins; arXiv abstract pages use the arXiv API; long pages return a `snapshot_id` and every later page is cut from the same snapshot; failures list each backend with error category, HTTP status and a redacted detail
+- **Output style and citation rules**: `concise` by default, `explanatory` adds term definitions and analogies. Both styles cite only statements a source makes, label inferences ("Inference:"), never cite self-written explanations or analogies, report absence as "not found in this search", and quote numbers verbatim without merging figures across sources
 - One-click disable Claude Code's built-in WebSearch/WebFetch, force routing to this tool
 - Smart retry (Retry-After header parsing + exponential backoff)
 - Parent process monitoring (auto-detects parent process exit on Windows, prevents zombie processes)
@@ -80,11 +82,7 @@ If you have previously installed this project, remove the old MCP first:
 claude mcp remove grok-search
 ```
 
-Replace the environment variables in the following command with your own values. The Grok endpoint must be OpenAI-compatible; Tavily is optional — `web_fetch` and `web_map` will be unavailable without it.
-
-#### GuDa Users (Recommended)
-
-GuDa users only need to set `GUDA_API_KEY` to access all services — API URLs are automatically derived:
+Replace the environment variables in the following command with your own values. The Grok endpoint must be OpenAI-compatible; Tavily and Firecrawl are optional: `web_fetch` needs at least one of them and `web_map` needs Tavily.
 
 ```bash
 claude mcp add-json grok-search --scope user '{
@@ -92,26 +90,7 @@ claude mcp add-json grok-search --scope user '{
   "command": "uvx",
   "args": [
     "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
-    "grok-search"
-  ],
-  "env": {
-    "GUDA_API_KEY": "your-guda-api-key"
-  }
-}'
-```
-
-#### Custom Configuration
-
-To use your own API endpoints, configure each service separately:
-
-```bash
-claude mcp add-json grok-search --scope user '{
-  "type": "stdio",
-  "command": "uvx",
-  "args": [
-    "--from",
-    "git+https://github.com/GuDaStudio/GrokSearch@grok-with-tavily",
+    "git+https://github.com/Cody-Xue/GrokSearch@main",
     "grok-search"
   ],
   "env": {
@@ -127,16 +106,14 @@ You can also configure additional environment variables in the `env` field:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GUDA_API_KEY` | No | - | GuDa API key (auto-derives all service URLs and keys when set) |
-| `GUDA_BASE_URL` | No | `https://code.guda.studio` | GuDa service base URL |
-| `GROK_API_URL` | No | `{GUDA_BASE_URL}/grok/v1` | Grok API endpoint (OpenAI-compatible), overrides GuDa-derived value |
-| `GROK_API_KEY` | No | `{GUDA_API_KEY}` | Grok API key, overrides GuDa-derived value |
-| `GROK_MODEL` | No | `grok-4.20-beta` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
-| `TAVILY_API_KEY` | No | `{GUDA_API_KEY}` | Tavily API key (for web_fetch / web_map) |
-| `TAVILY_API_URL` | No | `{GUDA_BASE_URL}/tavily` | Tavily API endpoint |
-| `TAVILY_ENABLED` | No | `true` | Enable Tavily |
-| `FIRECRAWL_API_KEY` | No | `{GUDA_API_KEY}` | Firecrawl API key (fallback when Tavily fails) |
-| `FIRECRAWL_API_URL` | No | `{GUDA_BASE_URL}/firecrawl` | Firecrawl API endpoint |
+| `GROK_API_URL` | Yes | - | Grok API endpoint (OpenAI-compatible) |
+| `GROK_API_KEY` | Yes | - | Grok API key |
+| `GROK_MODEL` | No | `grok-4-fast` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
+| `TAVILY_API_KEY` | No | - | Tavily API key (for web_fetch / web_map / extra_sources) |
+| `TAVILY_API_URL` | No | `https://api.tavily.com` | Tavily API endpoint |
+| `TAVILY_ENABLED` | No | `true` | Enable Tavily; with `false` neither `web_fetch`, `web_map` nor `extra_sources` calls Tavily, even when a key is set |
+| `FIRECRAWL_API_KEY` | No | - | Firecrawl API key (fallback when Tavily fails) |
+| `FIRECRAWL_API_URL` | No | `https://api.firecrawl.dev/v2` | Firecrawl API endpoint |
 | `GROK_DEBUG` | No | `false` | Debug mode |
 | `GROK_LOG_LEVEL` | No | `INFO` | Log level |
 | `GROK_LOG_DIR` | No | `logs` | Log directory |
@@ -149,17 +126,18 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_BREAKER_WINDOW_S` | No | `60` | Breaker counting window (seconds) |
 | `GROK_BREAKER_COOLDOWN_S` | No | `60` | Initial cooldown (seconds), doubled after a failed probe |
 | `GROK_BREAKER_MAX_COOLDOWN_S` | No | `300` | Cooldown ceiling (seconds) |
-| `GROK_SEARCH_STYLE` | No | `explanatory` | Output style: `explanatory` or `concise` |
+| `GROK_SEARCH_STYLE` | No | `concise` | Output style: `concise` or `explanatory` (adds term definitions and uncited analogies) |
+| `GROK_MODELS_CACHE_TTL_S` | No | `600` | Lifetime (seconds) of the cached `/models` list used to validate `web_search(model=...)`; failures are not cached and `get_config_info` refreshes it |
 | `GROK_VERIFY_IDS` | No | `true` | Resolve arXiv IDs and DOIs found in the answer |
-| `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of cited URLs |
+| `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of cited URLs (private, loopback and link-local addresses are never fetched, also not via redirects) |
 | `GROK_VERIFY_TIMEOUT_S` | No | `30` | Overall verification timeout (seconds); lookups still pending at the deadline are listed under `unresolved` as `timed out`. All arXiv API calls share a 3-second spacing gate and a one-hour cache |
 | `GROK_VERIFY_MAILTO` | No | empty | Contact e-mail for the verification User-Agent (Crossref polite pool) |
 | `GROK_PLANNING_TOOLS` | No | `false` | Register the six `plan_*` planning tools |
 | `GROK_FETCH_MIN_CHARS` | No | `2000` | Fall back to Firecrawl when the Tavily extract is shorter than this |
 | `GROK_FETCH_MAX_CHARS` | No | `40000` | Default characters returned per `web_fetch` call |
+| `GROK_FETCH_SNAPSHOT_TTL_S` | No | `900` | Idle lifetime (seconds) of a `web_fetch` paging snapshot; afterwards paging restarts at `offset=0` |
 | `TAVILY_EXTRACT_TIMEOUT_S` | No | `30` | Tavily extract timeout (seconds) |
 
-> **Note**: When `GUDA_API_KEY` is set, all `GROK_API_URL`/`GROK_API_KEY`/`TAVILY_*`/`FIRECRAWL_*` variables become optional as they are auto-derived from `GUDA_BASE_URL`. Explicitly set variables take higher priority.
 
 
 ### Verify Installation
@@ -179,7 +157,7 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 ## 3. MCP Tools
 
 <details>
-<summary>This project provides eight MCP tools (click to expand)</summary>
+<summary>Seven MCP tools by default; `GROK_PLANNING_TOOLS=true` adds six `plan_*` planning tools (click to expand)</summary>
 
 ### `web_search` — AI Web Search
 
@@ -187,21 +165,30 @@ Executes AI-driven web search via Grok API. By default it returns only Grok's an
 
 `web_search` does not expand sources in the response; it only returns `sources_count`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
 
-New parameters: `instructions` (per-call requirements for the searcher, e.g. "cover at least 15 distinct domains" or "list arXiv IDs with titles only") and `verify` (default `true`; resolves arXiv IDs, DOIs and cited URLs found in the answer). Besides `content` and `sources_count` the result carries `distinct_domains` and `verification` (`arxiv`/`doi`/`urls` plus an `unresolved` list); on failure it carries `error`/`error_type`/`retry_after_s` and `content` starts with `[搜索失败]`. With `extra_sources > 0` the independent Tavily/Firecrawl hits are appended to the answer as an "Extra sources" section.
+`instructions` adds per-call requirements for the searcher (e.g. "cover at least 15 distinct domains" or "list arXiv IDs with titles only"). Besides `content` and `sources_count` the result carries `distinct_domains`; on failure it carries `error`/`error_type`/`retry_after_s` and `content` starts with `[搜索失败]`.
+
+- **Citation positions**: with native citations, adjacent repeated markers (e.g. `[[1]](u)[[1]](u)`) are collapsed and the `start_index`/`end_index` returned by `get_sources` always refer to the content that is returned. Offsets that do not match are relocated (`position: relocated`) or lose their coordinates (`position: removed`); the upstream values are kept in `upstream_start_index`/`upstream_end_index` and summarized in `citation_positions`.
+- **`verification`**: checks only that identifiers exist (arXiv / Crossref), that cited links are reachable, and whether a paper title written next to an arXiv ID or DOI matches the registry title (`title_checks`: `match` / `partial` / `possible_mismatch` / `not_stated`). It does **not** check whether a source supports the statement it is attached to (`claim_support` is always `not_checked`). Whatever was not checked is listed in `skipped` with a reason (over the limit, URL checks disabled, private address, non-http link); totals are in `summary`.
+- **`model`**: CPA thinking suffixes are accepted, e.g. `grok-4.7(high)`, `grok-4.7(8192)`, `grok-4.7(auto)`. The default model (with its suffix) and other levels of the same base model pass directly; other names are validated by their base name against `/models` and sent in full. If the list cannot be fetched the name is not blocked (`model_check.status = unverified`).
+- **`extra_sources`** (0-20): with both engines active Tavily gets ceil(n/2) and Firecrawl floor(n/2), each asked for 2 spare results; URLs already cited by Grok and repeats across engines are dropped (scheme, `www.`, fragment, trailing slash and tracking parameters ignored) and results are picked round-robin. If an engine fails or comes up short, the other one backfills once. The hits are appended as an "Extra sources" section; details are in `extra_sources_report`.
+- **"Not found"**: "not found in this search" only means this search did not find it. When a definite answer matters, check the platform directly (for example `web_fetch` the repository's issue search page).
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `query` | string | Yes | - | Search query |
 | `platform` | string | No | `""` | Focus platform (e.g., `"Twitter"`, `"GitHub, Reddit"`) |
-| `model` | string | No | `null` | Per-request Grok model ID |
-| `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0 disables) |
+| `model` | string | No | `""` | Per-request Grok model ID, thinking suffix allowed |
+| `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0-20, 0 disables) |
+| `instructions` | string | No | `""` | Per-call requirements for the searcher |
+| `verify` | bool | No | `true` | Attach the verification layer (also gated by `GROK_VERIFY_IDS`) |
 
 Local date, time and timezone context is prepended to every search to improve time-sensitive queries.
 
 Return value (structured dict):
 - `session_id`: search session ID
-- `content`: answer only (sources removed)
-- `sources_count`: cached sources count
+- `content`: the answer (without native citations the sources section is removed; with native citations the original text is kept and only repeated markers are collapsed)
+- `sources_count` / `distinct_domains`: cached sources / distinct sites
+- `citation_positions`, `verification`, `extra_sources_report`, `model_check`: see above, present when applicable
 
 ### `get_sources` — Retrieve Sources
 
@@ -218,11 +205,18 @@ Return value (structured dict):
 
 ### `web_fetch` — Web Content Extraction
 
-Extracts complete web content via Tavily Extract API, returning Markdown format.
+Extracts complete web content via Tavily Extract API, returning Markdown. When Tavily fails or returns too little, Firecrawl Scrape takes over; arXiv abstract pages use the arXiv API.
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `url` | string | Yes | Target webpage URL |
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `url` | string | Yes | - | Target webpage URL |
+| `max_chars` | int | No | `0` | Maximum characters in this call; `0` uses `GROK_FETCH_MAX_CHARS` |
+| `offset` | int | No | `0` | Character offset; values above 0 require `snapshot_id` |
+| `snapshot_id` | string | No | `""` | Snapshot ID from the first page, used to read the following pages |
+
+The first line is a metadata header: `[web_fetch] source=… total_chars=… offset=… returned=… truncated=… [next_offset=… snapshot_id=… expires_in_s=…]`. A page longer than one response is stored as a server-side snapshot; call again with the same `url`, `offset=next_offset` and `snapshot_id` and every page is cut from the same text. `offset>0` without `snapshot_id` is refused; once a snapshot expires (900 s idle by default) the tool answers `error=snapshot_expired` and paging restarts at `offset=0`.
+
+On failure the first line is `[web_fetch] error=…`, followed by one line per backend with the error category (`auth`, `quota`, `rate_limit`, `timeout`, `proxy_config`, `network`, `upstream_error`, `bad_request`, `extract_failed`, `empty_content`, `disabled`, `not_configured`, ...), the HTTP status and a redacted detail.
 
 ### `web_map` — Site Structure Mapping
 
@@ -236,10 +230,17 @@ Traverses website structure via Tavily Map API, discovering URLs and generating 
 | `max_breadth` | int | No | `20` | Max links to follow per page (1-500) |
 | `limit` | int | No | `50` | Total link processing limit (1-500) |
 | `timeout` | int | No | `150` | Timeout in seconds (10-150) |
+| `allow_external` | bool | No | `true` | Include links to other sites (Tavily's default); `false` keeps only the starting site |
+| `select_paths` | string[] | No | - | Keep only URLs whose path matches these regexes, e.g. `["/docs/.*"]` |
+| `select_domains` | string[] | No | - | Crawl only domains/subdomains matching these regexes |
+| `exclude_paths` | string[] | No | - | Skip URLs whose path matches these regexes |
+| `exclude_domains` | string[] | No | - | Skip domains/subdomains matching these regexes |
+
+`web_map` is unavailable when `TAVILY_ENABLED=false`. Few results or a fast answer are not necessarily a fault; use the parameters above and `max_depth` to adjust the scope.
 
 ### `get_config_info` — Configuration Diagnostics
 
-No parameters required. Displays all configuration status, tests Grok API connection, returns response time and available model list (API keys auto-masked).
+No parameters required. Displays all configuration status (including whether Tavily/Firecrawl are actually active), tests Grok API connection, returns response time and available model list (API keys auto-masked), and refreshes the model list used to validate `web_search(model=...)`. Local proxy problems (such as `[::1]` in `NO_PROXY`) are reported as such.
 
 ### `switch_model` — Model Switching
 
@@ -254,12 +255,13 @@ Settings persist to `~/.config/grok-search/config.json` across sessions.
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | `action` | string | No | `"status"` | `"on"` disable built-in tools / `"off"` enable built-in tools / `"status"` check status |
+| `project_dir` | string | No | `""` | Project root; when empty it is resolved as described below |
 
-Modifies project-level `.claude/settings.json` `permissions.deny` to disable Claude Code's built-in WebSearch and WebFetch.
+Modifies `<project>/.claude/settings.json` `permissions.deny` to disable Claude Code's built-in WebSearch and WebFetch. The project is taken from `project_dir`, else `CLAUDE_PROJECT_DIR`, else the single workspace root reported by the client through MCP roots, else the nearest directory containing `.git` or `.claude` above the server's working directory (never the home directory or a filesystem root). If none applies nothing is written and the tool asks for `project_dir`; an unreadable settings file is never overwritten.
 
-### `search_planning` — Search Planning
+### `plan_*` — Search Planning (optional, off by default)
 
-A structured multi-phase planning scaffold to generate an executable search plan before running complex searches.
+With `GROK_PLANNING_TOOLS=true` six more tools record a staged plan for complex searches: `plan_intent` → `plan_complexity` → `plan_sub_query` → `plan_search_term` → `plan_tool_mapping` → `plan_execution`. They only record the plan and do not search.
 </details>
 
 ## 4. FAQ
@@ -268,7 +270,7 @@ A structured multi-phase planning scaffold to generate an executable search plan
 <summary>
 Q: Must I configure both Grok and Tavily?
 </summary>
-A: Set `GUDA_API_KEY` to get full Grok + Tavily + Firecrawl service. Without GuDa, Grok (`GROK_API_URL` + `GROK_API_KEY`) is required and provides the core search capability. Tavily is optional — without it, `web_fetch` and `web_map` will return configuration error messages.
+A: Grok (`GROK_API_URL` + `GROK_API_KEY`) is required and provides the core search capability. Tavily and Firecrawl are optional: `web_fetch` prefers Tavily Extract and falls back to Firecrawl Scrape, and returns a configuration error when neither is configured; `web_map` needs Tavily. `TAVILY_ENABLED=false` disables Tavily while keeping the key: `web_fetch` and `extra_sources` then use Firecrawl only and `web_map` is unavailable.
 </details>
 
 <details>
@@ -287,7 +289,7 @@ A: Say "Show grok-search configuration info" in a Claude conversation to automat
 
 ## License
 
-[MIT License](LICENSE)
+[MIT License](../LICENSE)
 
 ---
 
@@ -299,6 +301,19 @@ A: Say "Show grok-search configuration info" in a Claude conversation to automat
 </div>
 
 ## Changelog
+
+### v1.11.0 (2026-10-16)
+
+- `web_search(model=...)` accepts CPA thinking suffixes such as `(high)` or `(8192)`: the default model and other levels of it pass directly, other names are validated by base name and sent in full. The `/models` list is cached with a TTL (`GROK_MODELS_CACHE_TTL_S`), failures are not cached, a stale list no longer rejects new models, and `get_config_info` refreshes the cache.
+- `extra_sources` quota fixed: Tavily/Firecrawl split the share, duplicates with Grok's citations and across engines are dropped, and a failed engine is backfilled by the other; see `extra_sources_report`.
+- The default output style is now `concise`. The prompt no longer demands a citation for every sentence: only statements a source makes are cited, inferences are labelled, self-written explanations and analogies carry no citation, and absence is reported as "not found in this search".
+- The verification layer states that it checks existence and reachability only (`scope`, `claim_support: not_checked`) and gained paper-title comparison (`title_checks`), `skipped` and `summary`; private and local addresses (also via redirects) are no longer fetched.
+- `web_fetch` pages from snapshots (`snapshot_id`) instead of refetching; failures report category, HTTP status and a redacted detail per backend. `TAVILY_ENABLED=false` now really disables Tavily (fetch, map and extra sources).
+- Native citation offsets are checked against the final answer: repeated markers are collapsed and offsets recomputed; offsets that do not match are relocated or dropped (upstream values kept), see `citation_positions`.
+- `web_map` gained `allow_external`, `select_paths`, `select_domains`, `exclude_paths` and `exclude_domains`.
+- `toggle_builtin_tools` gained `project_dir` and resolves the project via argument → `CLAUDE_PROJECT_DIR` → MCP roots → nearest `.git`/`.claude`; it no longer writes to a filesystem root.
+- At startup, bracketed IPv6 entries in `NO_PROXY` (such as `[::1]`) that httpx cannot parse are rewritten, so the web tools no longer fail with `Invalid port: ':1]'`; `get_config_info` names local proxy problems explicitly.
+- README: install from this repository, 7 default tools + 6 optional planning tools; the English README no longer documents `GUDA_*` settings that the code does not support.
 
 ### v1.10.0 (2026-09-17)
 
