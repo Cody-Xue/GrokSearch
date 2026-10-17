@@ -2,6 +2,7 @@ import asyncio
 import codecs
 import httpx
 import json
+import math
 import os
 import re
 import time
@@ -129,6 +130,8 @@ _RETRYABLE_ERROR_TYPES = ("upstream_error", "rate_limit", "server_error", "timeo
 _NON_RETRYABLE_ERROR_CODES = (
     "invalid_request_error", "auth_error", "authentication_error",
     "permission_denied", "model_not_found", "not_found_error",
+    # Responses API: the prompt was refused by policy; resending it can get the model blocked on the gateway.
+    "invalid_prompt",
 )
 _NON_RETRYABLE_ERROR_MARKERS = (
     "unauthorized", "invalid_api_key", "invalid api key",
@@ -150,6 +153,13 @@ _AUTH_FAILURE_MARKERS = ("auth_not_found",)
 
 # A retry is started only when at least this much of the call's wall-clock limit is left.
 _MIN_ATTEMPT_WINDOW_S = 5.0
+
+# GROK_API_MODE -> endpoint under GROK_API_URL.
+_API_PATHS = {"chat": "/chat/completions", "responses": "/responses"}
+# Responses API incomplete_details.reason -> the chat finish_reason it corresponds to.
+_RESPONSES_FINISH = {"max_output_tokens": "length", "content_filter": "content_filter"}
+_USD_TICKS = 10_000_000_000
+_MAX_SEARCH_QUERIES = 10
 
 
 class GrokUpstreamError(Exception):
@@ -513,6 +523,8 @@ class GrokResponse:
     done_seen: bool = field(default=False, compare=False)
     usage: Optional[dict] = field(default=None, compare=False)
     dropped_events: int = field(default=0, compare=False)
+    # Queries of the upstream's own web/X searches (Responses API web_search_call / x_search_call items).
+    search_queries: list[str] = field(default_factory=list, compare=False)
 
     @property
     def incomplete(self) -> bool:
@@ -522,13 +534,42 @@ class GrokResponse:
         return finish in ("length", "content_filter") or native not in ("", "stop")
 
     def compact_usage(self) -> Optional[dict]:
-        if not isinstance(self.usage, dict):
+        """Token counts under the chat names (the Responses API's input/output_tokens are mapped onto them),
+        plus the cost and the upstream's own search calls when the upstream reports them (xAI does)."""
+        usage = self.usage
+        if not isinstance(usage, dict):
             return None
-        out = {name: self.usage[name] for name in ("prompt_tokens", "completion_tokens") if isinstance(self.usage.get(name), int)}
-        details = self.usage.get("completion_tokens_details")
-        reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else self.usage.get("reasoning_tokens")
-        if isinstance(reasoning, int):
+
+        def count(value):
+            return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+        out = {}
+        for name, alias in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
+            value = count(usage.get(name, usage.get(alias)))
+            if value is not None:
+                out[name] = value
+        details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
+        reasoning = count(details.get("reasoning_tokens") if isinstance(details, dict) else usage.get("reasoning_tokens"))
+        if reasoning is not None:
             out["reasoning_tokens"] = reasoning
+        details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
+        cached = count(details.get("cached_tokens")) if isinstance(details, dict) else None
+        if cached:
+            out["cached_tokens"] = cached
+        ticks = usage.get("cost_in_usd_ticks")
+        if isinstance(ticks, (int, float)) and not isinstance(ticks, bool) and ticks >= 0:
+            try:
+                cost = ticks / _USD_TICKS  # xAI bills in ticks: 1 USD = 10^10 ticks
+            except OverflowError:
+                cost = math.inf
+            if math.isfinite(cost):
+                out["cost_usd"] = round(cost, 4)
+        tools = usage.get("server_side_tool_usage_details")
+        if isinstance(tools, dict):
+            for name in ("web_search_calls", "x_search_calls"):
+                calls = count(tools.get(name))
+                if calls:
+                    out[name] = calls
         return out or None
 
     def result_fields(self) -> dict:
@@ -539,6 +580,8 @@ class GrokResponse:
         usage = self.compact_usage()
         if usage:
             out["usage"] = usage
+        if self.search_queries:
+            out["search_queries"] = self.search_queries[:_MAX_SEARCH_QUERIES]
         if self.dropped_events:
             out["dropped_events"] = self.dropped_events
         return out
@@ -594,10 +637,11 @@ class _SSELineSplitter:
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast"):
+    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast", api_mode: Optional[str] = None):
         # "https://host/v1/" must not become "https://host/v1//chat/completions" (404 on CPA).
         super().__init__((api_url or "").strip().rstrip("/"), (api_key or "").strip())
         self.model = model
+        self.api_mode = api_mode if api_mode in _API_PATHS else config.api_mode
 
     def get_provider_name(self) -> str:
         return "Grok"
@@ -640,15 +684,16 @@ class GrokSearchProvider(BaseSearchProvider):
         # The whole message, not only the caller's parts: nothing in it may break the UTF-8 request body.
         user_content = _scrub_surrogates(user_content)
 
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": build_search_prompt(config.search_style)},
-                {"role": "user", "content": user_content},
-            ],
-            "stream": True,
-            "tools": [{"type": "web_search"}, {"type": "x_search"}],
-        }
+        messages = [
+            {"role": "system", "content": build_search_prompt(config.search_style)},
+            {"role": "user", "content": user_content},
+        ]
+        tools = [{"type": "web_search"}, {"type": "x_search"}]
+        if self.api_mode == "responses":
+            # The same conversation as Responses API input; store=False keeps it off the upstream's storage.
+            payload = {"model": self.model, "input": messages, "stream": True, "tools": tools, "store": False}
+        else:
+            payload = {"model": self.model, "messages": messages, "stream": True, "tools": tools}
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
@@ -695,6 +740,117 @@ class GrokSearchProvider(BaseSearchProvider):
             if isinstance(annotations, list):
                 result.annotations.extend(a for a in annotations if isinstance(a, dict))
 
+        # Responses API: text parts and their annotations are collected while streaming and joined into the
+        # answer at the end (assemble_responses). The final response object, when it carries the message
+        # text, is authoritative: it survives an undecodable delta frame and holds every annotation.
+        parts: dict = {}  # (output_index, content_index) -> {"deltas": [...], "done": text or None, "annotations": [...]}
+        stray_annotations: list = []  # annotations that arrived before any text part
+        final_parts: list = []  # [(text, annotations)] from the terminal response object
+
+        def text_part(data) -> dict:
+            key = (data.get("output_index"), data.get("content_index"))
+            return parts.setdefault(key, {"deltas": [], "done": None, "annotations": []})
+
+        def note_search(item):
+            if not isinstance(item, dict) or not str(item.get("type") or "").endswith("search_call"):
+                return
+            action = item.get("action")
+            query = action.get("query") if isinstance(action, dict) else None
+            if isinstance(query, str) and query.strip() and query.strip() not in result.search_queries:
+                result.search_queries.append(query.strip())
+
+        def finish_response(response_obj):
+            """response.completed / .incomplete / .failed, or a whole non-streaming response object."""
+            result.done_seen = True
+            if isinstance(response_obj.get("usage"), dict):
+                result.usage = response_obj["usage"]
+            status = str(response_obj.get("status") or "")
+            error = response_obj.get("error")
+            if status == "failed" or (error and status != "completed"):
+                raise _make_stream_error(error or f"upstream response {status or 'failed'}", None, response_obj)
+            if status == "completed":
+                result.finish_reason = "stop"
+            else:
+                # incomplete (output cap, content filter), or cancelled / in_progress / queued: not a whole answer.
+                details = response_obj.get("incomplete_details")
+                reason = details.get("reason") if isinstance(details, dict) else None
+                result.native_finish_reason = str(reason or status or "incomplete")
+                result.finish_reason = _RESPONSES_FINISH.get(result.native_finish_reason, result.native_finish_reason)
+            for item in response_obj.get("output") or []:
+                note_search(item)
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                        annotations = part.get("annotations")
+                        final_parts.append((part["text"], annotations if isinstance(annotations, list) else []))
+
+        def collect_responses(data):
+            if not isinstance(data, dict):
+                return
+            kind = str(data.get("type") or "")
+            if kind == "error" or (not kind.startswith("response") and data.get("error")):
+                raise _make_stream_error(data.get("error") or data, None, data)
+            if kind == "response.output_text.delta":
+                if isinstance(data.get("delta"), str):
+                    text_part(data)["deltas"].append(data["delta"])
+            elif kind == "response.output_text.done":
+                if isinstance(data.get("text"), str):
+                    text_part(data)["done"] = data["text"]
+            elif kind == "response.output_text.annotation.added":
+                annotation = data.get("annotation")
+                key = (data.get("output_index"), data.get("content_index"))
+                if isinstance(annotation, dict):
+                    # Its own part, else the part being written (an event without indices), else the first one.
+                    target = parts.get(key) or (parts[next(reversed(parts))] if parts else None)
+                    (target["annotations"] if target else stray_annotations).append(annotation)
+            elif kind == "response.output_item.done":
+                note_search(data.get("item"))
+            elif kind in ("response.completed", "response.incomplete", "response.failed"):
+                response_obj = data.get("response")
+                if isinstance(response_obj, dict):
+                    finish_response(response_obj)
+                elif data.get("error") or kind == "response.failed":
+                    raise _make_stream_error(data.get("error") or f"upstream {kind}", None, data)
+            elif data.get("object") == "response":
+                finish_response(data)
+
+        def assemble_responses():
+            if any(text for text, _ in final_parts):
+                chosen = final_parts
+            else:
+                chosen = []
+                for part in parts.values():
+                    streamed = "".join(part["deltas"])
+                    # output_text.done carries the part's whole text: it wins over deltas that lost a frame.
+                    done = part["done"]
+                    chosen.append((done if isinstance(done, str) and done else streamed, part["annotations"]))
+                if chosen and stray_annotations:
+                    chosen[0] = (chosen[0][0], stray_annotations + chosen[0][1])
+            texts = []
+            offset = 0
+            for text, annotations in chosen:
+                if not text:
+                    # Sources without text: kept like chat-mode annotations that arrive without content.
+                    result.annotations.extend(a for a in annotations if isinstance(a, dict))
+                    continue
+                if texts:
+                    offset += 2  # "\n\n" between a second message or content part and the previous one
+                for annotation in annotations:
+                    if not isinstance(annotation, dict):
+                        continue
+                    if offset:
+                        annotation = dict(annotation)
+                        for name in ("start_index", "end_index"):
+                            if isinstance(annotation.get(name), int):
+                                annotation[name] += offset
+                    result.annotations.append(annotation)
+                texts.append(text)
+                offset += len(text)
+            result.content = "\n\n".join(texts)
+
+        collect_event = collect_responses if self.api_mode == "responses" else collect
+
         def handle(payload: str, event: str) -> bool:
             """Process one event payload; False when it is not JSON."""
             if payload.strip() == "[DONE]":
@@ -707,7 +863,7 @@ class GrokSearchProvider(BaseSearchProvider):
             if event == "error":
                 envelope = data if isinstance(data, dict) else None
                 raise _make_stream_error(data.get("error", data) if envelope else data, None, envelope)
-            collect(data)
+            collect_event(data)
             return True
 
         def dispatch():
@@ -760,10 +916,12 @@ class GrokSearchProvider(BaseSearchProvider):
 
         if not saw_sse and full_body_buffer:
             try:
-                collect(json.loads("\n".join(full_body_buffer)))
+                collect_event(json.loads("\n".join(full_body_buffer)))
                 result.done_seen = True  # a complete JSON document cannot be cut off
             except json.JSONDecodeError:
                 pass
+        if self.api_mode == "responses":
+            assemble_responses()
 
         await log_info(ctx, f"content: {result.content}", config.debug_enabled)
 
@@ -777,7 +935,7 @@ class GrokSearchProvider(BaseSearchProvider):
         try:
             async with client.stream(
                 "POST",
-                f"{self.api_url}/chat/completions",
+                f"{self.api_url}{_API_PATHS[self.api_mode]}",
                 headers=headers,
                 json=payload,
             ) as response:

@@ -264,6 +264,18 @@ class Config:
         """Wall-clock bound of one web_search Grok call: queueing, every attempt and every retry wait. 0 disables it."""
         return max(0.0, _env_float("GROK_SEARCH_TIMEOUT_S", 300.0))
 
+    @property
+    def api_mode(self) -> str:
+        """chat (default): POST /chat/completions; responses: POST /responses (the Responses API, which
+        xAI and CLIProxyAPI stream event by event instead of sending the answer only when it is complete)."""
+        value = _env_value("GROK_API_MODE")
+        if value is None:
+            return "chat"
+        if value.lower() in ("chat", "responses"):
+            _ENV_WARNINGS.pop("GROK_API_MODE", None)
+            return value.lower()
+        return _env_fallback("GROK_API_MODE", value, "chat")
+
     # -------------------------------------------------------- throttling / breaker
     @property
     def max_concurrency(self) -> int:
@@ -644,6 +656,7 @@ class Config:
             "GROK_RETRY_MULTIPLIER": self.retry_multiplier,
             "GROK_RETRY_MAX_WAIT": self.retry_max_wait,
             "GROK_RETRY_BUDGET_S": self.retry_budget_s,
+            "GROK_API_MODE": self.api_mode,
             "GROK_READ_TIMEOUT_S": self.read_timeout_s,
             "GROK_SEARCH_TIMEOUT_S": self.search_timeout_s,
             "GROK_BREAKER": {

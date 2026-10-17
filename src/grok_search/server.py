@@ -56,7 +56,7 @@ def _package_version() -> str:
         from importlib.metadata import version as _version
         return _version("grok-search")
     except Exception:
-        return "1.12.1"
+        return "1.13.0"
 
 
 mcp = FastMCP("grok-search", version=_package_version())
@@ -378,9 +378,13 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       Unicode code points (not UTF-16 units)
     - incomplete / finish_reason / native_finish_reason (only when the upstream cut the answer short, e.g.
       output cap or content filter): the answer is partial; a one-line note is appended after it
-    - usage (when the upstream reports it): prompt_tokens, completion_tokens, reasoning_tokens. Multi-agent /
-      high-reasoning models can bill 0.5-1.6M prompt tokens for one search; for routine lookups pass a
-      lighter model= (only when the user asked for it) and avoid repeating a call that already answered
+    - usage (when the upstream reports it): prompt_tokens, completion_tokens, reasoning_tokens, and when
+      reported cached_tokens, cost_usd (what the upstream billed for this search) and web_search_calls /
+      x_search_calls (searches Grok ran itself). Multi-agent / high-reasoning models can bill 0.5-1.6M prompt
+      tokens for one search; for routine lookups pass a lighter model= (only when the user asked for it) and
+      avoid repeating a call that already answered
+    - search_queries (GROK_API_MODE=responses): the queries Grok searched with, at most 10 — useful to judge
+      whether a "not found" covered the right terms
     - verification (when enabled): existence and reachability only, for the arXiv IDs / DOIs in the
       answer and the URLs Grok cited (extra sources are not checked). Identifiers are resolved against
       arXiv, Crossref and the doi.org registry (DataCite), URLs are fetched, and paper titles written next
@@ -549,7 +553,7 @@ async def web_search(
             "error_type": grok_error.get("error_type", "empty_response"),
         }
         for field in ("retry_after_s", "status", "exhausted", "incomplete", "finish_reason", "native_finish_reason",
-                      "usage", "dropped_events"):
+                      "usage", "search_queries", "dropped_events"):
             if field in grok_error:
                 result[field] = grok_error[field]
         if extra_report is not None:

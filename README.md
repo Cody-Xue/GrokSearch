@@ -34,6 +34,7 @@ Claude ──MCP──► Grok Search Server
 - **并发上限 + 按模型熔断**：`GROK_MAX_CONCURRENCY` 限制同时在途的 Grok 请求；连续 429 或账号池耗尽时按模型熔断（同一模型的不同思考档位，如 `(high)`/`(low)`/`(8192)`，共用一套熔断状态）并返回结构化错误，冷却后自动探测恢复。CLIProxyAPI / xAI 的账号池耗尽响应（503 `auth_unavailable`、429 `model_cooldown`、`free-usage-exhausted` 等）第一次就会熔断；排队等并发名额的调用拿到名额后会再检查一次熔断状态
 - **失败必有回声**：上游流内错误帧、429、空响应、超时、网络故障和中途断开的流都会变成 `error`/`error_type`/`retry_after_s` 字段，不再静默返回空正文；被上游截断或过滤的回答标记 `incomplete`。工具失败按设计以普通结果返回（MCP `isError=false`），请以 `error` 字段或首行判断
 - **搜索时长有上限**：`GROK_READ_TIMEOUT_S`（单次读取）与 `GROK_SEARCH_TIMEOUT_S`（整次调用，含排队、重试与等待）保证网关卡住时搜索也会结束并返回 `timeout`
+- **两种上游接口**：`GROK_API_MODE=chat`（默认，`/chat/completions`）或 `responses`（`/responses`，即 Responses API）。CLIProxyAPI 的 chat 接口要等整个回答生成完才发出第一个字节，Responses 接口则边生成边推送事件（实测 2–3 秒内即有响应），长时间的多智能体搜索不再受读取超时和 Cloudflare 100 秒限制的影响；xAI 还会在用量里给出本次花费（`usage.cost_usd`）与搜索次数，结果里附上 Grok 用过的搜索词（`search_queries`）
 - **按次换模型**：`web_search(model=...)` 支持 CPA 风格的思考后缀（如 `grok-4.7(high)`、`grok-4.7(8192)`），按基础名称对照 `/models` 校验、请求时保留完整名称；模型列表缓存有有效期，获取失败不缓存；TTS/语音、图像、嵌入等非对话模型按名称在本地拒绝，相近建议只列对话模型（同系列优先）
 - **额外信源双引擎分配**：`extra_sources` 在 Tavily 与 Firecrawl 之间对半分配，与 Grok 已引用的链接及引擎之间去重，一方失败由另一方补位，过程写入 `extra_sources_report`；指定 `platform` 时引擎只在该平台的域名内搜索（Tavily `include_domains`、Firecrawl `site:`），平台外结果被丢弃
 - **核验层（不是事实核验）**：回答里的 arXiv 号、DOI 经 arXiv API / Crossref / doi.org 登记处 / DataCite 确认存在（包括 arXiv 自己的 `10.48550/arXiv.<id>` DOI、Zenodo 以及万方/ISTIC 等其他登记机构的 DOI），Grok 引用的 URL 确认可访问，回答中写出的论文标题与登记标题自动比对（`title_checks`）；**不检查来源是否支持对应论断**（`claim_support: not_checked`）。`unresolved` 表示登记处或网站明确答复不存在（应视为可疑）；`lookup_failed` 表示没拿到答复（限流、5xx、超时、人机验证或登录墙页面，如 Reddit “Prove your humanity”），不能当作反对引用的证据；没检查的条目连同原因列在 `skipped`。只核验 Grok 引用的来源，不核验 `extra_sources` 的结果；URL 请求前先确认目标地址都是公网地址，Clash/mihomo fake-ip 环境下先经 DNS-over-HTTPS 查出真实地址（局限见 `web_search` 一节）。默认精简输出（`GROK_VERIFY_DETAIL=compact`）：只列需要关注的条目，计数全部保留
@@ -101,7 +102,7 @@ claude mcp add-json grok-search --scope user '{
 }'
 ```
 
-> **固定版本（推荐）**：`@main` 是分支，uvx 每次启动都会到 GitHub 解析它：总是运行主分支的最新代码，修复来得最快；代价是每次启动多花几秒，GitHub 不可达时服务器无法启动，而且未经你审阅的改动（包括不兼容的改动）会在下次启动时直接生效。日常使用建议固定到发布标签或提交，把上面的 `git+https://github.com/Cody-Xue/GrokSearch@main` 换成 `git+https://github.com/Cody-Xue/GrokSearch@v1.12.1`（以仓库实际存在的标签为准，打标签之前可用 `@<提交 SHA>`）：每次运行的都是同一份代码，可复现，缓存后启动不再依赖 GitHub；代价是升级要手动改版本号。两种写法都可以，下文示例沿用 `@main`。
+> **固定版本（推荐）**：`@main` 是分支，uvx 每次启动都会到 GitHub 解析它：总是运行主分支的最新代码，修复来得最快；代价是每次启动多花几秒，GitHub 不可达时服务器无法启动，而且未经你审阅的改动（包括不兼容的改动）会在下次启动时直接生效。日常使用建议固定到发布标签或提交，把上面的 `git+https://github.com/Cody-Xue/GrokSearch@main` 换成 `git+https://github.com/Cody-Xue/GrokSearch@v1.13.0`（以仓库实际存在的标签为准，打标签之前可用 `@<提交 SHA>`）：每次运行的都是同一份代码，可复现，缓存后启动不再依赖 GitHub；代价是升级要手动改版本号。两种写法都可以，下文示例沿用 `@main`。
 
 <details> <summary>如果遇到 SSL / 证书验证错误</summary>
 
@@ -153,6 +154,7 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_RETRY_MULTIPLIER` | ❌ | `1` | 重试退避乘数 |
 | `GROK_RETRY_MAX_WAIT` | ❌ | `10` | 重试最大等待秒数 |
 | `GROK_RETRY_BUDGET_S` | ❌ | `45` | 单次调用重试总等待预算（秒），上游 Retry-After 超出预算时立即放弃；`0` 关闭。只计重试之间的等待，整次调用由 `GROK_SEARCH_TIMEOUT_S` 限定 |
+| `GROK_API_MODE` | ❌ | `chat` | 上游接口：`chat` 调用 `/chat/completions`；`responses` 调用 `/responses`（Responses API：流式事件、`store: false`，xAI 与 CLIProxyAPI 支持，其他网关不一定支持）。`(high)` 等思考后缀在两种接口下都由网关转换为推理强度；无法识别的值按 `chat` 处理并列入 `config_warnings` |
 | `GROK_READ_TIMEOUT_S` | ❌ | `180` | 等待 Grok 回答时单次读取允许的最长静默（秒，最小 5）。CLIProxyAPI 这类缓冲型网关在回答生成完之前不发送任何字节，所以它也限定了单次尝试的时长。读取超时最多重试一次，且只在剩余的 `GROK_SEARCH_TIMEOUT_S` 还够再等一整次时重试 |
 | `GROK_SEARCH_TIMEOUT_S` | ❌ | `300` | 一次 `web_search` 的 Grok 调用总时限（秒）：等待并发名额、每次尝试与每次重试等待都计入；`0` 关闭。超时返回 `error_type: timeout` |
 | `GROK_MAX_CONCURRENCY` | ❌ | `16` | 同时在途的 Grok 请求上限 |
@@ -232,7 +234,7 @@ claude mcp list
   - 非对话模型按名称识别（名称中含 tts、voice、audio、speech、whisper、transcribe、image、imagine、video、embed/embedding、moderation、realtime、rerank 等独立片段），在本地以 `invalid_model` 拒绝，`model_check.reason` 为 `not_chat_model`，不会发出搜索请求（最多读取 `/models` 列表以给出建议；`/models` 不可用时同样拒绝）。例：`grok-tts` → “'grok-tts' is not a chat/search model (audio/speech model, name contains 'tts')”。
   - 相近建议只列对话模型，同系列优先，再按名称相似度排序，例如 `grok-4.8` → `grok-4.7`。无效结果的 `model_check.reason` 为 `bad_name`、`unsupported_suffix`、`not_listed` 或 `not_chat_model`。
   - 配置的默认模型（`GROK_MODEL` 或配置文件）不会被拦截，只在 `get_config_info` 的 `config_warnings` 中提示；名称恰好含上述片段的真实对话模型可以这样使用。
-  - **费用**：多智能体/高推理档位（如默认的 `grok-4.20-multi-agent-0309(high)`）每次搜索实测消耗 50 万–160 万 prompt tokens（`platform=GitHub` 时约 159 万）；`grok-4.7` 在本版的实测中每次约 1.9 万–13 万。日常查询建议用轻量模型：设为 `GROK_MODEL`，或按次传 `web_search(model="grok-4.7")`。`usage.prompt_tokens` 显示每次的实际用量。
+  - **费用**：多智能体/高推理档位（如默认的 `grok-4.20-multi-agent-0309(high)`）每次搜索实测消耗 50 万–160 万 prompt tokens（`platform=GitHub` 时约 159 万）；`grok-4.7` 在本版的实测中每次约 1.9 万–13 万。日常查询建议用轻量模型：设为 `GROK_MODEL`，或按次传 `web_search(model="grok-4.7")`。`usage.prompt_tokens` 显示每次的实际用量；上游报告花费时（xAI，两种接口都可能有，Responses 模式实测都有）`usage.cost_usd` 直接给出美元金额：本版实测默认模型每次约 0.5–0.7 美元，`grok-4.7` 约 0.02–0.05 美元。
 - **额外信源 `extra_sources`**（0–20，超出范围由参数校验拒绝）：两个引擎都可用时 Tavily 分 ⌈n/2⌉、Firecrawl 分 ⌊n/2⌋，每个引擎多取 2 条备用；与 Grok 已引用的链接及引擎之间去重（忽略协议、`www.`、片段、末尾斜杠和跟踪参数），按轮流顺序选取；某个引擎失败或结果不足时，由另一个引擎补一次（补取数量为缺口 + 2 条余量 + 已遇到的重复条数，最多 20）。结果附在正文末尾的 "Extra sources" 小节，每条一行纯文本（标题、链接、引擎、最多 300 字符的摘要）；过程见 `extra_sources_report`。
   - **按平台搜索**：指定 `platform` 且平台名已知（GitHub、GitLab、Reddit、X/Twitter、Stack Overflow、Hacker News、YouTube、arXiv、Wikipedia、知乎、B站、微博、CSDN、掘金、V2EX、Hugging Face、PyPI、npm、Medium、小红书、豆瓣、微信公众号等约 40 个），或写的是主机名（如 `docs.python.org`）时，引擎只在该平台的主域名内搜索：Tavily 用 `include_domains`，Firecrawl 在查询后加 `site:`（[文档](https://docs.firecrawl.dev/api-reference/endpoint/search)）；结果再按主机名后缀过滤（`githubhelp.com` 不算 GitHub），平台外结果被丢弃并计入 `off_platform_skipped`，补位时一并多取，因此可能少于请求数。短链/内容域名（githubusercontent.com、redd.it、youtu.be、b23.tv、weibo.cn、hf.co）只由本地过滤接受，不发给引擎（实测 Firecrawl 在 `site:github.com OR site:githubusercontent.com` 下会漏出平台外结果）。多个平台用逗号分隔（如 `"GitHub, Reddit"`）；平台名旁的其他词（如 `GitHub issues`）会追加到引擎查询。未知平台不过滤，只把平台文字追加到引擎查询。`extra_sources_report.platform` 记录 `requested`、`applied`（`domain_filter` / `query_hint` / `none`）、`domains`、`also_accepted`、`engines`、`off_platform_skipped`、`query_hint`、`unresolved`。实测 `platform="GitHub"`、`extra_sources=6`：6 条全部在 github.com。
 - **“没找到”的含义**：回答中的“本次检索未找到”只代表这次搜索没找到；需要确定结论时，直接到对应平台核实（例如用 `web_fetch` 打开仓库的 issue 搜索页）。
@@ -254,7 +256,8 @@ claude mcp list
 - `sources_count` / `distinct_domains`: Grok 引用的信源数量 / 不同站点数（没有原生引用时，按正文中的引用标记、Markdown 链接和 URL 统计）
 - `extra_sources_count` / `total_sources_count`: 额外信源数量 / 两者合计
 - `incomplete` / `finish_reason` / `native_finish_reason`: 仅在上游提前结束生成时出现（`finish_reason` 为 `length` 或 `content_filter`，或 `native_finish_reason` 不是 `stop`），表示回答不完整
-- `usage`: 上游报告用量时给出 `{prompt_tokens, completion_tokens, reasoning_tokens}`（多智能体模型每次可达 50 万–160 万 prompt tokens，见上文“费用”）
+- `usage`: 上游报告用量时给出 `{prompt_tokens, completion_tokens, reasoning_tokens}`，上游提供时还有 `cached_tokens`、`cost_usd`（本次计费，美元）与 `web_search_calls` / `x_search_calls`（Grok 自己发起的搜索次数）（多智能体模型每次可达 50 万–160 万 prompt tokens，见上文“费用”）
+- `search_queries`: Responses 模式下 Grok 实际使用的搜索词（最多 10 个），可用来判断“本次检索未找到”是否搜对了词
 - `dropped_events`: 仅在有 SSE 帧无法解码时出现
 - `error` / `error_type` / `retry_after_s` / `status` / `exhausted`: 仅失败时出现，见上文
 - `citation_positions`、`verification`、`extra_sources_report`、`model_check`：见上文，按需出现
@@ -327,7 +330,7 @@ Firecrawl 被重定向时首行出现 `final_url` 与 `title`（`title` 总在�
 无需参数。显示所有配置状态（含 Tavily/Firecrawl 实际是否启用）、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏），并刷新 `web_search(model=...)` 校验用的模型列表缓存。本地代理环境错误（如 `NO_PROXY` 中的 `[::1]`）会单独标为“本地代理环境错误”。
 
 - `GROK_MODEL_SOURCE` 为 `env` | `switch_model` | `config` | `default`，`GROK_MODEL_NOTE` 说明 `switch_model` 的选择能保持多久。
-- 还会列出 `GROK_CONFIG_FILE`、`GROK_LOG_RETENTION_DAYS`、`GROK_RETRY_MULTIPLIER`、`GROK_RETRY_MAX_WAIT`、`GROK_READ_TIMEOUT_S`、`GROK_SEARCH_TIMEOUT_S`、各项 `GROK_VERIFY_*`（含 `GROK_VERIFY_FAKE_IP`、`GROK_VERIFY_DOH_URL`、`GROK_VERIFY_DETAIL`）、`GROK_FETCH_*`（含 `GROK_FETCH_DIRECT`、`GROK_FETCH_MAX_AGE_S`）与 `GROK_MAP_REGEX_TIMEOUT_S`；`config_warnings` 列出无法识别的环境变量值以及配置文件、日志目录的问题。
+- 还会列出 `GROK_CONFIG_FILE`、`GROK_LOG_RETENTION_DAYS`、`GROK_RETRY_MULTIPLIER`、`GROK_RETRY_MAX_WAIT`、`GROK_API_MODE`、`GROK_READ_TIMEOUT_S`、`GROK_SEARCH_TIMEOUT_S`、各项 `GROK_VERIFY_*`（含 `GROK_VERIFY_FAKE_IP`、`GROK_VERIFY_DOH_URL`、`GROK_VERIFY_DETAIL`）、`GROK_FETCH_*`（含 `GROK_FETCH_DIRECT`、`GROK_FETCH_MAX_AGE_S`）与 `GROK_MAP_REGEX_TIMEOUT_S`；`config_warnings` 列出无法识别的环境变量值以及配置文件、日志目录的问题。
 - API Key 最多显示四分之一（不足 24 个字符时最多显示末 4 位）；URL 中的凭据（用户信息、查询参数值）显示为 `***`。
 - `connection_test` 中的 `available_models` 不变，另有 `chat_models`（`web_search`/`switch_model` 接受的模型）与 `non_chat_models`（按名称识别的 TTS/语音/音频、图像/视频生成、嵌入、审核、实时、重排模型，总是被拒绝）。`GROK_MODEL` 本身像非对话模型时，`config_warnings` 会给出提示。
 - 连接测试遇到传输错误（连接重置或拒绝、代理隧道关闭）时重试一次（`retried_after`/`attempts`）；空错误信息会写成 `proxy tunnel closed or upstream unreachable (ConnectError)`；Cloudflare 错误页只给出名称。
@@ -417,6 +420,13 @@ A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 AP
 </div>
 
 ## 变更记录
+
+### v1.13.0（2026-10-17）
+
+- 新增 `GROK_API_MODE=chat|responses`（默认 `chat`，行为不变）。`responses` 改用 `/responses`（Responses API）：请求体为 `input` 加 `store: false`，按事件流解析正文增量、引用注解（按文本段换算偏移）和 `response.completed` / `incomplete` / `failed`；`incomplete` 映射到 `finish_reason`（`max_output_tokens` → `length`），`failed` 与错误事件按原有规则分类（号池耗尽、限流、确定性错误）；没有结束事件就断开的流按 `truncated_stream` 重试。重试、熔断、总时限与引用位置校验与 chat 模式相同。
+- 实测（CLIProxyAPI）：Responses 接口 2–3 秒内返回响应头并持续推送搜索进度与正文，chat 接口则要等回答生成完；`(high)` 后缀在两种接口下都转换为 `reasoning.effort: high`。
+- `usage` 增加 `cached_tokens`、`cost_usd`（xAI 的 `cost_in_usd_ticks`，1 美元 = 10¹⁰ ticks）与 `web_search_calls` / `x_search_calls`；Responses 模式的结果增加 `search_queries`。
+- 版本号 1.13.0；安装说明中的固定版本改为 `@v1.13.0`。
 
 ### v1.12.1（2026-10-17）
 
