@@ -7,7 +7,7 @@ English | [简体中文](../README.md)
 
 **Grok-with-Tavily MCP, providing enhanced web access for Claude Code**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![FastMCP](https://img.shields.io/badge/FastMCP-2.0.0+-green.svg)](https://github.com/jlowin/fastmcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT) [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![FastMCP](https://img.shields.io/badge/FastMCP-2.11.0+-green.svg)](https://github.com/jlowin/fastmcp)
 
 </div>
 
@@ -27,18 +27,20 @@ Claude --MCP--> Grok Search Server
 ### Features
 
 - **Dual Engine**: Grok search + Tavily extraction/mapping, complementary collaboration
+- **Firecrawl fallback**: when Tavily extraction fails, web_fetch falls back to Firecrawl Scrape, which is retried automatically when it returns empty content
 - **OpenAI-compatible interface**, supports any Grok mirror endpoint
 - **Automatic time injection** (local date and time context is prepended to every search)
 - **Read-only tool annotations**: `web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` declare `readOnlyHint`, so Claude Code runs several calls from one turn in parallel instead of one after another
-- **Concurrency cap + per-model circuit breaker**: `GROK_MAX_CONCURRENCY` bounds in-flight Grok requests; repeated 429s or an exhausted account pool open a breaker for that model (thinking-level suffixes such as `(high)`/`(low)`/`(8192)` share one breaker) and return a structured error, with half-open probing to recover
-- **Failures are never silent**: in-stream error frames, HTTP 429 and empty responses become `error`/`error_type`/`retry_after_s` fields instead of an empty answer
+- **Concurrency cap + per-model circuit breaker**: `GROK_MAX_CONCURRENCY` bounds in-flight Grok requests; repeated 429s or an exhausted account pool open a breaker for that model (thinking-level suffixes such as `(high)`/`(low)`/`(8192)` share one breaker) and return a structured error, with half-open probing to recover. CLIProxyAPI / xAI pool-exhaustion answers (503 `auth_unavailable`, 429 `model_cooldown`, `free-usage-exhausted`, ...) open the breaker on the first call; calls queued for a concurrency slot check the breaker again once they get one
+- **Failures are never silent**: in-stream error frames, HTTP 429, empty responses, timeouts, network failures and streams that close mid-answer become `error`/`error_type`/`retry_after_s` fields instead of an empty answer; answers the upstream cut short or filtered are flagged `incomplete`. By design, tool failures are returned as normal results (MCP `isError=false`): check the `error` field or the first line
+- **Bounded search time**: `GROK_READ_TIMEOUT_S` (per read) and `GROK_SEARCH_TIMEOUT_S` (whole call, including queueing, retries and waits) make a search end with `timeout` even when the gateway stalls
 - **Per-call models**: `web_search(model=...)` accepts CPA-style thinking suffixes (e.g. `grok-4.7(high)`, `grok-4.7(8192)`), validates the base name against `/models` and sends the full name; the model list is cached with a TTL and failures are not cached
 - **Dual-engine extra sources**: `extra_sources` is split between Tavily and Firecrawl, deduplicated against Grok's citations and across engines, and a failed engine is backfilled by the other (`extra_sources_report`)
-- **Verification layer (not fact-checking)**: arXiv IDs and DOIs are confirmed to exist via the arXiv API / Crossref, cited URLs are confirmed reachable, and paper titles written in the answer are compared with the registry title (`title_checks`). It does **not** check whether a source supports the claim (`claim_support: not_checked`); anything not checked is listed in `skipped` with a reason. Cited URLs are fetched only when their host resolves to public addresses (limits: see `web_search`)
-- **Fetch quality gate and snapshot paging**: short Tavily extracts fall back to Firecrawl and the longer result wins; arXiv abstract pages use the arXiv API; long pages return a `snapshot_id` and every later page is cut from the same snapshot; failures list each backend with error category, HTTP status and a redacted detail
+- **Verification layer (not fact-checking)**: arXiv IDs and DOIs are confirmed to exist via the arXiv API, Crossref, the doi.org handle registry and DataCite (this covers arXiv's own `10.48550/arXiv.<id>` DOIs, Zenodo, and DOIs of other agencies such as Wanfang/ISTIC), URLs Grok cited are confirmed reachable, and paper titles written in the answer are compared with the registry title (`title_checks`). It does **not** check whether a source supports the claim (`claim_support: not_checked`). `unresolved` means the registry or site said it does not exist (treat as suspect); `lookup_failed` means no answer was obtained (rate limit, 5xx, timeout) and is not evidence against the citation; anything not checked is listed in `skipped` with a reason. Only sources Grok cited are checked, not `extra_sources` hits. Cited URLs are fetched only when their host resolves to public addresses; behind a Clash/mihomo fake-ip resolver the real address is looked up via DNS-over-HTTPS first (limits: see `web_search`)
+- **Fetch quality gate and snapshot paging**: short Tavily extracts fall back to Firecrawl and the longer result wins; arXiv abstract pages use the arXiv API (a versioned link returns that version); long pages return a `snapshot_id` and every later page is cut from the same snapshot; CJK-heavy pages default to 20,000 characters per page; a page that itself answers HTTP >= 400 counts as failed (`page_status=`), a Firecrawl redirect shows `final_url=`/`title=` in the header, and login walls / anti-bot pages are flagged `warning=interstitial`; non-http(s) URLs and local/LAN IP literals are refused locally (`error=invalid_url`) without calling a paid backend; failures list each backend with error category, HTTP status and a redacted detail
 - **Output style and citation rules**: `concise` by default, `explanatory` adds term definitions and analogies. Both styles cite only statements a source makes, label inferences ("Inference:"), never cite self-written explanations or analogies, report absence as "not found in this search", and quote numbers verbatim without merging figures across sources
 - One-click disable Claude Code's built-in WebSearch/WebFetch, force routing to this tool
-- Smart retry (Retry-After header parsing + exponential backoff)
+- Smart retry (Retry-After honoured on every status + exponential backoff; deterministic errors are not retried; Cloudflare 520/521/523/530 are retried once, 522/524 are treated as timeouts)
 - Parent process monitoring (auto-detects parent process exit on Windows, prevents zombie processes)
 
 ### Demo
@@ -102,25 +104,60 @@ claude mcp add-json grok-search --scope user '{
 }'
 ```
 
+> **Pin a version (recommended)**: `@main` is a branch, so uvx resolves it against GitHub on every start: you always run the latest main and get fixes first, but each start takes a few seconds longer, the server cannot start when GitHub is unreachable, and changes you have not reviewed (including incompatible ones) take effect on the next start. For everyday use, pin a release tag or commit: replace `git+https://github.com/Cody-Xue/GrokSearch@main` above with `git+https://github.com/Cody-Xue/GrokSearch@v1.12.0` (use a tag that exists in the repository; until one is published, use `@<commit SHA>`). Every run then uses the same code, is reproducible and, once cached, starts without GitHub; the trade-off is that you upgrade by editing the version. Both forms work; the examples below keep `@main`.
+
+<details> <summary>If you hit SSL / certificate verification errors</summary>
+
+In some corporate networks or proxy environments you may see errors such as:
+
+certificate verify failed
+self signed certificate in certificate chain
+
+Add `--native-tls` to the uvx arguments so that uv uses the system certificate store:
+
+```bash
+claude mcp add-json grok-search --scope user '{
+  "type": "stdio",
+  "command": "uvx",
+  "args": [
+    "--native-tls",
+    "--from",
+    "git+https://github.com/Cody-Xue/GrokSearch@main",
+    "grok-search"
+  ],
+  "env": {
+    "GROK_API_URL": "https://your-api-endpoint.com/v1",
+    "GROK_API_KEY": "your-grok-api-key",
+    "TAVILY_API_KEY": "tvly-your-tavily-key",
+    "TAVILY_API_URL": "https://api.tavily.com"
+  }
+}'
+```
+
+</details>
+
 You can also configure additional environment variables in the `env` field:
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `GROK_API_URL` | Yes | - | Grok API endpoint (OpenAI-compatible) |
-| `GROK_API_KEY` | Yes | - | Grok API key |
-| `GROK_MODEL` | No | `grok-4-fast` | Default model (takes precedence over `~/.config/grok-search/config.json` when set) |
+| `GROK_API_URL` | Yes | - | Grok API endpoint (OpenAI-compatible). Surrounding whitespace and a trailing `/` are ignored (`https://host/v1/` works) |
+| `GROK_API_KEY` | Yes | - | Grok API key; surrounding whitespace is ignored |
+| `GROK_MODEL` | No | `grok-4-fast` | Default model (takes precedence over `~/.config/grok-search/config.json` and `switch_model` when set; a blank value counts as unset) |
 | `TAVILY_API_KEY` | No | - | Tavily API key (for web_fetch / web_map / extra_sources) |
 | `TAVILY_API_URL` | No | `https://api.tavily.com` | Tavily API endpoint |
 | `TAVILY_ENABLED` | No | `true` | Enable Tavily; with `false` neither `web_fetch`, `web_map` nor `extra_sources` calls Tavily, even when a key is set |
 | `FIRECRAWL_API_KEY` | No | - | Firecrawl API key (fallback when Tavily fails) |
 | `FIRECRAWL_API_URL` | No | `https://api.firecrawl.dev/v2` | Firecrawl API endpoint |
-| `GROK_DEBUG` | No | `false` | Debug mode |
+| `GROK_DEBUG` | No | `false` | Debug mode (logs full prompts and answers) |
 | `GROK_LOG_LEVEL` | No | `INFO` | Log level |
-| `GROK_LOG_DIR` | No | `logs` | Log directory |
+| `GROK_LOG_DIR` | No | `logs` | Log directory; a relative path is under `~/.config/grok-search`. If it is unusable, logs go to a private temp directory, never the working directory. One file per day (`grok_search_YYYYMMDD.log`); a running server switches files after midnight |
+| `GROK_LOG_RETENTION_DAYS` | No | `7` | Number of daily log files kept (today included); older ones are deleted at start-up and at each day change |
 | `GROK_RETRY_MAX_ATTEMPTS` | No | `3` | Max retry attempts |
 | `GROK_RETRY_MULTIPLIER` | No | `1` | Retry backoff multiplier |
 | `GROK_RETRY_MAX_WAIT` | No | `10` | Max retry wait in seconds |
-| `GROK_RETRY_BUDGET_S` | No | `45` | Total retry-wait budget per call (seconds); a Retry-After beyond the budget fails fast. `0` disables |
+| `GROK_RETRY_BUDGET_S` | No | `45` | Total retry-wait budget per call (seconds); a Retry-After beyond the budget fails fast. `0` disables. Counts only the waits between retries; the whole call is bounded by `GROK_SEARCH_TIMEOUT_S` |
+| `GROK_READ_TIMEOUT_S` | No | `180` | Longest silence (per read, seconds, minimum 5) while waiting for Grok. Buffering gateways such as CLIProxyAPI send nothing until the answer is complete, so this also caps one attempt. A read timeout is retried at most once, and only if another full wait fits `GROK_SEARCH_TIMEOUT_S` |
+| `GROK_SEARCH_TIMEOUT_S` | No | `300` | Wall-clock limit (seconds) for one `web_search` Grok call: waiting for a concurrency slot, every attempt and every retry wait. `0` disables it. When exceeded, `error_type` is `timeout` |
 | `GROK_MAX_CONCURRENCY` | No | `16` | Maximum in-flight Grok requests |
 | `GROK_BREAKER_THRESHOLD` | No | `3` | 429s within the window that open the breaker |
 | `GROK_BREAKER_WINDOW_S` | No | `60` | Breaker counting window (seconds) |
@@ -128,15 +165,21 @@ You can also configure additional environment variables in the `env` field:
 | `GROK_BREAKER_MAX_COOLDOWN_S` | No | `300` | Cooldown ceiling (seconds) |
 | `GROK_SEARCH_STYLE` | No | `concise` | Output style: `concise` or `explanatory` (adds term definitions and uncited analogies) |
 | `GROK_MODELS_CACHE_TTL_S` | No | `600` | Lifetime (seconds) of the cached `/models` list used to validate `web_search(model=...)`; failures are not cached and `get_config_info` refreshes it |
-| `GROK_VERIFY_IDS` | No | `true` | Resolve arXiv IDs and DOIs found in the answer |
-| `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of cited URLs (hosts are resolved first and non-public addresses are not fetched; limits: see `web_search`) |
-| `GROK_VERIFY_TIMEOUT_S` | No | `30` | Overall verification timeout (seconds); lookups still pending at the deadline are listed under `unresolved` as `timed out`. All arXiv API calls share a 3-second spacing gate and a one-hour cache |
-| `GROK_VERIFY_MAILTO` | No | empty | Contact e-mail for the verification User-Agent (Crossref polite pool) |
+| `GROK_VERIFY_IDS` | No | `true` | Resolve arXiv IDs and DOIs found in the answer (identifier lookups only; URL checks follow `GROK_VERIFY_URLS`; with both `false` no verification block is attached) |
+| `GROK_VERIFY_URLS` | No | `true` | Check reachability and title of the URLs Grok cited, independent of `GROK_VERIFY_IDS` (hosts are resolved first and non-public addresses are not fetched; limits: see `web_search`) |
+| `GROK_VERIFY_TIMEOUT_S` | No | `30` | Overall verification timeout (seconds); lookups still pending at the deadline are listed under `lookup_failed` (reason `timed out`), and the last 5 s (at most 20%) of the budget is kept for the DataCite fallback of arXiv IDs. All arXiv API calls (`web_fetch` included) share one gate: one connection at a time, each request starting 3 s after the previous one finished; a 429/503 starts a process-wide cooldown (Retry-After, else 60 s) during which arXiv lookups fail fast into `lookup_failed`; concurrent lookups of the same ID share one request; 10 s read timeout. Verification lookups and `web_fetch` abstract pages are cached for an hour, and a paper fetched with `web_fetch` is not looked up again when it is verified (the verification cache holds no abstract, so a `web_fetch` after a verification still makes one request) |
+| `GROK_VERIFY_MAILTO` | No | empty | Contact e-mail sent only to the registries (arXiv / Crossref / doi.org / DataCite), never to cited sites or the DoH service. It joins the Crossref polite pool: up to 3 concurrent Crossref requests per process instead of 1. Strongly recommended |
+| `GROK_VERIFY_FAKE_IP` | No | `doh` | What to do when the local resolver returns only fake-ip addresses (198.18.0.0/15): `doh` = resolve the name via DNS-over-HTTPS through the configured proxy and fetch through the proxy only if all real addresses are public; `skip` = do not fetch (listed in `skipped`); `allow` = fetch through the proxy without the check |
+| `GROK_VERIFY_DOH_URL` | No | `https://cloudflare-dns.com/dns-query` | DoH JSON endpoint used by `GROK_VERIFY_FAKE_IP=doh` (Cloudflare/Google JSON format, e.g. `https://dns.google/resolve`), reached through the configured proxy |
 | `GROK_PLANNING_TOOLS` | No | `false` | Register the six `plan_*` planning tools |
 | `GROK_FETCH_MIN_CHARS` | No | `2000` | Fall back to Firecrawl when the Tavily extract is shorter than this |
 | `GROK_FETCH_MAX_CHARS` | No | `40000` | Default characters returned per `web_fetch` call |
+| `GROK_FETCH_MAX_CHARS_CJK` | No | `20000` | Default `web_fetch` page size when more than 30% of the page is CJK text (CJK is about one token per character), never above `GROK_FETCH_MAX_CHARS`. It keeps a page under the ~25k-token MCP result limit of Claude Code |
+| `GROK_FETCH_ARXIV_BUDGET_S` | No | `8` | Overall time limit (seconds) for `web_fetch`'s arXiv API path, covering the 3 s gate and one retry. After a rate-limit, timeout, network or 5xx failure the arXiv API is skipped for 2 minutes and Tavily/Firecrawl are used (`attempts=arxiv-api:cooldown`) |
 | `GROK_FETCH_SNAPSHOT_TTL_S` | No | `900` | Idle lifetime (seconds) of a `web_fetch` paging snapshot; afterwards paging restarts at `offset=0` |
 | `TAVILY_EXTRACT_TIMEOUT_S` | No | `30` | Tavily extract timeout (seconds) |
+
+Booleans accept `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off` (any case). A blank value keeps the default; an unrecognised value (including an unparseable number) also keeps the default and is listed in `config_warnings` of `get_config_info`. For example `TAVILY_ENABLED=disabled` keeps Tavily on; use `false`.
 
 
 
@@ -150,7 +193,7 @@ After confirming a successful connection, we **highly recommend** typing the fol
 ```
 Call grok-search toggle_builtin_tools to disable Claude Code's built-in WebSearch and WebFetch tools
 ```
-This will automatically modify the **project-level** `.claude/settings.json` `permissions.deny`, disabling Claude Code's built-in WebSearch and WebFetch, forcing Claude Code to use this project for searches!
+This (`action=on`) will automatically modify the **project-level** `.claude/settings.json` `permissions.deny`, disabling Claude Code's built-in WebSearch and WebFetch, forcing Claude Code to use this project for searches!
 
 
 
@@ -159,19 +202,32 @@ This will automatically modify the **project-level** `.claude/settings.json` `pe
 <details>
 <summary>Seven MCP tools by default; `GROK_PLANNING_TOOLS=true` adds six `plan_*` planning tools (click to expand)</summary>
 
+By design, every tool returns its failures as normal results (MCP `isError=false`), so the model can read the structured error fields and any partial results already obtained: for `web_search` check the `error`/`error_type` fields and the `[搜索失败]` prefix, for `web_fetch`/`web_map` the `error=` in the first line.
+
 ### `web_search` — AI Web Search
 
 Executes AI-driven web search via Grok API. By default it returns only Grok's answer and a `session_id` for retrieving sources later.
 
-`web_search` does not expand sources in the response; it only returns `sources_count`. Sources are cached server-side by `session_id` and can be fetched with `get_sources`.
+`web_search` does not expand sources in the response; it only returns counts. Sources are cached server-side by `session_id` and can be fetched with `get_sources`. `sources_count` / `distinct_domains` count only the sources Grok cited (not `extra_sources`); `extra_sources_count` counts the extra hits and `total_sources_count` is the sum (the length of the `get_sources` list).
 
-`instructions` adds per-call requirements for the searcher (e.g. "cover at least 15 distinct domains" or "list arXiv IDs with titles only"). Besides `content` and `sources_count` the result carries `distinct_domains`; on failure it carries `error`/`error_type`/`retry_after_s` and `content` starts with `[搜索失败]`.
+`instructions` adds per-call requirements for the searcher (e.g. "cover at least 15 distinct domains" or "list arXiv IDs with titles only"). On failure the result carries `error`/`error_type`/`retry_after_s` (plus `status` and `exhausted` when applicable) and `content` always starts with `[搜索失败]`; extra-source hits found before the failure are still listed after it, and `model_check` is returned when `model` was given.
 
-- **Citation positions**: with native citations, adjacent repeated markers (e.g. `[[1]](u)[[1]](u)`) are collapsed and the `start_index`/`end_index` returned by `get_sources` always refer to the content that is returned. Offsets that do not match are relocated (`position: relocated`) or lose their coordinates (`position: removed`); the upstream values are kept in `upstream_start_index`/`upstream_end_index` and summarized in `citation_positions`.
-- **`verification`**: checks only that identifiers exist (arXiv / Crossref), that cited links are reachable, and whether a paper title written next to an arXiv ID or DOI matches the registry title (`title_checks`: `match` / `partial` / `possible_mismatch` / `not_stated`). It does **not** check whether a source supports the statement it is attached to (`claim_support` is always `not_checked`). Whatever was not checked is listed in `skipped` with a reason (over the limit, URL checks disabled, non-public address, non-http link); totals are in `summary`.
-- **Which URLs are fetched**: before the request and before every redirect the host is resolved with the system resolver (hosts file and LAN names included); if any address is not public the URL is not fetched and goes to `skipped`. This covers loopback, private, link-local and CGNAT (100.64.0.0/10) addresses, numeric forms such as `127.1`, `2130706433` or `0x7f.0.0.1`, and non-public IPv4 addresses inside IPv4-mapped, 6to4 and NAT64 addresses. Limits: the check and the connection resolve the name separately, so DNS rebinding is not prevented; when an HTTP/SOCKS proxy carries the request the proxy decides the real destination; with a Clash/mihomo fake-ip resolver every name resolves to 198.18.0.0/15, the real destination cannot be checked and such URLs are skipped (add the domains to fake-ip-filter or set `GROK_VERIFY_URLS=false`); names that do not resolve locally are listed as `unresolved` (`dns lookup failed`). arXiv and Crossref lookups go to fixed hosts and are not subject to this check.
-- **`model`**: CPA thinking suffixes are accepted, e.g. `grok-4.7(high)`, `grok-4.7(8192)`, `grok-4.7(auto)`. The default model (with its suffix) and other levels of the same base model pass directly; other names are validated by their base name against `/models` and sent in full. If the list cannot be fetched the name is not blocked (`model_check.status = unverified`).
-- **`extra_sources`** (0-20): with both engines active Tavily gets ceil(n/2) and Firecrawl floor(n/2), each asked for 2 spare results; URLs already cited by Grok and repeats across engines are dropped (scheme, `www.`, fragment, trailing slash and tracking parameters ignored) and results are picked round-robin. If an engine fails or comes up short, the other one backfills once. The hits are appended as an "Extra sources" section; details are in `extra_sources_report`.
+- **Citation positions**: with native citations, adjacent repeated markers (e.g. `[[1]](u)[[1]](u)`) are collapsed and the `start_index`/`end_index` returned by `get_sources` always refer to the content that is returned, counted in Unicode code points (not UTF-16 units). Offsets that do not match are relocated (`position: relocated`) or lose their coordinates (`position: removed`); the upstream values are kept in `upstream_start_index`/`upstream_end_index` and summarized in `citation_positions`.
+- **Upstream errors and retries**:
+  - `error_type` is one of: `config` (`GROK_API_URL`/`GROK_API_KEY` missing or invalid), `proxy_config` (broken local proxy environment), `invalid_model`, `rate_limit` (`exhausted: true` means this model's account pool is blocked: wait `retry_after_s` or switch model), `circuit_open`, `timeout` (no complete answer within `GROK_SEARCH_TIMEOUT_S`, a read timeout, or Cloudflare 522/524), `network` (connection, proxy or TLS failure; the message is never empty), `truncated_stream` (the stream closed without `finish_reason` or `[DONE]`; it is retried), `empty_response`, `auth` (the gateway has no usable credential for the model, e.g. CPA `auth_not_found`; not retried), `http_<status>`, `unknown`, or an error code passed through from the upstream stream (e.g. `invalid_request_error`, `model_not_found`, `server_error`, `upstream_error`).
+  - `rate_limit` with `exhausted: true` also covers CLIProxyAPI 503 `auth_unavailable` / "no auth available", 429 `model_cooldown` / "cooling down" and xAI `free-usage-exhausted`, and opens the breaker on the first call. `retry_after_s` comes from Retry-After on any status, or from CPA `reset_seconds` in error frames.
+  - An exhausted pool that announces a recovery time within `GROK_RETRY_BUDGET_S` and the overall limit is waited out once; otherwise the call fails fast with `retry_after_s` and is not retried blindly. Deterministic errors (`retryable: false`, `authentication_error`, `auth_not_found`) are not retried.
+  - Cloudflare: 520/521/523/530 are retried once; 522/524 are reported as `timeout`, and 524 is never re-run (the search already ran ~100 s; narrow the query or use a lighter model). Cloudflare pages are named, not quoted.
+  - Circuit breaker: calls waiting for a `GROK_MAX_CONCURRENCY` slot re-check the breaker once they get one; only the half-open probe call can release the probe slot.
+- **`verification`**: checks the arXiv IDs / DOIs in the answer and the URLs Grok cited (`extra_sources` hits are not checked) for existence and reachability only, and whether a paper title written next to an identifier matches the registry title (`title_checks`: `match` / `partial` / `possible_mismatch` / `not_stated`). It does **not** check whether a source supports the statement it is attached to (`claim_support` is always `not_checked`).
+  - arXiv IDs include old-style IDs (e.g. `hep-th/9711200`) and `10.48550/arXiv.<id>` DOIs. DOIs go to Crossref first; on a Crossref 404 the doi.org handle registry decides whether the DOI exists and DataCite supplies the title.
+  - `unresolved` (treat as suspect): the registry said not found, the page answered 404/410 or another 4xx, or the domain does not exist (NXDOMAIN). 401/403/451 carry the note "access denied to automated requests; the page may still exist".
+  - `lookup_failed` (unknown, not evidence against the citation): 429, 5xx, timeouts, network errors, registry cooldowns, bot challenges, the verification time limit; reasons include the HTTP status. `summary` also counts `lookup_failed`.
+  - `skipped`: what was not checked and why (over the limit, URL checks disabled, identifier checks disabled (`GROK_VERIFY_IDS=false`), non-public address, non-http link, arxiv.org/doi.org URLs without a recognisable identifier, DOI-shaped text over 400 characters or with `.`/`..` path segments; DOI templates written in the answer, such as `10.48550/arXiv.<id>` or `10.1145/3XXXXXX.3XXXXXX`, come last, at most 20 of them).
+  - `title_checks` only use a title written for this identifier: the nearest explicit title, never another paper's; the previous line counts when the identifier starts its line; author-year text, venue names, labels ending in `:` and spans under 3 words are not titles.
+- **Which URLs are fetched**: before the request and before every redirect the host is resolved with the system resolver (hosts file and LAN names included); if any address is not public the URL is not fetched and goes to `skipped`. This covers loopback, private, link-local and CGNAT (100.64.0.0/10) addresses, numeric forms such as `127.1`, `2130706433` or `0x7f.0.0.1`, and non-public IPv4 addresses inside IPv4-mapped, 6to4 and NAT64 addresses. With a Clash/mihomo fake-ip resolver every name resolves to 198.18.0.0/15: with `GROK_VERIFY_FAKE_IP=doh` (default) the real addresses come from DNS-over-HTTPS through the configured proxy, the same all-public rule applies, and the page is fetched through the proxy; `skip` and `allow` are described in the env table. Redirects are followed hop by hop and redirect bodies are never read; at most 64 KB of decoded body is read (gzip/deflate inflated with a limit, other encodings not decoded). Proxy 502/503/504 answers go to `lookup_failed` (from the proxy or the site). Names that do not resolve locally are listed as `unresolved` (`dns lookup failed`). Limits: the check and the connection resolve the name separately, so DNS rebinding is not prevented; when an HTTP/SOCKS proxy carries the request the proxy decides the real destination (and may use different, e.g. split-horizon, DNS); DoH reveals cited host names to the DoH provider. Registry (arXiv / Crossref / doi.org / DataCite) and DoH lookups go to fixed hosts and are not subject to this check.
+- **`model`**: CPA thinking suffixes are accepted, e.g. `grok-4.7(high)`, `grok-4.7(8192)`, `grok-4.7(auto)`. The default model (with its suffix) and other levels of the same base model pass directly; other names are validated by their base name against `/models` and sent in full. If the list cannot be fetched the name is not blocked (`model_check.status = unverified`). With an OpenRouter URL a per-call model also gets `:online`, and an explicit `model:online` is accepted.
+- **`extra_sources`** (0-20, values outside the range are rejected by parameter validation): with both engines active Tavily gets ceil(n/2) and Firecrawl floor(n/2), each asked for 2 spare results; URLs already cited by Grok and repeats across engines are dropped (scheme, `www.`, fragment, trailing slash and tracking parameters ignored) and results are picked round-robin. If an engine fails or comes up short, the other one backfills once (shortfall + a margin of 2 + the duplicates seen, at most 20). The hits are appended as an "Extra sources" section with one plain-text line per item (title, link, engine, a preview of at most 300 characters); details are in `extra_sources_report`.
 - **"Not found"**: "not found in this search" only means this search did not find it. When a definite answer matters, check the platform directly (for example `web_fetch` the repository's issue search page).
 
 | Parameter | Type | Required | Default | Description |
@@ -179,16 +235,21 @@ Executes AI-driven web search via Grok API. By default it returns only Grok's an
 | `query` | string | Yes | - | Search query |
 | `platform` | string | No | `""` | Focus platform (e.g., `"Twitter"`, `"GitHub, Reddit"`) |
 | `model` | string | No | `""` | Per-request Grok model ID, thinking suffix allowed |
-| `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0-20, 0 disables) |
+| `extra_sources` | int | No | `0` | Extra sources via Tavily/Firecrawl (0-20, 0 disables; counted in `extra_sources_count`, not in `sources_count`) |
 | `instructions` | string | No | `""` | Per-call requirements for the searcher |
-| `verify` | bool | No | `true` | Attach the verification layer (also gated by `GROK_VERIFY_IDS`) |
+| `verify` | bool | No | `true` | Attach the verification layer; identifier lookups follow `GROK_VERIFY_IDS` and URL checks `GROK_VERIFY_URLS`; both off = no verification |
 
 Local date, time and timezone context is prepended to every search to improve time-sensitive queries.
 
 Return value (structured dict):
 - `session_id`: search session ID
-- `content`: the answer (without native citations the sources section is removed; with native citations the original text is kept and only repeated markers are collapsed)
-- `sources_count` / `distinct_domains`: cached sources / distinct sites
+- `content`: the answer. Without native citations the full text is kept and only a pure link list under a sources heading is removed; with native citations the original text is kept and only repeated markers are collapsed. When the answer was cut short a one-line `[回答不完整] …` note follows it, before the "Extra sources" section
+- `sources_count` / `distinct_domains`: sources Grok cited / distinct sites among them (without native citations: the markers, Markdown links and URLs written in the answer)
+- `extra_sources_count` / `total_sources_count`: extra-source hits / cited + extra
+- `incomplete` / `finish_reason` / `native_finish_reason`: present only when the upstream cut the answer short (`finish_reason` `length` or `content_filter`, or `native_finish_reason` other than `stop`)
+- `usage`: `{prompt_tokens, completion_tokens, reasoning_tokens}` when the upstream reports token usage
+- `dropped_events`: present only when SSE frames could not be decoded
+- `error` / `error_type` / `retry_after_s` / `status` / `exhausted`: failures only, see above
 - `citation_positions`, `verification`, `extra_sources_report`, `model_check`: see above, present when applicable
 
 ### `get_sources` — Retrieve Sources
@@ -201,23 +262,28 @@ Retrieves the full cached source list for a previous `web_search` call.
 
 Return value (structured dict):
 - `session_id`
-- `sources_count`
-- `sources`: source list (each item includes `url`, may include `title`/`description`/`provider`)
+- `sources_count`: the whole list (`web_search`'s `total_sources_count`)
+- `cited_sources_count` / `extra_sources_count`: how many of them Grok cited / came from `extra_sources`
+- `sources`: the sources Grok cited (`provider: grok`) first, then the `extra_sources` hits (`provider: tavily` / `firecrawl`), which Grok did not cite. Each item includes `url` and may include `title`/`description`/`provider`/`citations`. `start_index`/`end_index` in `citations` are Unicode code-point offsets into the content returned by `web_search`; an extra source's `description` is a whitespace-collapsed snippet of at most 500 characters ending with `…` when cut (use `web_fetch` for the full page)
 
 ### `web_fetch` — Web Content Extraction
 
-Extracts complete web content via Tavily Extract API, returning Markdown. When Tavily fails or returns too little, Firecrawl Scrape takes over; arXiv abstract pages use the arXiv API.
+Extracts complete web content via Tavily Extract API, returning Markdown. When Tavily fails or returns too little, Firecrawl Scrape takes over; arXiv abstract pages use the arXiv API, and a versioned link (e.g. `/abs/1706.03762v1`) returns that version with `version: v1` in the front matter (`vN (latest)` when no version was requested).
+
+All backends run in the cloud, so before any backend call web_fetch refuses URLs they cannot reach: no http(s) scheme, no host, `localhost`/`*.localhost`, and loopback/private/link-local/CGNAT IP literals. The result is `[web_fetch] error=invalid_url reason=<malformed|missing_scheme|unsupported_scheme|missing_host|local_address>`; host names are not resolved for this check.
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `url` | string | Yes | - | Target webpage URL |
-| `max_chars` | int | No | `0` | Maximum characters in this call; `0` uses `GROK_FETCH_MAX_CHARS` |
+| `url` | string | Yes | - | Complete public http(s) URL |
+| `max_chars` | int | No | `0` | Maximum characters in this call; `0` uses `GROK_FETCH_MAX_CHARS`, or `GROK_FETCH_MAX_CHARS_CJK` when more than 30% of the page is CJK |
 | `offset` | int | No | `0` | Character offset; values above 0 require `snapshot_id` |
 | `snapshot_id` | string | No | `""` | Snapshot ID from the first page, used to read the following pages |
 
-The first line is a metadata header: `[web_fetch] source=… total_chars=… offset=… returned=… truncated=… [next_offset=… snapshot_id=… expires_in_s=…]`. A page longer than one response is stored as a server-side snapshot; call again with the same `url`, `offset=next_offset` and `snapshot_id` and every page is cut from the same text. `offset>0` without `snapshot_id` is refused; once a snapshot expires (900 s idle by default) the tool answers `error=snapshot_expired` and paging restarts at `offset=0`.
+The first line is a metadata header: `[web_fetch] source=… total_chars=… offset=… returned=… truncated=… [next_offset=… snapshot_id=… expires_in_s=…] [attempts=…] [warning=interstitial] [final_url=… title="…"]`. A page longer than one response is stored as a server-side snapshot; call again with the same `url`, `offset=next_offset` and `snapshot_id` and every page is cut from the same text. `offset>0` without `snapshot_id` is refused; once a snapshot expires (900 s idle by default) the tool answers `error=snapshot_expired` and paging restarts at `offset=0`.
 
-On failure the first line is `[web_fetch] error=…`, followed by one line per backend with the error category (`auth`, `quota`, `rate_limit`, `timeout`, `proxy_config`, `network`, `upstream_error`, `bad_request`, `extract_failed`, `empty_content`, `disabled`, `not_configured`, ...), the HTTP status and a redacted detail.
+`final_url` and `title` appear when Firecrawl was redirected; `title` is always the last field and is JSON-quoted. `warning=interstitial` plus a `注意:` line mean the text is a login wall or anti-bot page (e.g. Zhihu 安全验证, Cloudflare "Just a moment..."), not the requested page. Such a page never replaces a Tavily extract.
+
+On failure the first line is `[web_fetch] error=…`, followed by one line per backend with the error category (`auth`, `quota`, `rate_limit`, `timeout`, `proxy_config`, `network`, `upstream_error`, `bad_request`, `extract_failed`, `empty_content`, `disabled`, `not_configured`, ...), the HTTP status and a redacted detail. When the page itself answered HTTP >= 400 (404, 403, 5xx...), that backend counts as failed with detail `target page answered HTTP <status>` and category `extract_failed` (`rate_limit` for 429, `upstream_error` for 5xx), and the first line adds `page_status=<status>`.
 
 ### `web_map` — Site Structure Mapping
 
@@ -239,9 +305,16 @@ Traverses website structure via Tavily Map API, discovering URLs and generating 
 
 `web_map` is unavailable when `TAVILY_ENABLED=false`. Few results or a fast answer are not necessarily a fault; use the parameters above and `max_depth` to adjust the scope.
 
+On failure the first line is `[web_map] error=<category> provider=tavily [status=<HTTP status>]`, followed by the Chinese message and a redacted detail line; success output is unchanged JSON and is no longer duplicated in `structuredContent`. `file://`, `localhost` and local/LAN IP literals are refused locally (`[web_map] error=invalid_url reason=…`); bare domains such as `docs.example.com` still go to Tavily.
+
 ### `get_config_info` — Configuration Diagnostics
 
 No parameters required. Displays all configuration status (including whether Tavily/Firecrawl are actually active), tests Grok API connection, returns response time and available model list (API keys auto-masked), and refreshes the model list used to validate `web_search(model=...)`. Local proxy problems (such as `[::1]` in `NO_PROXY`) are reported as such.
+
+- `GROK_MODEL_SOURCE` is `env` | `switch_model` | `config` | `default`; `GROK_MODEL_NOTE` explains how long a `switch_model` choice lasts.
+- It also lists `GROK_CONFIG_FILE`, `GROK_LOG_RETENTION_DAYS`, `GROK_RETRY_MULTIPLIER`, `GROK_RETRY_MAX_WAIT`, `GROK_READ_TIMEOUT_S`, `GROK_SEARCH_TIMEOUT_S`, the `GROK_VERIFY_*` settings (including `GROK_VERIFY_FAKE_IP` and `GROK_VERIFY_DOH_URL`) and the `GROK_FETCH_*` settings; `config_warnings` lists environment values that were not understood and config-file or log-directory problems.
+- Keys show at most a quarter of their characters (at most the last 4 below 24 characters); credentials in URLs (userinfo, query values) are shown as `***`.
+- The connection test retries once after a transport error (connection reset or refused, proxy tunnel closed; `retried_after`/`attempts`) and explains an empty error as `proxy tunnel closed or upstream unreachable (ConnectError)`; Cloudflare error pages are named, not quoted.
 
 ### `switch_model` — Model Switching
 
@@ -249,20 +322,24 @@ No parameters required. Displays all configuration status (including whether Tav
 |-----------|------|----------|-------------|
 | `model` | string | Yes | Model ID (e.g., `"grok-4-fast"`, `"grok-2-latest"`) |
 
-Settings persist to `~/.config/grok-search/config.json` across sessions.
+- The name is stripped and checked against `/models` like `web_search(model=...)`. Thinking suffixes such as `(high)` are allowed. Empty, over-long (more than 200 characters) or unlisted names are rejected with suggestions and nothing changes. If `/models` is unreachable the switch is applied unverified with a warning.
+- The choice is saved to `~/.config/grok-search/config.json`, or to a private temp directory (not kept after a restart, with a warning) when that is not writable.
+- If `GROK_MODEL` is set in the MCP `env` it takes precedence: the switch lasts only for the running process and `GROK_MODEL` wins after a restart. To change the model permanently, edit `GROK_MODEL`.
 
 ### `toggle_builtin_tools` — Tool Routing Control
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `action` | string | No | `"status"` | `"on"` disable built-in tools / `"off"` enable built-in tools / `"status"` check status |
+| `action` | string | No | `"status"` | `"on"` (alias `"block"`) disable built-in tools / `"off"` (alias `"allow"`) enable built-in tools again / `"status"` check status; any other value (including the ambiguous `enable`/`disable`) is rejected |
 | `project_dir` | string | No | `""` | Project root; when empty it is resolved as described below |
 
 Modifies `<project>/.claude/settings.json` `permissions.deny` to disable Claude Code's built-in WebSearch and WebFetch. The project is taken from `project_dir`, else `CLAUDE_PROJECT_DIR`, else the nearest directory containing `.git` or `.claude` above the server's working directory (never the home directory or a filesystem root). If none applies nothing is written and the tool asks for `project_dir`; an unreadable settings file is never overwritten.
 
+Deny rules in `.claude/settings.local.json` and `~/.claude/settings.json` are read, never changed, and reported in `denied_elsewhere`, with the combined result in `effective`; `off` warns when one of them still blocks the tools. A `.claude` directory or settings file that is a symlink pointing outside the project is refused; writes are atomic; a read-only `settings.json` is not changed. (The old, undocumented `disable` used to re-enable the built-in tools; it is now rejected.)
+
 ### `plan_*` — Search Planning (optional, off by default)
 
-With `GROK_PLANNING_TOOLS=true` six more tools record a staged plan for complex searches: `plan_intent` → `plan_complexity` → `plan_sub_query` → `plan_search_term` → `plan_tool_mapping` → `plan_execution`. They only record the plan and do not search.
+With `GROK_PLANNING_TOOLS=true` six more tools record a staged plan for complex searches: `plan_intent` → `plan_complexity` → `plan_sub_query` → `plan_search_term` → `plan_tool_mapping` → `plan_execution`. They only record the plan and do not search. Inputs are validated first (enums, `level` 1-3, ranges, confidence 0-1); errors return `{error, phase, invalid_fields}` and nothing is recorded. `plan_intent`, `plan_complexity` and `plan_execution` need `is_revision=true` to overwrite an existing phase.
 </details>
 
 ## 4. FAQ
@@ -278,7 +355,21 @@ A: Grok (`GROK_API_URL` + `GROK_API_KEY`) is required and provides the core sear
 <summary>
 Q: What format does the Grok API URL need?
 </summary>
-A: An OpenAI-compatible API endpoint (supporting `/chat/completions` and `/models` endpoints). If using official Grok, access it through an OpenAI-compatible mirror.
+A: An OpenAI-compatible API endpoint (supporting `/chat/completions` and `/models` endpoints). If using official Grok, access it through an OpenAI-compatible mirror. Surrounding whitespace and a trailing `/` are ignored: before v1.12.0 a trailing slash made `get_config_info` report success while every `web_search` returned HTTP 404.
+</details>
+
+<details>
+<summary>
+Q: What does `proxy tunnel closed or upstream unreachable (ConnectError)` mean?
+</summary>
+A: The local proxy (`HTTP_PROXY`/`HTTPS_PROXY`) closed the tunnel or could not reach the gateway. Check that the proxy is running, that its rules let the gateway's domain through, and that `GROK_API_URL` is reachable.
+</details>
+
+<details>
+<summary>
+Q: Why is `isError` false when a tool fails?
+</summary>
+A: By design. Failures are returned as normal results so the model can read the structured error fields and any partial results (such as extra sources). For `web_search` check `error`/`error_type` and the `[搜索失败]` prefix; for `web_fetch`/`web_map` check `error=` in the first line.
 </details>
 
 <details>
@@ -302,6 +393,63 @@ A: Say "Show grok-search configuration info" in a Claude conversation to automat
 </div>
 
 ## Changelog
+
+### v1.12.0 (unreleased)
+
+**web_search and the Grok upstream**
+
+- Fix: a `GROK_API_URL` with a trailing slash made every `web_search` fail with HTTP 404 while `get_config_info` reported success; surrounding whitespace in the URL and key is ignored too.
+- New: `GROK_READ_TIMEOUT_S` and `GROK_SEARCH_TIMEOUT_S`. A stalled gateway no longer holds a search (and a concurrency slot) for ~12 minutes or forever.
+- Fix: timeouts and transport failures are reported as `timeout`/`network` with a useful message instead of `unknown: ReadTimeout` or a bare `ConnectError`.
+- Fix: CLIProxyAPI pool exhaustion (503 `auth_unavailable`, 429 `model_cooldown`, xAI `free-usage-exhausted`) sets `exhausted=true` and `retry_after_s` and opens the breaker on the first call; an announced recovery time within the budget is waited out once. Deterministic gateway credential failures are not retried (`error_type: auth`).
+- Fix: Retry-After is honoured on 503 and every other status.
+- Fix: Cloudflare 52x errors are named; 522/524 are timeouts; 520/521/523/530 are retried once.
+- Fix: the SSE parser no longer drops frames containing U+0085/U+2028/U+2029 and joins multi-line `data:` events; lone UTF-16 surrogates in the query no longer crash the request.
+- New: `incomplete`/`finish_reason`/`native_finish_reason`/`usage` fields. Streams that close without `finish_reason` or `[DONE]` are retried as `truncated_stream`.
+- Fix: circuit breaker – queued calls re-check after getting a slot; only the probe owner can release the half-open probe.
+- `sources_count`/`distinct_domains` count only the sources Grok cited; new `extra_sources_count` and `total_sources_count`. `get_sources` gains `cited_sources_count`/`extra_sources_count`; extra-source snippets are capped at 500 characters.
+- Without native citations the full answer is kept (it could be mistaken for a sources section and removed) and the markers, links and URLs in it count as citations; URLs with balanced parentheses are no longer cut; answer parsing is linear-time.
+- Every failure starts with `[搜索失败]`; extra-source hits are still shown when Grok fails and `model_check` is returned on failure too; `extra_sources` 0-20 is enforced by the schema; backfill asks for a margin; the "Extra sources" section has one plain line per item.
+- With OpenRouter a per-call model also gets `:online`.
+
+**Verification layer**
+
+- DOIs and arXiv IDs are extracted exactly as written: parenthesised Lancet/Elsevier DOIs, Chinese punctuation or text right after a DOI, URL tails `?`/`#`/`.pdf`, bioRxiv `vN.full`, sentence-final periods, `.pdf` links, `arXiv.<id>` and old-style IDs.
+- New `lookup_failed` list: `unresolved` only holds registry/site denials; timed-out, rate-limited and 5xx lookups move to `lookup_failed`.
+- DOIs not in Crossref are checked via the doi.org handle registry and DataCite. Crossref runs at concurrency 1 per process (3 with `GROK_VERIFY_MAILTO`), with one retry after Retry-After.
+- arXiv: one connection at a time, 3 s after completion, process-wide 429/503 cooldown, shared in-flight lookups, 10 s read timeout, DataCite fallback, status codes in reasons.
+- `title_checks` no longer flag author-year link text, journal names, bold labels or a neighbouring paper's title.
+- Only Grok-cited sources are verified. `GROK_VERIFY_IDS=false` now only disables identifier lookups; URL checks follow `GROK_VERIFY_URLS`.
+- New `GROK_VERIFY_FAKE_IP` / `GROK_VERIFY_DOH_URL`: URL checks work behind Clash fake-ip.
+- URL checks read at most 64 KB decoded and never read redirect bodies (fixes a gzip-bomb/regex stall that could freeze the server); `GROK_VERIFY_MAILTO` is sent only to registries.
+
+**web_fetch / web_map**
+
+- 404/403/5xx error pages rendered by Firecrawl are no longer returned as content (`page_status=`) and no longer replace a short Tavily extract.
+- After a Firecrawl redirect the header shows `final_url`/`title`; login walls and anti-bot pages (e.g. Zhihu 安全验证) are flagged `warning=interstitial` with a note line.
+- Versioned arXiv abs links return the requested version; abstract pages are cached for an hour and fill the verification cache; a slow or throttled arXiv API is abandoned after `GROK_FETCH_ARXIV_BUDGET_S` (default 8 s) and skipped for 2 minutes.
+- Non-http(s) URLs and local/LAN IP literals are refused locally (`error=invalid_url`) without calling paid backends.
+- CJK-heavy pages default to 20,000 characters per page (`GROK_FETCH_MAX_CHARS_CJK`).
+- `web_map`: `output_schema=None`, so no duplicated `structuredContent`, and a stable `[web_map] error=<category> provider=tavily [status=…]` failure header.
+
+**Configuration and admin tools**
+
+- `switch_model` validates the name (empty, over-long and unlisted names are rejected) and reports the true model source (`GROK_MODEL_SOURCE`/`GROK_MODEL_NOTE`).
+- Config and logs are never written into the project working directory; a malformed `config.json` is ignored with a warning; unrecognised env values keep their default and appear in `config_warnings`.
+- Daily log files with retention (`GROK_LOG_RETENTION_DAYS`, default 7).
+- Stricter key/URL masking (at most a quarter of a key, URL credentials as `***`, also in breaker messages); the `get_config_info` connection test retries once after a transport error and lists the new timeout and verification settings.
+- `toggle_builtin_tools`: `block`/`allow` aliases, ambiguous `enable`/`disable` rejected, deny rules from other settings files reported, symlinks leading outside the project refused, atomic writes.
+- `plan_*` inputs are validated; overwriting a phase needs `is_revision=true`.
+- The server exits with status 1 and prints the traceback when it crashes.
+
+**Security**
+
+- Error bodies are redacted before they are shortened; `xai-` keys, Basic/bare Authorization values, `?key=` and URL userinfo are redacted too.
+
+**Packaging and docs**
+
+- Dependency floor raised to `fastmcp>=2.11.0` (the `meta` argument used to register the tools exists only from 2.11.0; older versions cannot import the server).
+- Install docs recommend pinning a tag or commit; tool failures returned as normal results (`isError=false`) are documented; the English README is back in parity (SSL `--native-tls` variant, Firecrawl empty-content retry).
 
 ### v1.11.0 (2026-10-16)
 

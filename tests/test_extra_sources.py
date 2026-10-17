@@ -74,7 +74,7 @@ async def test_failed_engine_is_backfilled_by_the_other(configured, monkeypatch)
     assert report["returned"] == 8 and report["engines"]["tavily"]["selected"] == 8
     assert report["engines"]["firecrawl"]["status"] == "error"
     assert report["engines"]["firecrawl"]["error"] == {"provider": "firecrawl", "category": "quota", "status": 402, "detail": "Insufficient credits"}
-    assert tavily.calls == [6, 8]  # first round: share 4 + 2; backfill: 6 + shortfall 2
+    assert tavily.calls == [6, 10]  # first round: share 4 + 2; backfill: 6 + shortfall 2 + margin 2 (+ 0 duplicates)
 
 
 @pytest.mark.asyncio

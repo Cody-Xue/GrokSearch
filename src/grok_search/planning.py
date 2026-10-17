@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from typing import Optional, Literal
 import uuid
+
+ToolName = Literal["web_search", "web_fetch", "web_map"]
 
 
 class IntentOutput(BaseModel):
@@ -32,10 +34,10 @@ class ComplexityOutput(BaseModel):
 
 
 class SubQuery(BaseModel):
-    id: str = Field(description="Unique identifier (e.g., 'sq1')")
+    id: str = Field(min_length=1, description="Unique identifier (e.g., 'sq1')")
     goal: str
     expected_output: str = Field(description="What a successful result looks like")
-    tool_hint: Optional[str] = Field(default=None, description="Suggested tool: web_search | web_fetch | web_map")
+    tool_hint: Optional[ToolName] = Field(default=None, description="Suggested tool: web_search | web_fetch | web_map")
     boundary: str = Field(description="What this sub-query explicitly excludes — MUST state mutual exclusion with sibling sub-queries, not just the broader domain")
     depends_on: Optional[list[str]] = Field(default=None, description="IDs of prerequisite sub-queries")
 
@@ -54,9 +56,16 @@ class StrategyOutput(BaseModel):
     fallback_plan: Optional[str] = Field(default=None, description="Fallback if primary searches fail")
 
 
+class StrategyUpdate(BaseModel):
+    """A later plan_search_term call: approach is optional once the first call has set it."""
+    approach: Optional[Literal["broad_first", "narrow_first", "targeted"]] = None
+    search_terms: list[SearchTerm]
+    fallback_plan: Optional[str] = None
+
+
 class ToolPlanItem(BaseModel):
-    sub_query_id: str
-    tool: Literal["web_search", "web_fetch", "web_map"]
+    sub_query_id: str = Field(min_length=1)
+    tool: ToolName
     reason: str
     params: Optional[dict] = Field(default=None, description="Tool-specific parameters")
 
@@ -84,6 +93,47 @@ REQUIRED_PHASES: dict[int, set[str]] = {
 
 _ACCUMULATIVE_LIST_PHASES = {"query_decomposition", "tool_selection"}
 _MERGE_STRATEGY_PHASE = "search_strategy"
+
+# Schema each phase's data must satisfy (search_strategy: StrategyOutput on the first call, StrategyUpdate after).
+PHASE_MODELS: dict[str, type[BaseModel]] = {
+    "intent_analysis": IntentOutput,
+    "complexity_assessment": ComplexityOutput,
+    "query_decomposition": SubQuery,
+    "tool_selection": ToolPlanItem,
+    "execution_order": ExecutionOrderOutput,
+}
+
+
+def _describe_errors(error: ValidationError) -> list[str]:
+    problems = []
+    for item in error.errors():
+        location = ".".join(str(part) for part in item.get("loc", ())) or "value"
+        text = f"{location}: {item.get('msg', 'invalid')}"
+        if "input" in item and not isinstance(item["input"], (dict, list)):
+            shown = repr(item["input"])
+            text += f" (got {shown[:80]}{'…' if len(shown) > 80 else ''})"
+        problems.append(text)
+    return problems
+
+
+def validate_phase_data(phase: str, phase_data, *, first_strategy_call: bool = True) -> list[str]:
+    """Problems with one phase's data; empty when it is valid."""
+    if phase == _MERGE_STRATEGY_PHASE:
+        model = StrategyOutput if first_strategy_call else StrategyUpdate
+    else:
+        model = PHASE_MODELS.get(phase)
+    if model is None:
+        return []
+    if not isinstance(phase_data, dict):
+        return [f"phase data must be an object, got {type(phase_data).__name__}"]
+    try:
+        model.model_validate(phase_data)
+    except ValidationError as e:
+        problems = _describe_errors(e)
+        if phase == _MERGE_STRATEGY_PHASE and first_strategy_call and any(p.startswith("approach:") for p in problems):
+            problems.append("approach is required on the first plan_search_term call of a session")
+        return problems
+    return []
 
 
 def _split_csv(value: str) -> list[str]:
@@ -136,16 +186,38 @@ class PlanningEngine:
         confidence: float = 1.0,
         phase_data: dict | list | None = None,
     ) -> dict:
-        if session_id and session_id in self._sessions:
-            session = self._sessions[session_id]
+        existing_session = self._sessions.get(session_id) if session_id else None
+        target = revises_phase if is_revision and revises_phase else phase
+        if target not in PHASE_NAMES:
+            return {"error": f"Unknown phase: {target}. Valid: {', '.join(PHASE_NAMES)}"}
+
+        # Validate before anything is created or changed, so a rejected call leaves no trace.
+        problems = []
+        if not isinstance(confidence, (int, float)) or not 0.0 <= confidence <= 1.0:
+            problems.append(f"confidence: must be between 0.0 and 1.0 (got {confidence!r})")
+        first_strategy_call = is_revision or existing_session is None or target not in existing_session.phases
+        problems += validate_phase_data(target, phase_data, first_strategy_call=first_strategy_call)
+        if problems:
+            return {
+                "error": f"Invalid input for {target}; nothing was recorded: " + "; ".join(problems),
+                "phase": target,
+                "invalid_fields": problems,
+            }
+        single_record = target not in _ACCUMULATIVE_LIST_PHASES and target != _MERGE_STRATEGY_PHASE
+        if single_record and existing_session is not None and target in existing_session.phases and not is_revision:
+            return {
+                "error": f"{target} is already recorded for session '{existing_session.session_id}'; "
+                         f"set is_revision=true to overwrite it (nothing was changed)",
+                "phase": target,
+                "session_id": existing_session.session_id,
+            }
+
+        if existing_session is not None:
+            session = existing_session
         else:
             sid = session_id if session_id else uuid.uuid4().hex[:12]
             session = PlanningSession(sid)
             self._sessions[sid] = session
-
-        target = revises_phase if is_revision and revises_phase else phase
-        if target not in PHASE_NAMES:
-            return {"error": f"Unknown phase: {target}. Valid: {', '.join(PHASE_NAMES)}"}
 
         if target in _ACCUMULATIVE_LIST_PHASES:
             if is_revision:

@@ -1,17 +1,30 @@
 import re
 
-_URL_PATTERN = re.compile(r'https?://[^\s<>"\'`，。、；：！？》）】\)]+')
+# One URL character: no whitespace, quotes, angle or square brackets, parentheses or CJK punctuation.
+# Parentheses are only taken as a balanced pair (Wikipedia-style ".../Python_(programming_language)"), so
+# a URL written inside "(...)" or as a Markdown link target does not swallow the closing ")". Every
+# alternative starts with a different character, which keeps matching linear on hostile input.
+_URL_CHAR = r'[^\s<>"\'`()\[\]，。、；：！？》）】（「」『』]'
+URL_BODY = rf"(?:{_URL_CHAR}|\({_URL_CHAR}*\))+"
+_URL_PATTERN = re.compile(r"https?://" + URL_BODY)
+_URL_TAIL_PUNCTUATION = ".,;:!?*"
+
+
+def clean_url(url: str) -> str:
+    """Strip sentence punctuation and Markdown emphasis that ended up after a URL."""
+    return (url or "").strip().rstrip(_URL_TAIL_PUNCTUATION)
 
 
 def extract_unique_urls(text: str) -> list[str]:
     """从文本中提取所有唯一 URL，按首次出现顺序排列"""
     seen: set[str] = set()
     urls: list[str] = []
-    for m in _URL_PATTERN.finditer(text):
-        url = m.group().rstrip('.,;:!?')
-        if url not in seen:
-            seen.add(url)
-            urls.append(url)
+    for m in _URL_PATTERN.finditer(text or ""):
+        url = clean_url(m.group())
+        if not url.partition("://")[2] or url in seen:
+            continue
+        seen.add(url)
+        urls.append(url)
     return urls
 
 

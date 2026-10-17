@@ -15,7 +15,7 @@ import time
 from collections import deque
 from typing import Callable, Optional
 
-from .config import config
+from .config import config, mask_url
 
 BreakerKey = tuple[str, str]
 
@@ -29,7 +29,7 @@ class BreakerOpen(Exception):
         self.reason = reason
         detail = f" ({reason})" if reason else ""
         super().__init__(
-            f"circuit open for model {key[1]} at {key[0]}: retry after {self.retry_after_s:.0f}s{detail}"
+            f"circuit open for model {key[1]} at {mask_url(key[0])}: retry after {self.retry_after_s:.0f}s{detail}"
         )
 
 
@@ -80,6 +80,7 @@ class CircuitBreaker:
             "open_until": None,
             "half_open": False,
             "probe_in_flight": False,
+            "probe_token": None,
             "last_cooldown": 0.0,
             "reason": "",
             "opened_count": 0,
@@ -91,19 +92,25 @@ class CircuitBreaker:
             st["failures"].popleft()
 
     # -- public API ---------------------------------------------------------
-    def check(self, key: BreakerKey) -> None:
-        """Admit a call or raise BreakerOpen. Admits exactly one probe when half-open."""
+    def check(self, key: BreakerKey) -> Optional[object]:
+        """Admit a call or raise BreakerOpen. Admits exactly one probe when half-open.
+
+        Returns a token when this call was admitted as the half-open probe, otherwise None.
+        Only the holder of that token may hand the probe slot back (release_probe).
+        """
         now = self.clock()
         with self._lock:
             st = self._state(key)
             if st["open_until"] is None:
-                return
+                return None
             if now < st["open_until"]:
                 raise BreakerOpen(key, st["open_until"] - now, st["reason"])
             if st["probe_in_flight"]:
                 raise BreakerOpen(key, 5.0, "half-open probe in flight")
             st["half_open"] = True
             st["probe_in_flight"] = True
+            st["probe_token"] = token = object()
+            return token
 
     def is_open(self, key: BreakerKey) -> bool:
         now = self.clock()
@@ -138,6 +145,7 @@ class CircuitBreaker:
             st["last_cooldown"] = cooldown
             st["half_open"] = False
             st["probe_in_flight"] = False
+            st["probe_token"] = None
             st["reason"] = reason or ("account pool exhausted" if exhausted else "repeated rate limits")
             st["opened_count"] += 1
             return True
@@ -149,15 +157,21 @@ class CircuitBreaker:
             st["open_until"] = None
             st["half_open"] = False
             st["probe_in_flight"] = False
+            st["probe_token"] = None
             st["last_cooldown"] = 0.0
             st["reason"] = ""
 
-    def release_probe(self, key: BreakerKey) -> None:
-        """A half-open probe ended without a definitive verdict; let the next caller probe."""
+    def release_probe(self, key: BreakerKey, token: Optional[object]) -> None:
+        """The half-open probe ended without a definitive verdict; let the next caller probe.
+
+        A call that was not admitted as the probe (token None or stale) changes nothing, so a
+        failing old call cannot let a second probe in while the real one is still running.
+        """
         with self._lock:
             st = self._states.get(key)
-            if st and st["half_open"]:
+            if st and token is not None and st["probe_token"] is token:
                 st["probe_in_flight"] = False
+                st["probe_token"] = None
 
     def snapshot(self) -> dict:
         now = self.clock()

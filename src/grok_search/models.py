@@ -14,6 +14,10 @@ than one per waiting call. A name missing from a list older than
 MISS_REFRESH_MIN_AGE_S triggers one refresh before it is rejected; concurrent
 misses share that refresh. A stale list never rejects a name, and
 get_config_info refreshes the cache whenever it runs.
+
+On OpenRouter (GROK_API_URL contains "openrouter") a model needs the ":online"
+variant to search the web: the suffix is ignored for validation and added to the
+name that is sent, as it is for the default model and switch_model.
 """
 import asyncio
 import difflib
@@ -24,7 +28,7 @@ from typing import Optional
 
 import httpx
 
-from .config import config
+from .config import apply_online_suffix, config, uses_online_suffix
 from .errors import ProviderError, classify_exception
 
 # Values CPA accepts inside the parentheses besides a numeric token budget (case-insensitive).
@@ -33,6 +37,10 @@ THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max", "auto", "
 MISS_REFRESH_MIN_AGE_S = 30.0
 # After a failed fetch, callers within this window get the failure without refetching.
 FAILURE_BACKOFF_S = 15.0
+
+# Longer names are rejected before anything is sent or saved.
+MAX_MODEL_NAME_LEN = 200
+_ONLINE = ":online"
 
 _SUFFIX_RE = re.compile(r"^(?P<base>.*?[^\s(])\((?P<value>[^()]*)\)$")
 _BUDGET_RE = re.compile(r"^-?\d+$")
@@ -61,6 +69,17 @@ def parse_model_name(model: str) -> ModelName:
     else:
         kind = "unknown"
     return ModelName(raw, match.group("base"), value, kind)
+
+
+def model_name_problem(name: str) -> str:
+    """Why a (stripped) model name can never be valid; empty when it is acceptable as a name."""
+    if not name:
+        return "model name is empty"
+    if len(name) > MAX_MODEL_NAME_LEN:
+        return f"model name is {len(name)} characters long (limit {MAX_MODEL_NAME_LEN})"
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        return "model name contains control characters"
+    return ""
 
 
 def routing_base(model: str) -> str:
@@ -200,37 +219,45 @@ class ModelCheck:
 
 
 async def check_model(requested: str, *, default_model: str, api_url: str, api_key: str, cache: ModelListCache) -> ModelCheck:
-    """Decide whether a per-call model name may be sent upstream; the full name is always kept."""
-    requested = (requested or "").strip()
-    default_raw = default_model[: -len(":online")] if default_model.endswith(":online") else default_model
-    if requested in (default_model, default_raw):
-        return ModelCheck(True, requested, "default")
+    """Decide whether a per-call model name may be sent upstream; the full name is always kept.
 
-    name = parse_model_name(requested)
+    ModelCheck.model is the name to send: on OpenRouter it carries ":online" like the default model.
+    """
+    requested = (requested or "").strip()
+    problem = model_name_problem(requested)
+    if problem:
+        return ModelCheck(False, requested, "invalid", detail=problem)
+    lookup = requested[: -len(_ONLINE)] if uses_online_suffix(api_url) and requested.endswith(_ONLINE) else requested
+    send = apply_online_suffix(lookup, api_url)
+    default_raw = default_model[: -len(_ONLINE)] if default_model.endswith(_ONLINE) else default_model
+    if lookup in (default_model, default_raw):
+        return ModelCheck(True, send, "default")
+
+    name = parse_model_name(lookup)
     if name.suffix_kind != "unknown" and name.base == parse_model_name(default_raw).base:
-        return ModelCheck(True, requested, "default_base", name.base)
+        return ModelCheck(True, send, "default_base", name.base)
 
     def listed(models) -> bool:
-        return bool(models) and (requested in models or base_is_listed(name.base, models))
+        return bool(models) and (lookup in models or base_is_listed(name.base, models))
 
     listing = await cache.get(api_url, api_key)
     if name.suffix_kind == "unknown":
-        if listing.models and requested in listing.models:
-            return ModelCheck(True, requested, "listed", name.base)
+        if listing.models and lookup in listing.models:
+            return ModelCheck(True, send, "listed", name.base)
         return ModelCheck(
             False, requested, "invalid", name.base,
             f"unsupported thinking suffix '({name.suffix})': use a token budget such as (8192) or one of "
             + ", ".join(THINKING_LEVELS),
         )
     if listed(listing.models):
-        return ModelCheck(True, requested, "listed", name.base)
+        return ModelCheck(True, send, "listed", name.base)
     if listing.models and not listing.stale and listing.from_cache and cache.now() - listing.fetched_at >= MISS_REFRESH_MIN_AGE_S:
         # One refresh for a miss; it honours the failure backoff and concurrent misses share it.
         listing = await cache.get(api_url, api_key, refresh_older_than=MISS_REFRESH_MIN_AGE_S)
         if not listing.stale and listed(listing.models):
-            return ModelCheck(True, requested, "listed_after_refresh", name.base)
+            return ModelCheck(True, send, "listed_after_refresh", name.base)
     if not listing.models or listing.stale:
         reason = listing.error.summary() if listing.error else "model list unavailable"
-        return ModelCheck(True, requested, "unverified", name.base, f"could not validate against /models ({reason}); sent as-is")
+        return ModelCheck(True, send, "unverified", name.base, f"could not validate against /models ({reason}); sent as-is")
     suggestions = difflib.get_close_matches(name.base, listing.models, n=5, cutoff=0.4)
     return ModelCheck(False, requested, "invalid", name.base, f"'{name.base}' is not in the proxy's /models list", suggestions)

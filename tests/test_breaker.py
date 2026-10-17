@@ -103,9 +103,34 @@ def test_release_probe_lets_next_caller_probe():
     b = make(clock)
     b.record_failure(KEY, exhausted=True)
     clock.t = 60
-    b.check(KEY)
-    b.release_probe(KEY)
-    b.check(KEY)
+    token = b.check(KEY)
+    assert token is not None
+    b.release_probe(KEY, token)
+    assert b.check(KEY) is not None
+
+
+def test_only_the_probe_owner_can_release_the_probe_slot():
+    clock = Clock()
+    b = make(clock)
+    assert b.check(KEY) is None  # admitted while closed: not a probe
+    b.record_failure(KEY, exhausted=True)
+    clock.t = 60
+    probe = b.check(KEY)
+    # The old call fails while the probe is still running: it must not free the probe slot.
+    b.release_probe(KEY, None)
+    b.release_probe(KEY, object())
+    with pytest.raises(BreakerOpen) as info:
+        b.check(KEY)
+    assert "probe" in info.value.reason
+    # A stale token from an earlier probe cannot release a later one either.
+    b.record_failure(KEY)  # the probe failed: open again
+    clock.t = 1000
+    second = b.check(KEY)
+    b.release_probe(KEY, probe)
+    with pytest.raises(BreakerOpen):
+        b.check(KEY)
+    b.release_probe(KEY, second)
+    assert b.check(KEY) is not None
 
 
 def test_keys_are_independent():

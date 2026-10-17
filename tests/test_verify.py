@@ -13,6 +13,7 @@ def _fresh_arxiv_state(monkeypatch):
     monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0.0)
     verify._ARXIV_CACHE.clear()
     verify._arxiv_gate.update(loop=None, lock=None, last_start=0.0)
+    verify._crossref_gate.update(loop=None)
 
 ATOM = """<?xml version="1.0" encoding="UTF-8"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
@@ -44,6 +45,8 @@ async def test_verify_answer_resolves_and_flags(monkeypatch):
                     "container-title": ["Nature"], "type": "journal-article",
                     "issued": {"date-parts": [[2026, 4, 22]]}}})
             return httpx.Response(404, json={"status": "error"})
+        if host == "doi.org":  # a Crossref 404 is confirmed with the DOI handle registry
+            return httpx.Response(404, json={"responseCode": 100})
         if host == "example.test":
             if path == "/ok":
                 return httpx.Response(200, text="<html><head><title>OK\n  page</title></head></html>")
@@ -161,8 +164,9 @@ async def test_verify_timeout_marks_pending_lookups(monkeypatch):
     real = httpx.AsyncClient
     monkeypatch.setattr(verify.httpx, "AsyncClient", lambda **kwargs: real(transport=httpx.MockTransport(handler), **kwargs))
     result = await verify.verify_answer("see 2607.06065 and 10.1038/x", [{"url": "https://example.test/slow"}], check_urls=True, timeout_s=0.2)
-    assert result["timed_out"] is True
-    assert {(u["kind"], u["value"], u["reason"]) for u in result["unresolved"]} == {
+    assert result["timed_out"] is True and result["unresolved"] == []
+    # Lookups that never got an answer are not evidence against the citation: lookup_failed, not unresolved.
+    assert {(u["kind"], u["value"], u["reason"]) for u in result["lookup_failed"]} == {
         ("arxiv", "2607.06065", "timed out"), ("doi", "10.1038/x", "timed out"), ("url", "https://example.test/slow", "timed out")}
 
 

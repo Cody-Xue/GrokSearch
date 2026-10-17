@@ -17,14 +17,17 @@ receives, so every answer goes through normalize_citations() before it is return
    coordinates. The upstream values are kept as upstream_start_index /
    upstream_end_index and "position" says "relocated" or "removed".
 """
+import bisect
 import copy
 import json
 import re
 from dataclasses import dataclass
 
+# The URL keeps one level of balanced parentheses; square brackets end it, so a long run of unclosed
+# markers cannot make one match attempt scan the rest of the answer.
 MARKER_RE = re.compile(
     r"\[\[(?P<label>[^\[\]\s]{1,16})\]\]"
-    r"\((?P<url>https?://(?:[^\s()]|\([^\s()]*\))+)\)"
+    r"\((?P<url>https?://(?:[^\s()\[\]]|\([^\s()\[\]]*\))+)\)"
 )
 _RUN_GAP_RE = re.compile(r"[ \t]*")
 
@@ -63,14 +66,21 @@ def _collapse_duplicates(text: str, markers: list[Marker]) -> tuple[list[tuple[i
     return deletions, twin_of
 
 
-def _shift(pos: int, deletions: list[tuple[int, int]]) -> int:
-    removed = 0
+def _shifter(deletions: list[tuple[int, int]]):
+    """pos -> position after the (sorted, non-overlapping) deletions are applied; O(log n) per call."""
+    ends = [end for _, end in deletions]
+    removed = [0]
     for start, end in deletions:
-        if end <= pos:
-            removed += end - start
-        else:
-            break
-    return pos - removed
+        removed.append(removed[-1] + end - start)
+
+    def shift(pos: int) -> int:
+        return pos - removed[bisect.bisect_right(ends, pos)]
+
+    return shift
+
+
+def _shift(pos: int, deletions: list[tuple[int, int]]) -> int:
+    return _shifter(deletions)(pos)
 
 
 def _apply(text: str, deletions: list[tuple[int, int]]) -> str:
@@ -89,7 +99,8 @@ def _is_link_span(text: str, start: int, end: int, url: str) -> bool:
     """True when text[start:end] is exactly one Markdown link to url, optionally wrapped in brackets."""
     if not (0 <= start < end <= len(text)) or not url:
         return False
-    pattern = r"\s*[(\[]?\s*\[[^\[\]]*\]\(\s*" + re.escape(_url_key(url)) + r"/?\s*\)\s*[)\]]?\s*"
+    # No two whitespace runs are adjacent, so an all-whitespace span is rejected in linear time.
+    pattern = r"\s*(?:[(\[]\s*)?\[[^\[\]]*\]\(\s*" + re.escape(_url_key(url)) + r"/?\s*\)\s*(?:[)\]]\s*)?"
     return re.fullmatch(pattern, text[start:end]) is not None
 
 
@@ -103,11 +114,29 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
     markers = find_markers(text)
     deletions, twin_of = _collapse_duplicates(text, markers)
     cleaned = _apply(text, deletions)
+    shift = _shifter(deletions)
     by_span = {(m.start, m.end): i for i, m in enumerate(markers)}
+    # Markers per URL (and per URL + label) in reading order, for relocation without rescanning.
+    by_url: dict[str, list[int]] = {}
+    by_url_label: dict[tuple[str, str], list[int]] = {}
+    for i, m in enumerate(markers):
+        by_url.setdefault(_url_key(m.url), []).append(i)
+        by_url_label.setdefault((_url_key(m.url), m.label), []).append(i)
+    cursor: dict = {}
+
+    def first_unclaimed(key, indices: list[int] | None) -> int | None:
+        # claimed only grows, so each list is walked at most once in total.
+        if not indices:
+            return None
+        pos = cursor.get(key, 0)
+        while pos < len(indices) and indices[pos] in claimed:
+            pos += 1
+        cursor[key] = pos
+        return indices[pos] if pos < len(indices) else None
 
     def final_span(i: int) -> tuple[int, int]:
         kept = markers[twin_of.get(i, i)]
-        return _shift(kept.start, deletions), _shift(kept.end, deletions)
+        return shift(kept.start), shift(kept.end)
 
     report = {
         "markers": len(markers) - len(twin_of),
@@ -139,7 +168,7 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
                 citations[idx] = {**occ, "start_index": new_start, "end_index": new_end}
                 report["valid"] += 1
             elif hit is None and _is_link_span(text, start, end, url):
-                citations[idx] = {**occ, "start_index": _shift(start, deletions), "end_index": _shift(end, deletions)}
+                citations[idx] = {**occ, "start_index": shift(start), "end_index": shift(end)}
                 report["valid"] += 1
             else:
                 pending.append((source, idx, occ, url_key))
@@ -148,10 +177,11 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
         label = occ.get("label")
         rest = {k: v for k, v in occ.items() if k not in ("start_index", "end_index")}
         upstream = {"upstream_start_index": occ["start_index"], "upstream_end_index": occ["end_index"]}
-        candidates = [i for i, m in enumerate(markers) if i not in claimed and _url_key(m.url) == url_key]
-        target = next((i for i in candidates if label is None or markers[i].label == label), None)
-        if target is None and candidates:
-            target = candidates[0]
+        target = None
+        if label is not None:
+            target = first_unclaimed(("label", url_key, label), by_url_label.get((url_key, label)))
+        if target is None:
+            target = first_unclaimed(("url", url_key), by_url.get(url_key))
         if target is not None:
             claimed.add(target)
             new_start, new_end = final_span(target)

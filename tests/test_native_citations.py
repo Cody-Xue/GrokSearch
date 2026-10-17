@@ -230,8 +230,10 @@ async def test_extra_sources_merge_with_native_citations(configured_server, monk
     async with Client(configured_server) as client:
         result = await call(client, "web_search", {"query": "test", "extra_sources": 2})
         cached = await call(client, "get_sources", {"session_id": result["session_id"]})
-    assert result["sources_count"] == 2
+    # sources_count counts what Grok cited; the uncited extra hit is counted separately.
+    assert (result["sources_count"], result["extra_sources_count"], result["total_sources_count"]) == (1, 1, 2)
     assert [item["provider"] for item in cached["sources"]] == ["grok", "firecrawl"]
+    assert (cached["sources_count"], cached["cited_sources_count"], cached["extra_sources_count"]) == (2, 1, 1)
     assert cached["sources"][0]["citations"] == [{"label": "1"}]
 
 

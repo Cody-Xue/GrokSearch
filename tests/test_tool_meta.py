@@ -101,6 +101,14 @@ async def test_default_style_is_concise(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_switch_model_warns_when_env_pins_model(configured, monkeypatch, tmp_path):
+    from grok_search import models
+    from grok_search.models import ModelListCache
+
+    async def fetch(api_url, api_key, timeout_s=10.0):  # switch_model now validates against /models
+        return ["test-model", "other-model"]
+
+    monkeypatch.setattr(models, "fetch_available_models", fetch)
+    monkeypatch.setattr(server, "_MODEL_CACHE", ModelListCache())
     monkeypatch.setattr(server.config, "_config_file", tmp_path / "config.json")
     async with Client(configured) as client:
         data = await call(client, "switch_model", {"model": "other-model"})
@@ -117,7 +125,9 @@ async def test_extra_sources_are_appended_and_domains_counted(configured, monkey
         result = await call(client, "web_search", {"query": "q", "extra_sources": 1})
     assert result["content"].startswith("answer\n\n## Extra sources")
     assert "[Extra](https://www.b.example.test/y) [firecrawl]" in result["content"]
-    assert result["sources_count"] == 2 and result["distinct_domains"] == 2
+    # Counts cover Grok's citations only; the extra hit is in extra_sources_count / total_sources_count.
+    assert result["sources_count"] == 1 and result["distinct_domains"] == 1
+    assert result["extra_sources_count"] == 1 and result["total_sources_count"] == 2
 
 
 @pytest.mark.asyncio
