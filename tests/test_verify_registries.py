@@ -185,6 +185,17 @@ async def test_doi_unknown_to_the_handle_registry_is_unresolved(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_unregistered_test_prefix_doi_explains_itself(monkeypatch):
+    # ACM DL shows 10.5555/... for NeurIPS papers; the paper exists, the DOI is not registered.
+    handle = httpx.Response(404, json={"responseCode": 100, "handle": "10.5555/3295222.3295349"})
+    mock_verify_client(monkeypatch, registry_handler(handle))
+    result = await verify.verify_answer("NeurIPS 2017 record 10.5555/3295222.3295349", [], check_urls=False, timeout_s=5)
+    reason = reasons(result, "unresolved")["10.5555/3295222.3295349"]
+    assert reason.startswith("not found (10.5555 is Crossref's test prefix") and "check the paper by its title" in reason
+    assert verify._doi_not_found_reason("10.55555/x") == "not found"
+
+
+@pytest.mark.asyncio
 async def test_failed_handle_lookup_is_lookup_failed(monkeypatch):
     mock_verify_client(monkeypatch, registry_handler(httpx.Response(503, text="busy")))
     result = await verify.verify_answer("10.1234/maybe", [], check_urls=False, timeout_s=5)

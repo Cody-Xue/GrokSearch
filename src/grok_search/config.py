@@ -333,6 +333,18 @@ class Config:
         return os.getenv("GROK_VERIFY_DOH_URL", "").strip() or "https://cloudflare-dns.com/dns-query"
 
     @property
+    def verify_detail(self) -> str:
+        """compact (default): web_search's verification lists only problems, with all counts in summary;
+        full: also every resolved identifier record, reachable URL and matching title check."""
+        value = _env_value("GROK_VERIFY_DETAIL")
+        if value is None:
+            return "compact"
+        if value.lower() in ("compact", "full"):
+            _ENV_WARNINGS.pop("GROK_VERIFY_DETAIL", None)
+            return value.lower()
+        return _env_fallback("GROK_VERIFY_DETAIL", value, "compact")
+
+    @property
     def planning_tools_enabled(self) -> bool:
         return _env_bool("GROK_PLANNING_TOOLS", False)
 
@@ -357,6 +369,20 @@ class Config:
         return max(1.0, _env_float("GROK_FETCH_ARXIV_BUDGET_S", 8.0))
 
     @property
+    def fetch_max_age_s(self) -> float:
+        """Oldest Firecrawl cache entry web_fetch accepts (sent as maxAge). 0 always scrapes fresh;
+        Firecrawl's own default would serve copies up to 2 days old."""
+        return max(0.0, _env_float("GROK_FETCH_MAX_AGE_S", 0.0))
+
+    @property
+    def fetch_direct_enabled(self) -> bool:
+        """Download text resources (raw code/config/text URLs) directly instead of through the extractors.
+
+        Through a proxy or a fake-ip TUN only the well-known code hosts (direct.TRUSTED_HOSTS) are
+        downloaded directly; the proxy, not this process, decides where other names lead."""
+        return _env_bool("GROK_FETCH_DIRECT", True)
+
+    @property
     def tavily_extract_timeout_s(self) -> float:
         return max(5.0, _env_float("TAVILY_EXTRACT_TIMEOUT_S", 30.0))
 
@@ -364,6 +390,13 @@ class Config:
     def fetch_snapshot_ttl_s(self) -> float:
         """Idle lifetime of a web_fetch page snapshot used for paging."""
         return max(30.0, _env_float("GROK_FETCH_SNAPSHOT_TTL_S", 900.0))
+
+    # ------------------------------------------------------------------- map
+    @property
+    def map_regex_timeout_s(self) -> float:
+        """Wall-clock limit of web_map's local select_domains matching, which runs in a child process
+        that is killed when it is exceeded (the results then come back unfiltered)."""
+        return min(60.0, max(0.5, _env_float("GROK_MAP_REGEX_TIMEOUT_S", 2.0)))
 
     # ------------------------------------------------------------- endpoints
     @property
@@ -554,7 +587,9 @@ class Config:
             self._model_persisted = False
             warning = f"{e}；本次切换只在当前进程有效"
         self._cached_model = self._apply_model_suffix(model)
-        self._model_source = "switch_model"
+        env_model = _env_value("GROK_MODEL")
+        # Switching back to the GROK_MODEL value is what a restart would give too: the source is env again.
+        self._model_source = "env" if env_model and self._apply_model_suffix(env_model) == self._cached_model else "switch_model"
         return warning
 
     @staticmethod
@@ -623,12 +658,16 @@ class Config:
             "GROK_VERIFY_MAILTO": self.verify_mailto or "未设置",
             "GROK_VERIFY_FAKE_IP": self.verify_fake_ip,
             "GROK_VERIFY_DOH_URL": mask_url(self.verify_doh_url),
+            "GROK_VERIFY_DETAIL": self.verify_detail,
             "GROK_PLANNING_TOOLS": self.planning_tools_enabled,
             "GROK_FETCH_MIN_CHARS": self.fetch_min_chars,
             "GROK_FETCH_MAX_CHARS": self.fetch_max_chars,
             "GROK_FETCH_SNAPSHOT_TTL_S": self.fetch_snapshot_ttl_s,
             "GROK_FETCH_MAX_CHARS_CJK": self.fetch_max_chars_cjk,
             "GROK_FETCH_ARXIV_BUDGET_S": self.fetch_arxiv_budget_s,
+            "GROK_FETCH_MAX_AGE_S": self.fetch_max_age_s,
+            "GROK_FETCH_DIRECT": self.fetch_direct_enabled,
+            "GROK_MAP_REGEX_TIMEOUT_S": self.map_regex_timeout_s,
             "TAVILY_API_URL": mask_url(self.tavily_api_url),
             "TAVILY_ENABLED": self.tavily_enabled,
             "TAVILY_EXTRACT_TIMEOUT_S": self.tavily_extract_timeout_s,

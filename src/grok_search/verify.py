@@ -22,8 +22,12 @@ cooling down after rate-limiting us); it says nothing about the citation.
 What is NOT checked: whether a source supports the statement it is attached to.
 "Resolved" means "exists / reachable", not "true". Every identifier or URL that
 was not checked is listed in skipped with a reason. Nothing here depends on a model.
+
+verify_answer returns the full result (GROK_VERIFY_DETAIL=full). compact_verification reduces it
+to what needs attention plus the counts, the default shape attached to web_search.
 """
 import asyncio
+import codecs
 import difflib
 import email.utils
 import html
@@ -40,6 +44,8 @@ from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from .interstitial import is_interstitial, url_key
+
 ARXIV_API = "https://export.arxiv.org/api/query"
 CROSSREF_API = "https://api.crossref.org/works/"
 DOI_HANDLE_API = "https://doi.org/api/handles/"
@@ -54,6 +60,12 @@ SCOPE = (
     "could be obtained, including 401/403/451 refusals of scripted requests (not evidence either way). Whether "
     "a source supports the sentence it is attached to is NOT checked."
 )
+# compact (default) output: the semantics of unresolved / lookup_failed are in the web_search tool
+# description, which the client receives once, instead of in every result.
+SCOPE_COMPACT = (
+    "Existence/reachability of cited IDs and URLs only; NOT whether sources support claims. Only problems are listed."
+)
+COMPACT_MAX_SKIPPED = 10
 MAX_SKIPPED_LISTED = 50
 MAX_PATTERNS_LISTED = 20  # DOI patterns, listed after the other skipped entries
 
@@ -324,6 +336,14 @@ DOI_MAX_TAIL_PASSES = 6
 DOI_PATTERN_REASON = "DOI pattern/prefix, not an identifier (not looked up)"
 DOI_TOO_LONG_REASON = f"DOI-shaped text longer than {DOI_MAX_CHARS} characters (not looked up)"
 DOI_DOT_SEGMENT_REASON = "DOI with a '.' or '..' path segment (not looked up: it would change the registry path)"
+# 10.5555 is Crossref's test prefix. The ACM Digital Library shows 10.5555/... identifiers for items it hosts
+# without a registered DOI (NeurIPS proceedings, for example): the identifier is still not a DOI, but whether the
+# paper exists has to be checked by its title. The entry stays unresolved either way.
+DOI_TEST_PREFIX_REASON = "not found (10.5555 is Crossref's test prefix, used by ACM DL for unregistered items; check the paper by its title)"
+
+
+def _doi_not_found_reason(doi: str) -> str:
+    return DOI_TEST_PREFIX_REASON if doi.startswith("10.5555/") else "not found"
 
 
 def _has_dot_segment(doi: str) -> bool:
@@ -1018,14 +1038,16 @@ class DohResolver:
         return addresses
 
 
-async def check_destination(host: str, port: int, fake_ip: str = "skip", doh: Optional[DohResolver] = None) -> None:
-    """Raise BlockedAddress unless every address of host is public, ResolveFailed when it does not resolve."""
+async def check_destination(host: str, port: int, fake_ip: str = "skip", doh: Optional[DohResolver] = None) -> list[str]:
+    """Raise BlockedAddress unless every address of host is public, ResolveFailed when it does not resolve.
+
+    Returns the addresses the system resolver gave (fake-ip ones included when fake_ip allowed them)."""
     literal = literal_address(host)
     if literal is not None:
         kind = address_problem(literal)
         if kind:
             raise BlockedAddress(host, str(literal), kind, literal=True)
-        return
+        return [str(literal)]
     try:
         addresses = await resolve_host(host, port)
     except socket.gaierror as e:
@@ -1044,7 +1066,7 @@ async def check_destination(host: str, port: int, fake_ip: str = "skip", doh: Op
         if kind == "fake_ip":
             fake.append(address)
     if not fake or fake_ip == "allow":
-        return
+        return addresses
     if fake_ip == "doh" and doh is not None:
         for address in await doh.resolve(host):
             try:
@@ -1053,7 +1075,7 @@ async def check_destination(host: str, port: int, fake_ip: str = "skip", doh: Op
                 raise ResolveFailed(f"{host}: DNS-over-HTTPS returned {address!r}", definitive=False)
             if kind:
                 raise BlockedAddress(host, address, kind, via="DNS-over-HTTPS")
-        return
+        return addresses
     raise BlockedAddress(host, fake[0], "fake_ip")
 
 
@@ -1124,11 +1146,28 @@ def _extract_title(text: str) -> str:
     return html.unescape(" ".join(raw.split())).strip()[:200]
 
 
-def _decode(body: bytes, charset: Optional[str]) -> str:
+# Codecs a server may name in Content-Type. Anything else ("punycode", whose decoder is quadratic and
+# runs on the event loop, "idna", "undefined", the escape codecs, ...) is decoded as UTF-8 instead.
+_TEXT_CHARSET_RE = re.compile(
+    r"utf-(?:8(?:-sig)?|16(?:-[bl]e)?|32(?:-[bl]e)?)|ascii|iso8859-\d+|cp\d+|mac-[a-z]+|koi8-[rtu]|"
+    r"big5(?:hkscs)?|gb(?:2312|k|18030)|hz|euc_[a-z0-9_]+|shift_jis\w*|iso2022_\w+|johab|kz1048|ptcp154|"
+    r"tis-620|hp-roman8|palmos|mbcs|oem"
+)
+
+
+def text_charset(charset: Optional[str]) -> Optional[str]:
+    """The Python codec for a declared charset when it is a plain text encoding, else None."""
+    if not charset:
+        return None
     try:
-        return body.decode(charset or "utf-8", "replace")
-    except LookupError:
-        return body.decode("utf-8", "replace")
+        name = codecs.lookup(str(charset).strip()).name
+    except (LookupError, ValueError, TypeError):
+        return None
+    return name if _TEXT_CHARSET_RE.fullmatch(name) else None
+
+
+def _decode(body: bytes, charset: Optional[str]) -> str:
+    return body.decode(text_charset(charset) or "utf-8", "replace")
 
 
 def _proxied(url: str) -> bool:
@@ -1163,8 +1202,11 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
                 return {"url": url, "status": None, "transient": True, "error": f"more than {URL_MAX_REDIRECTS} redirects"}
             status = response.status_code
             body = await _read_capped(response, max_bytes) if status < 400 else b""
+            # A body cut at max_bytes is not a short page (GitHub issue pages: 250-360 KB of HTML).
+            complete = len(body) < max_bytes
             charset = response.charset_encoding
             challenge = response.headers.get("cf-mitigated", "").lower() == "challenge"
+            final_url = str(response.url)
         finally:
             await response.aclose()
     except BlockedAddress as e:
@@ -1178,9 +1220,14 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
     except Exception as e:
         detail = str(e).strip()
         return {"url": url, "status": None, "transient": True, "error": type(e).__name__ + (f": {detail[:120]}" if detail else "")}
-    info = {"url": url, "status": status, "title": _extract_title(_decode(body, charset)) if body else ""}
+    text = _decode(body, charset) if body else ""
+    info = {"url": url, "status": status, "title": _extract_title(text) if text else ""}
     if challenge:
         info["challenge"] = True
+    # A captcha or bot check answered with 2xx (Reddit, PyPI's Fastly challenge, Baidu) is not the cited page.
+    if text and is_interstitial(info["title"], text, redirected=url_key(final_url) != url_key(url), final_url=final_url,
+                                url=url, complete=complete):
+        info["interstitial"] = True
     return info
 
 
@@ -1192,6 +1239,8 @@ def _url_outcome(info: dict) -> tuple[str, str]:
     if status is None:
         return ("lookup_failed" if info.get("transient") else "unresolved"), info.get("error", "unreachable")
     if status < 400:
+        if info.get("interstitial"):
+            return "lookup_failed", "bot check / interstitial (page may exist)"
         return "urls", ""
     reason = f"status {status}"
     if status in (408, 425, 429) or status >= 500:
@@ -1229,10 +1278,11 @@ _ID_LEAD_RE = re.compile(r"(?i)\s*(?:[(（\[]\s*)*(?:(?:arxiv|doi)\s*)?(?:(?:id|
 _BOUNDARY_RE = re.compile(r"[.;。；|](?:\s|$)|[。；|]|\n")
 _SENTENCE_RE = re.compile(r"[.!?;](?:\s|$)|[。！？；]")
 _ABBREVIATION_RE = re.compile(r"(?i)\b(?:et al|e\.g|i\.e|vs|no|vol|pp|cf|fig|eq|ch|sec|ed|eds)\.")
-# Text that may precede an identifier at the start of its line ("- arXiv:", "**DOI:** https://doi.org/").
+# Text that may precede an identifier at the start of its line ("- arXiv:", "**DOI:** https://doi.org/",
+# "- arXiv: [1706.03762](https://...)": a Markdown link or a bracket may open after the label).
 _LINE_LEAD_RE = re.compile(
     r"(?i)[\s>*_~`#+\-•·\d.,;:：，、)(（）\[\]【】]*"
-    r"(?:(?:arxiv|biorxiv|medrxiv|doi|pmid|id|url|link|pdf|preprint|paper|论文|链接|预印本|编号|号)(?:[\s*_]*[:：])?[\s*_,;，、]*)*"
+    r"(?:(?:arxiv|biorxiv|medrxiv|doi|pmid|id|url|link|pdf|preprint|paper|论文|链接|预印本|编号|号)(?:[\s*_]*[:：])?[\s*_,;，、\[(（【]*)*"
 )
 _URL_TAIL_RE = re.compile(r"(?:https?://|www\.)\S*$")
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]")
@@ -1601,7 +1651,7 @@ async def verify_answer(
             if info:
                 result["doi"].append(info)
             else:
-                result["unresolved"].append({"kind": "doi", "value": doi, "reason": "not found"})
+                result["unresolved"].append({"kind": "doi", "value": doi, "reason": _doi_not_found_reason(doi)})
 
         async def run_url(url: str):
             async with url_sem:
@@ -1665,3 +1715,113 @@ async def verify_answer(
         "title_not_stated": statuses.count("not_stated"),
     }
     return result
+
+
+_COMPACT_FINE_TITLES = frozenset({"match"})
+_BULK_SKIP_PREFIXES = ("over the per-answer limit", "identifier checks disabled", "URL checks disabled")
+
+
+def _skipped_rank(entry) -> int:
+    """Order for the capped compact list: specific reasons, then bulk ones (limits, disabled checks), then DOI patterns."""
+    reason = str(entry.get("reason", "")) if isinstance(entry, dict) else ""
+    if reason == DOI_PATTERN_REASON:
+        return 2
+    return 1 if reason.startswith(_BULK_SKIP_PREFIXES) else 0
+
+
+COMPACT_GROUP_SAMPLES = 2
+
+
+def _url_host_key(value) -> str:
+    try:
+        host = (urlparse(str(value)).hostname or "").lower()
+    except ValueError:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _group_lookup_failed(entries: list) -> list:
+    """URL entries with the same host and reason become one {kind, host, reason, count, sample} entry.
+
+    A platform search over a bot-protected site cites a dozen pages of it, each refused the same way
+    ("status 403 (bot challenge)"); listing every one was most of the compact block. Single entries
+    and identifier entries keep their shape."""
+    groups: dict = {}
+    order: list = []
+    for entry in entries:
+        key = None
+        if isinstance(entry, dict) and entry.get("kind") == "url" and isinstance(entry.get("value"), str):
+            host = _url_host_key(entry["value"])
+            if host:
+                key = (host, str(entry.get("reason", "")))
+        if key is None:
+            order.append(("single", entry))
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(("group", key))
+        groups[key].append(entry)
+    out = []
+    for kind, item in order:
+        if kind == "single":
+            out.append(item)
+            continue
+        members = groups[item]
+        if len(members) == 1:
+            out.append(members[0])
+        else:
+            out.append({"kind": "url", "host": item[0], "reason": item[1], "count": len(members),
+                        "sample": [m["value"] for m in members[:COMPACT_GROUP_SAMPLES]]})
+    return out
+
+
+def compact_verification(result: dict, max_skipped: int = COMPACT_MAX_SKIPPED) -> dict:
+    """The compact form of a verify_answer result (GROK_VERIFY_DETAIL=compact, the default): problems and counts.
+
+    Kept: every unresolved entry, every lookup_failed entry (URLs of one host refused for the same
+    reason grouped as {kind: "url", host, reason, count, sample}), title checks other than "match"
+    (partial, possible_mismatch and not_stated, whose registry title is the only clue to an identifier
+    that points to a different paper), reachable URLs whose final status is not 200 (urls_unusual, for
+    example a 202/203 bot-check page; only when there are some), the first max_skipped specific skipped
+    entries (blocked or unsupported URLs first, DOI patterns last; skipped_omitted counts the rest),
+    timed_out, checked and summary (every count, including urls_reachable, identifiers_found and
+    title_match). Bulk skips (over the per-answer limit, checks disabled) are only counted, per reason,
+    in skipped_by_reason.
+    Dropped: resolved arXiv / DOI records, reachable URLs with status 200 and matching title checks;
+    the keys arxiv, doi and urls are left out rather than sent empty. Anything that is not a
+    verification result (an error dict) is returned unchanged; missing keys are tolerated.
+    """
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    out: dict = {"scope": SCOPE_COMPACT, "claim_support": result.get("claim_support", "not_checked"), "detail": "compact"}
+    out["unresolved"] = list(result.get("unresolved") or [])
+    out["lookup_failed"] = _group_lookup_failed(list(result.get("lookup_failed") or []))
+    out["title_checks"] = [t for t in result.get("title_checks") or []
+                           if not (isinstance(t, dict) and t.get("status") in _COMPACT_FINE_TITLES)]
+    unusual = [u for u in result.get("urls") or [] if not (isinstance(u, dict) and u.get("status") == 200)]
+    if unusual:
+        out["urls_unusual"] = unusual
+    skipped = sorted(result.get("skipped") or [], key=_skipped_rank)
+    bulk: dict = {}
+    specific = []
+    for entry in skipped:
+        reason = str(entry.get("reason", "")) if isinstance(entry, dict) else ""
+        if reason.startswith(_BULK_SKIP_PREFIXES):
+            bulk[reason] = bulk.get(reason, 0) + 1
+        else:
+            specific.append(entry)
+    out["skipped"] = specific[:max(0, max_skipped)]
+    if bulk:
+        out["skipped_by_reason"] = bulk
+    total = (result.get("summary") or {}).get("skipped")
+    if not isinstance(total, int) or isinstance(total, bool) or total < len(skipped):
+        total = len(skipped)
+    shown = len(out["skipped"]) + sum(bulk.values())
+    if total > shown:
+        out["skipped_omitted"] = total - shown
+    if result.get("timed_out"):
+        out["timed_out"] = True
+    for key in ("checked", "summary"):
+        if key in result:
+            out[key] = result[key]
+    return out

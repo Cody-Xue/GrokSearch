@@ -278,3 +278,69 @@ async def test_get_config_info_masks_credentials_everywhere(isolated, monkeypatc
     assert "url-secret-pw" not in text and "1234567" not in text
     assert info["GROK_API_URL"] == "http://***@127.0.0.1:9/v1"
     assert any("http://***@127.0.0.1:9/v1" in key for key in info["breaker"])
+
+
+# ----------------------------------------------------------- already active / back to GROK_MODEL
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["grok-4.20-multi-agent-0309(high)", "  grok-4.20-multi-agent-0309(high) "])
+async def test_switching_to_the_env_model_changes_nothing(isolated, name):
+    async with Client(server.mcp) as client:
+        data = await call(client, "switch_model", {"model": name})
+        info = await call(client, "get_config_info")
+    assert data["status"] == "✅ 成功" and data["already_active"] is True
+    assert data["current_model"] == data["previous_model"] == "grok-4.20-multi-agent-0309(high)"
+    assert data["model_source"] == "env" and "无需切换" in data["message"] and "warning" not in data
+    assert info["GROK_MODEL_SOURCE"] == "env" and "GROK_MODEL_NOTE" not in info
+    assert config_json(isolated) is None
+
+
+@pytest.mark.asyncio
+async def test_switching_to_the_current_config_model_does_not_rewrite_it(isolated, monkeypatch):
+    monkeypatch.delenv("GROK_MODEL")
+    saved = []
+    real_set_model = server.config.set_model
+    monkeypatch.setattr(server.config, "set_model", lambda model: saved.append(model) or real_set_model(model))
+    async with Client(server.mcp) as client:
+        first = await call(client, "switch_model", {"model": "grok-4.7"})
+        again = await call(client, "switch_model", {"model": "grok-4.7"})
+    assert first.get("already_active") is None and first["model_source"] == "switch_model"
+    assert again["already_active"] is True and again["model_source"] == "switch_model"
+    assert saved == ["grok-4.7"] and config_json(isolated) == {"model": "grok-4.7"}
+
+
+@pytest.mark.asyncio
+async def test_switching_back_to_the_env_model_restores_the_env_source(isolated):
+    async with Client(server.mcp) as client:
+        away = await call(client, "switch_model", {"model": "grok-4.7"})
+        back = await call(client, "switch_model", {"model": "grok-4.20-multi-agent-0309(high)"})
+        info = await call(client, "get_config_info")
+    assert away["model_source"] == "switch_model" and "GROK_MODEL=" in away["warning"]
+    assert back["status"] == "✅ 成功" and back["current_model"] == "grok-4.20-multi-agent-0309(high)"
+    assert back["model_source"] == "env" and "warning" not in back and "already_active" not in back
+    assert info["GROK_MODEL_SOURCE"] == "env" and "GROK_MODEL_NOTE" not in info
+    # The file follows the switch, so removing GROK_MODEL later does not resurrect grok-4.7.
+    assert config_json(isolated) == {"model": "grok-4.20-multi-agent-0309(high)"}
+
+
+@pytest.mark.asyncio
+async def test_switching_without_api_config_compares_with_the_current_model(isolated, monkeypatch):
+    monkeypatch.delenv("GROK_API_URL")
+    async with Client(server.mcp) as client:
+        data = await call(client, "switch_model", {"model": "grok-4.20-multi-agent-0309(high)"})
+    assert data["already_active"] is True and "未能通过 /models 校验" in data["warning"]
+    assert config_json(isolated) is None
+
+
+# ----------------------------------------------------------------- non-chat models
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["grok-voice-tts-1.0", "grok-tts", "gpt-image-2(high)"])
+async def test_switch_model_refuses_non_chat_models(isolated, listed, name):
+    listed["models"] = ["grok-4.7", "grok-4.20-multi-agent-0309", "grok-tts", "grok-voice-tts-1.0", "gpt-image-2"]
+    async with Client(server.mcp) as client:
+        data = await call(client, "switch_model", {"model": name})
+        info = await call(client, "get_config_info")
+    assert data["status"] == "❌ 失败" and "not a chat/search model" in data["message"] and "未做任何修改" in data["message"]
+    assert data["model_check"]["reason"] == "not_chat_model"
+    assert not any(m in data["model_check"].get("suggestions", []) for m in ("grok-tts", "grok-voice-tts-1.0", "gpt-image-2"))
+    assert config_json(isolated) is None
+    assert info["GROK_MODEL"] == "grok-4.20-multi-agent-0309(high)" and info["GROK_MODEL_SOURCE"] == "env"

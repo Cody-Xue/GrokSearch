@@ -15,7 +15,7 @@ def test_redact_removes_keys_and_tokens(monkeypatch):
 
 @pytest.mark.parametrize("status, body, category", [
     (401, {"detail": {"error": "Unauthorized: missing or invalid API key."}}, "auth"),
-    (403, {"detail": {"error": "[403] URL is not supported"}}, "bad_request"),
+    (403, {"detail": {"error": "[403] URL is not supported"}}, "unsupported_site"),
     (402, {"success": False, "error": "Insufficient credits"}, "quota"),
     (432, {"detail": {"error": "This request exceeds your plan's set usage limit."}}, "quota"),
     (429, {}, "rate_limit"),
@@ -27,6 +27,46 @@ def test_http_status_classification(status, body, category):
     error = errors.classify_exception("p", httpx.HTTPStatusError("x", request=request, response=response))
     assert (error.category, error.status) == (category, status)
     assert error.retryable == (category in ("rate_limit", "upstream_error"))
+
+
+# Recorded live from Firecrawl for https://www.reddit.com/r/Python/ (v1.12.0 reported it as "auth").
+FIRECRAWL_UNSUPPORTED = {
+    "success": False,
+    "error": "We apologize for the inconvenience but we do not support this site. If you are part of an enterprise "
+             "and want to have a further conversation about this, please contact our sales team here: "
+             "https://www.firecrawl.dev/contact-sales",
+}
+
+
+@pytest.mark.parametrize("body, category", [
+    (FIRECRAWL_UNSUPPORTED, "unsupported_site"),
+    ({"error": "This site is blocked"}, "unsupported_site"),
+    ({"error": "Blocked by robots.txt"}, "unsupported_site"),
+    ({"detail": {"error": "[403] URL is not supported"}}, "unsupported_site"),
+    ({"error": "Invalid API key"}, "auth"),
+    ({"error": "Insufficient permissions for this token"}, "auth"),
+    ({"error": "Your API key is blocked"}, "auth"),  # a key problem, even though it says "blocked"
+    ({"message": "Missing credentials"}, "auth"),
+    ({}, "http_error"),  # a bare 403 says neither
+])
+def test_403_tells_an_unsupported_site_from_a_key_problem(body, category):
+    request = httpx.Request("POST", "https://api.firecrawl.dev/v2/scrape")
+    response = httpx.Response(403, json=body, request=request)
+    error = errors.classify_exception("firecrawl", httpx.HTTPStatusError("x", request=request, response=response))
+    assert (error.category, error.status) == (category, 403)
+    assert not error.retryable
+
+
+def test_new_categories_are_kept_by_provider_error():
+    for category in ("unsupported_site", "blocked", "not_text"):
+        assert errors.ProviderError("p", category).category == category  # not coerced to "unknown"
+
+
+def test_unsupported_site_summary_does_not_say_auth():
+    request = httpx.Request("POST", "https://api.firecrawl.dev/v2/scrape")
+    response = httpx.Response(403, json=FIRECRAWL_UNSUPPORTED, request=request)
+    error = errors.classify_exception("firecrawl", httpx.HTTPStatusError("x", request=request, response=response))
+    assert error.summary().startswith("firecrawl: unsupported_site (HTTP 403) — We apologize")
 
 
 def test_proxy_environment_problem_is_named(monkeypatch):

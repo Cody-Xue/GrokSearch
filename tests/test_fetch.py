@@ -130,7 +130,7 @@ async def test_arxiv_api_failure_falls_back_to_extractors(monkeypatch):
 
 
 def header_fields(output: str) -> dict:
-    header = output.split("\n\n", 1)[0]
+    header = output.split("\n", 1)[0]  # later header lines explain failed backends or warnings
     return dict(part.split("=", 1) for part in header.split()[1:])
 
 
@@ -376,8 +376,10 @@ async def test_firecrawl_error_page_never_replaces_a_short_tavily_extract(monkey
         "markdown": blocked, "metadata": {"statusCode": 403, "error": "Forbidden"}}}))
     out = await fetching.fetch_page("https://example.test/release-notes")
     header, body = out.split("\n\n", 1)
-    assert header.startswith(f"[web_fetch] source=tavily total_chars={len(valid)}")
-    assert header.endswith(f"attempts=tavily:short({len(valid)}),firecrawl:extract_failed")
+    first, detail = header.split("\n")
+    assert first.startswith(f"[web_fetch] source=tavily total_chars={len(valid)}")
+    assert first.endswith(f"attempts=tavily:short({len(valid)}),firecrawl:extract_failed")
+    assert detail == "- firecrawl: extract_failed (HTTP 403) — target page answered HTTP 403 (Forbidden)"
     assert body == valid
 
 
@@ -429,8 +431,9 @@ async def test_redirect_surfaces_final_url_and_title(monkeypatch):
         "statusCode": 200, "url": "https://example.test/landing", "title": "Landing page", "sourceURL": "https://sho.rt/abc"}}}))
     out = await fetching.fetch_page("https://sho.rt/abc")
     header = out.split("\n\n", 1)[0]
-    assert header.endswith('attempts=tavily:extract_failed,firecrawl:ok final_url=https://example.test/landing title="Landing page"')
-    assert "warning=" not in header and "\n" not in header
+    first, detail = header.split("\n")
+    assert first.endswith('attempts=tavily:extract_failed,firecrawl:ok final_url=https://example.test/landing title="Landing page"')
+    assert "warning=" not in header and detail == "- tavily: extract_failed — Failed to fetch url"
 
 
 @pytest.mark.asyncio
@@ -449,7 +452,7 @@ async def test_snapshot_pages_keep_the_interstitial_warning(monkeypatch):
     first = await fetching.fetch_page("https://www.zhihu.com/question/451397804", max_chars=1000)
     sid = re.search(r"snapshot_id=(\w+)", first).group(1)
     second = await fetching.fetch_page("https://www.zhihu.com/question/451397804", max_chars=1000, offset=1000, snapshot_id=sid)
-    assert "cached=true warning=interstitial final_url=" in second.split("\n", 1)[0]
+    assert "cached=true cache=bypassed warning=interstitial final_url=" in second.split("\n", 1)[0]
 
 
 @pytest.mark.parametrize("final_url, title, redirected, expected", [
@@ -584,6 +587,8 @@ async def test_slow_arxiv_api_is_cut_off_by_the_budget_then_cooled_down(monkeypa
     calls = {"n": 0}
 
     async def handler(request):  # a throttled arXiv answers its 429s only after 10-45 s
+        if request.url.host == "api.datacite.org":
+            return httpx.Response(503, text="down")
         calls["n"] += 1
         await asyncio.sleep(30)
         return httpx.Response(429, text="Rate exceeded.")
@@ -594,11 +599,12 @@ async def test_slow_arxiv_api_is_cut_off_by_the_budget_then_cooled_down(monkeypa
     started = time.monotonic()
     out = await fetching.fetch_page("https://arxiv.org/abs/2607.20852")
     assert time.monotonic() - started < 3
-    assert out.startswith("[web_fetch] source=tavily") and out.split("\n\n", 1)[0].endswith("attempts=arxiv-api:timeout")
+    assert out.startswith("[web_fetch] source=tavily")
+    assert out.split("\n", 1)[0].endswith("attempts=arxiv-api:timeout,datacite:upstream_error,tavily:ok")
     started = time.monotonic()
     out = await fetching.fetch_page("https://arxiv.org/abs/2607.20853")
     assert time.monotonic() - started < 0.5 and calls["n"] == 1  # skipped while cooling down
-    assert out.split("\n\n", 1)[0].endswith("attempts=arxiv-api:cooldown")
+    assert out.split("\n", 1)[0].endswith("attempts=arxiv-api:cooldown,datacite:upstream_error,tavily:ok")
 
 
 @pytest.mark.asyncio
@@ -686,4 +692,4 @@ async def test_page_status_may_arrive_as_text_or_float(monkeypatch, status):
 async def test_missing_or_odd_metadata_is_ignored(monkeypatch, metadata):
     scripted_backends(monkeypatch, TAVILY_FAILED, (200, {"success": True, "data": {"markdown": "doc " * 800, "metadata": metadata}}))
     out = await fetching.fetch_page("https://example.test/doc")
-    assert out.split("\n\n", 1)[0].endswith("attempts=tavily:extract_failed,firecrawl:ok")
+    assert out.split("\n", 1)[0].endswith("attempts=tavily:extract_failed,firecrawl:ok")

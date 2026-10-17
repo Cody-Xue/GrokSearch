@@ -91,30 +91,37 @@ def _setup_file_logging() -> None:
 _setup_file_logging()
 
 
-async def log_info(ctx, message: str, is_debug: bool = False):
-    """Debug-gated info: written to the log file only when GROK_DEBUG is on."""
-    if is_debug:
-        logger.info(message)
+async def _notify(ctx, level: str, message: str) -> None:
+    """Send a log notification to the MCP client; a failure there never reaches the tool.
 
-    if ctx:
-        await ctx.info(message)
+    The client may be gone (closed transport: anyio.BrokenResourceError / ClosedResourceError) or the
+    call may run outside a request; the tool's result matters more than its progress messages.
+    Cancellation (a BaseException) still propagates.
+    """
+    if not ctx:
+        return
+    try:
+        await getattr(ctx, level)(message)
+    except Exception:
+        pass
+
+
+async def log_info(ctx, message: str, is_debug: bool = False):
+    """Debug-gated info. GROK_DEBUG on (callers pass config.debug_enabled): written to the log file and
+    sent to the client; off: dropped. Messages can be long (prompts, answers), so nothing is sent by default."""
+    if not is_debug:
+        return
+    logger.info(message)
+    await _notify(ctx, "info", message)
 
 
 async def log_warning(ctx, message: str):
-    """Always written to the log file."""
+    """Always written to the log file and sent to the client."""
     logger.warning(message)
-    if ctx:
-        try:
-            await ctx.warning(message)
-        except Exception:
-            pass
+    await _notify(ctx, "warning", message)
 
 
 async def log_error(ctx, message: str):
-    """Always written to the log file, regardless of GROK_DEBUG."""
+    """Always written to the log file and sent to the client, regardless of GROK_DEBUG."""
     logger.error(message)
-    if ctx:
-        try:
-            await ctx.error(message)
-        except Exception:
-            pass
+    await _notify(ctx, "error", message)

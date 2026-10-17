@@ -136,12 +136,18 @@ async def test_web_search_attaches_verification_when_enabled(configured, monkeyp
     monkeypatch.setattr(GrokSearchProvider, "search_with_sources", AsyncMock(return_value=GrokResponse("see 2607.06065")))
     fake = AsyncMock(return_value={"arxiv": [{"id": "2607.06065", "title": "X"}], "doi": [], "urls": [], "unresolved": []})
     monkeypatch.setattr(server, "verify_answer", fake)
+    monkeypatch.delenv("GROK_VERIFY_DETAIL", raising=False)
     async with Client(configured) as client:
         with_check = await call(client, "web_search", {"query": "q"})
         without = await call(client, "web_search", {"query": "q", "verify": False})
-    assert with_check["verification"]["arxiv"][0]["id"] == "2607.06065"
+        monkeypatch.setenv("GROK_VERIFY_DETAIL", "full")
+        full = await call(client, "web_search", {"query": "q"})
+    # compact (default): resolved records are left out, problems and counts stay.
+    assert with_check["verification"]["detail"] == "compact" and "arxiv" not in with_check["verification"]
+    assert with_check["verification"]["unresolved"] == []
+    assert full["verification"]["arxiv"][0]["id"] == "2607.06065"
     assert "verification" not in without
-    fake.assert_awaited_once()
+    assert fake.await_count == 2
 
 
 @pytest.mark.asyncio

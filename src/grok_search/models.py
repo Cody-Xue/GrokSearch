@@ -18,6 +18,18 @@ get_config_info refreshes the cache whenever it runs.
 On OpenRouter (GROK_API_URL contains "openrouter") a model needs the ":online"
 variant to search the web: the suffix is ignored for validation and added to the
 name that is sent, as it is for the default model and switch_model.
+
+/models also lists models that cannot answer /chat/completions (text-to-speech,
+voice, transcription, image/video generation, embeddings, moderation, realtime,
+rerankers). Gateways such as CPA carry no capability field, so these are recognised
+by name (non_chat_kind): a per-call or switch_model name of that kind is rejected
+before anything is sent, and such models are never suggested. When the gateway does
+declare what a model outputs (OpenRouter's architecture.output_modalities /
+architecture.modality, remembered per API URL by remember_capabilities), that
+declaration wins: openai/gpt-5-image or openai/gpt-audio answer chat completions
+with text on OpenRouter and are accepted, a model declared without text output is
+rejected whatever its name. The configured default (GROK_MODEL / config file) is not
+blocked; get_config_info warns about it instead.
 """
 import asyncio
 import difflib
@@ -44,6 +56,26 @@ _ONLINE = ":online"
 
 _SUFFIX_RE = re.compile(r"^(?P<base>.*?[^\s(])\((?P<value>[^()]*)\)$")
 _BUDGET_RE = re.compile(r"^-?\d+$")
+
+# Name tokens of models that cannot serve /chat/completions, by kind. A token only counts as a whole
+# name part (between "-", "_", "/", ".", ":" or the ends; digits may follow, as in "tts1"), so
+# "grok-2-vision-1212", "grok-code-fast-1" and "deepseek-chat" stay chat models. Vision models chat
+# and are not listed.
+_NON_CHAT_TOKENS = {
+    "audio/speech": ("tts", "voice", "audio", "speech", "whisper", "transcribe", "transcription"),
+    "image generation": ("image", "images", "imagine", "imagen", "dall-e", "dalle"),
+    "video generation": ("video", "sora", "veo"),
+    "embedding": ("embed", "embeds", "embedding", "embeddings"),
+    "moderation": ("moderation",),
+    "realtime": ("realtime",),
+    "rerank": ("rerank", "reranker"),
+}
+_NON_CHAT_KIND = {token: kind for kind, tokens in _NON_CHAT_TOKENS.items() for token in tokens}
+_NON_CHAT_RE = re.compile(
+    r"(?:^|[-_/.:])(" + "|".join(sorted(map(re.escape, _NON_CHAT_KIND), key=len, reverse=True)) + r")(?=$|[-_/.:\d])",
+    re.IGNORECASE,
+)
+_FAMILY_RE = re.compile(r"[a-z]+")
 
 
 @dataclass
@@ -82,6 +114,98 @@ def model_name_problem(name: str) -> str:
     return ""
 
 
+def _non_chat_token(name: str) -> str:
+    match = _NON_CHAT_RE.search(name or "")
+    return match.group(1) if match else ""
+
+
+def non_chat_kind(name: str) -> str:
+    """The kind of non-chat model a name denotes ("audio/speech", "image generation", ...); "" for a chat model.
+
+    Name-based because /models carries no capability metadata.
+    """
+    token = _non_chat_token(name)
+    return _NON_CHAT_KIND[token.lower()] if token else ""
+
+
+# Per API URL: model id -> whether its /models entry declares text output (only ids that declare anything).
+_DECLARED_TEXT_OUTPUT: dict[str, dict[str, bool]] = {}
+
+
+def declared_text_output(item) -> Optional[bool]:
+    """Whether a /models entry says the model outputs text (OpenRouter: architecture.output_modalities, or
+    architecture.modality "text+image->text+image"); None when it says nothing."""
+    architecture = item.get("architecture") if isinstance(item, dict) else None
+    if not isinstance(architecture, dict):
+        return None
+    outputs = architecture.get("output_modalities")
+    if isinstance(outputs, list) and outputs:
+        return any(isinstance(o, str) and o.strip().lower() == "text" for o in outputs)
+    modality = architecture.get("modality")
+    if isinstance(modality, str) and "->" in modality:
+        return "text" in [part.strip().lower() for part in modality.split("->", 1)[1].split("+")]
+    return None
+
+
+def remember_capabilities(api_url: str, items) -> None:
+    """Store what the /models entries of api_url declare about text output (see declared_text_output)."""
+    declared = {}
+    for item in items or []:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            value = declared_text_output(item)
+            if value is not None:
+                declared[item["id"]] = value
+    if len(_DECLARED_TEXT_OUTPUT) > 16:
+        _DECLARED_TEXT_OUTPUT.clear()
+    _DECLARED_TEXT_OUTPUT[api_url] = declared
+
+
+def model_kind(name: str, api_url: str = "") -> str:
+    """non_chat_kind, overridden by what the gateway at api_url declared for this model: "" when it
+    declared text output, "no text output" when it declared other output only."""
+    declared = _DECLARED_TEXT_OUTPUT.get(api_url, {})
+    raw = (name or "").strip()
+    for form in dict.fromkeys((raw, raw[: -len(_ONLINE)] if raw.endswith(_ONLINE) else raw)):
+        if form in declared:
+            return "" if declared[form] else "no text output"
+    return non_chat_kind(name)
+
+
+def _model_tail(name: str) -> str:
+    """The model part of "provider://vendor/model": what families and prefixes are compared on."""
+    return (name or "").lower().split("://")[-1].rsplit("/", 1)[-1]
+
+
+def _model_family(name: str) -> str:
+    match = _FAMILY_RE.match(_model_tail(name))
+    return match.group(0) if match else ""
+
+
+def suggest_models(base: str, models, n: int = 5, cutoff: float = 0.4) -> list[str]:
+    """Chat models close to base, best first; non-chat models (non_chat_kind) are never suggested.
+
+    Ranked by: same family as base ("grok", "gpt", ...), a name that extends base ("grok-4.20" ->
+    "grok-4.20-multi-agent-0309"), string similarity, then the shorter name. Candidates of the same
+    family or that extend base are kept at any similarity; others need at least `cutoff`.
+    """
+    typed = (base or "").strip().lower()
+    if not typed:
+        return []
+    family = _model_family(typed)
+    ranked = []
+    for candidate in dict.fromkeys(m for m in models or () if isinstance(m, str) and m):
+        if non_chat_kind(candidate) or candidate.lower() == typed:
+            continue
+        lowered = candidate.lower()
+        same_family = bool(family) and _model_family(lowered) == family
+        extends = lowered.startswith(typed) or _model_tail(lowered).startswith(_model_tail(typed))
+        ratio = difflib.SequenceMatcher(None, typed, lowered).ratio()
+        if same_family or extends or ratio >= cutoff:
+            ranked.append((not same_family, not extends, -ratio, len(candidate), candidate))
+    ranked.sort()
+    return [entry[-1] for entry in ranked[:n]]
+
+
 def routing_base(model: str) -> str:
     """The model a CPA-style proxy actually routes to: thinking suffix and ":online" removed.
 
@@ -112,9 +236,12 @@ async def fetch_available_models(api_url: str, api_key: str, timeout_s: float = 
         response.raise_for_status()
         data = response.json()
     models: list[str] = []
-    for item in (data or {}).get("data", []) or []:
+    items = (data or {}).get("data", []) or [] if isinstance(data, dict) else []
+    for item in items:
         if isinstance(item, dict) and isinstance(item.get("id"), str):
             models.append(item["id"])
+    if models:
+        remember_capabilities(api_url, items)
     return models
 
 
@@ -206,6 +333,7 @@ class ModelCheck:
     base: str = ""
     detail: str = ""
     suggestions: list[str] = field(default_factory=list)
+    reason: str = ""  # machine-readable cause of an invalid result, e.g. "not_chat_model"
 
     def to_dict(self) -> dict:
         data = {"status": self.status, "model": self.model}
@@ -213,6 +341,8 @@ class ModelCheck:
             data["base"] = self.base
         if self.detail:
             data["detail"] = self.detail
+        if self.reason:
+            data["reason"] = self.reason
         if self.suggestions:
             data["suggestions"] = self.suggestions
         return data
@@ -226,7 +356,7 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
     requested = (requested or "").strip()
     problem = model_name_problem(requested)
     if problem:
-        return ModelCheck(False, requested, "invalid", detail=problem)
+        return ModelCheck(False, requested, "invalid", detail=problem, reason="bad_name")
     lookup = requested[: -len(_ONLINE)] if uses_online_suffix(api_url) and requested.endswith(_ONLINE) else requested
     send = apply_online_suffix(lookup, api_url)
     default_raw = default_model[: -len(_ONLINE)] if default_model.endswith(_ONLINE) else default_model
@@ -237,10 +367,21 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
     if name.suffix_kind != "unknown" and name.base == parse_model_name(default_raw).base:
         return ModelCheck(True, send, "default_base", name.base)
 
+    listing = await cache.get(api_url, api_key)
+    kind = model_kind(name.base, api_url)
+    if kind:
+        # Listed or not, /chat/completions would refuse it (e.g. HTTP 400 "only supported on /v1/audio/speech").
+        why = ("the proxy's /models entry declares no text output" if kind == "no text output"
+               else f"{kind} model, name contains '{_non_chat_token(name.base)}'")
+        return ModelCheck(
+            False, requested, "invalid", name.base,
+            f"'{name.base}' is not a chat/search model ({why}); web_search needs a chat model",
+            suggest_models(name.base, listing.models), reason="not_chat_model",
+        )
+
     def listed(models) -> bool:
         return bool(models) and (lookup in models or base_is_listed(name.base, models))
 
-    listing = await cache.get(api_url, api_key)
     if name.suffix_kind == "unknown":
         if listing.models and lookup in listing.models:
             return ModelCheck(True, send, "listed", name.base)
@@ -248,6 +389,7 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
             False, requested, "invalid", name.base,
             f"unsupported thinking suffix '({name.suffix})': use a token budget such as (8192) or one of "
             + ", ".join(THINKING_LEVELS),
+            reason="unsupported_suffix",
         )
     if listed(listing.models):
         return ModelCheck(True, send, "listed", name.base)
@@ -259,5 +401,5 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
     if not listing.models or listing.stale:
         reason = listing.error.summary() if listing.error else "model list unavailable"
         return ModelCheck(True, send, "unverified", name.base, f"could not validate against /models ({reason}); sent as-is")
-    suggestions = difflib.get_close_matches(name.base, listing.models, n=5, cutoff=0.4)
-    return ModelCheck(False, requested, "invalid", name.base, f"'{name.base}' is not in the proxy's /models list", suggestions)
+    return ModelCheck(False, requested, "invalid", name.base, f"'{name.base}' is not in the proxy's /models list",
+                      suggest_models(name.base, listing.models), reason="not_listed")

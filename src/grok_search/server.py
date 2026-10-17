@@ -18,11 +18,12 @@ try:
     from grok_search.sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
     from grok_search.planning import engine as planning_engine, _split_csv
     from grok_search.throttle import breaker, BreakerOpen
-    from grok_search.verify import verify_answer
+    from grok_search.verify import compact_verification, verify_answer
     from grok_search.fetching import fetch_page, url_problem
     from grok_search.citations import normalize_citations
     from grok_search.errors import ProviderError, classify_exception, redact, sanitize_no_proxy_env, summarize_error_body
-    from grok_search.models import ModelListCache, check_model, model_name_problem
+    from grok_search.models import ModelListCache, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base
+    from grok_search.platforms import resolve_platform
 except ImportError:
     from .providers.grok import GrokResponse, GrokSearchProvider, GrokUpstreamError
     from .logger import log_info, log_error, logger
@@ -30,16 +31,20 @@ except ImportError:
     from .sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
     from .planning import engine as planning_engine, _split_csv
     from .throttle import breaker, BreakerOpen
-    from .verify import verify_answer
+    from .verify import compact_verification, verify_answer
     from .fetching import fetch_page, url_problem
     from .citations import normalize_citations
     from .errors import ProviderError, classify_exception, redact, sanitize_no_proxy_env, summarize_error_body
-    from .models import ModelListCache, check_model, model_name_problem
+    from .models import ModelListCache, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base
+    from .platforms import resolve_platform
 
 import asyncio
 import json
+import math
 import os
 import re
+import signal
+import subprocess
 import tempfile
 from urllib.parse import urlparse
 
@@ -51,7 +56,7 @@ def _package_version() -> str:
         from importlib.metadata import version as _version
         return _version("grok-search")
     except Exception:
-        return "1.12.0"
+        return "1.12.1"
 
 
 mcp = FastMCP("grok-search", version=_package_version())
@@ -131,11 +136,13 @@ def _split_shares(total: int, engines: list[str]) -> dict[str, int]:
     return {engines[0]: first, engines[1]: total - first}
 
 
-async def _run_engine(engine: str, query: str, limit: int) -> list[dict]:
+async def _run_engine(engine: str, query: str, limit: int, include_domains: list[str] | None = None) -> list[dict]:
+    # include_domains is passed only when a platform is applied, so engine stand-ins keep (query, limit).
+    kwargs = {"include_domains": include_domains} if include_domains else {}
     if engine == "tavily":
-        results = await _call_tavily_search(query, limit)
+        results = await _call_tavily_search(query, limit, **kwargs)
     else:
-        results = await _call_firecrawl_search(query, limit)
+        results = await _call_firecrawl_search(query, limit, **kwargs)
     return _engine_items(engine, results)
 
 
@@ -150,22 +157,35 @@ class _ExtraSources:
     4. Selection: round-robin across engines, keeping each engine's own ranking.
     5. Backfill: if an engine failed or the selection is still short, every engine that answered
        and may have more results is asked once more for (previous request + shortfall + 2 + the
-       duplicates skipped so far, at most 20), so new duplicates do not leave the request short again.
+       duplicates and off-platform hits skipped so far, at most 20), so new duplicates do not leave the
+       request short again.
+    6. Platform (web_search platform=...): a known platform or hostname becomes a domain list, sent to
+       Tavily as include_domains and to Firecrawl as "site:" operators; hits whose host is not one of
+       those domains (or a subdomain) are dropped before selection. An unknown platform is appended to
+       the engine query as text, without a filter; so is a library or product name written like a host
+       ("discord.py", "Node.js", "ASP.NET", "Socket.IO"). extra_sources_report["platform"] says which was applied.
     """
 
-    def __init__(self, query: str, wanted: int):
+    def __init__(self, query: str, wanted: int, platform: str = ""):
         self.query = query
         self.wanted = wanted
+        self.scope = resolve_platform(platform) if platform else None
+        self.engine_query = self.scope.engine_query(query) if self.scope else query
+        self.domains = list(self.scope.domains) if self.scope else []
         self.engines = _extra_engines()
         self.shares = _split_shares(wanted, self.engines)
         self.items: dict[str, list[dict]] = {engine: [] for engine in self.engines}
+        self.off_platform: dict[str, set[str]] = {engine: set() for engine in self.engines}
         self.state: dict[str, dict] = {engine: {"share": self.shares.get(engine, 0)} for engine in self.engines}
 
     async def _ask(self, engine: str, limit: int, phase: str) -> None:
         state = self.state[engine]
         state[f"{phase}_asked"] = limit
         try:
-            got = await _run_engine(engine, self.query, limit)
+            if self.domains:
+                got = await _run_engine(engine, self.engine_query, limit, include_domains=self.domains)
+            else:
+                got = await _run_engine(engine, self.engine_query, limit)
         except Exception as e:
             state["status"] = "error"
             state["error"] = classify_exception(engine, e).to_dict()
@@ -176,9 +196,19 @@ class _ExtraSources:
         known = {_url_identity(item["url"]) for item in self.items[engine]}
         for item in got:
             key = _url_identity(item["url"])
+            if self.scope is not None and not self.scope.allows(item["url"]):
+                # The engines filter by domain themselves; this catches what slips through
+                # (look-alike hosts such as githubhelp.com are not GitHub).
+                self.off_platform[engine].add(key)
+                continue
             if key not in known:
                 known.add(key)
                 self.items[engine].append(item)
+        if self.off_platform[engine]:
+            state["off_platform_skipped"] = len(self.off_platform[engine])
+
+    def _off_platform_count(self) -> int:
+        return sum(len(keys) for keys in self.off_platform.values())
 
     async def first_round(self) -> None:
         await asyncio.gather(*(
@@ -218,7 +248,7 @@ class _ExtraSources:
             if state.get("status") == "error" or state.get("exhausted"):
                 continue
             previous = state.get("first_asked", 0)
-            limit = min(previous + shortfall + _EXTRA_MARGIN + duplicates, _EXTRA_MAX_PER_CALL)
+            limit = min(previous + shortfall + _EXTRA_MARGIN + duplicates + self._off_platform_count(), _EXTRA_MAX_PER_CALL)
             if limit <= previous:
                 continue
             await self._ask(engine, limit, "backfill")
@@ -227,6 +257,8 @@ class _ExtraSources:
             self.state[engine].setdefault("status", "not_needed")
             self.state[engine]["selected"] = sum(1 for item in picked if item["provider"] == engine)
         report = {"requested": self.wanted, "returned": len(picked), "duplicates_skipped": duplicates, "engines": self.state}
+        if self.scope is not None:
+            report["platform"] = self.scope.report(self.engines, self._off_platform_count())
         if not self.engines:
             report["engines"] = config.provider_status()
             report["note"] = "no extra-source engine is active"
@@ -304,6 +336,12 @@ def _counts(cited: list[dict], extra: list[dict], total: list[dict]) -> dict:
     }
 
 
+def _is_blank(text: str | None) -> bool:
+    """True when nothing visible is left: whitespace (any Unicode space), zero-width/format and control
+    characters only. str.strip() keeps U+200B, U+FEFF and C0 controls, which would still be billed upstream."""
+    return not any(ch.isprintable() and not ch.isspace() for ch in (text or ""))
+
+
 def _early_failure(session_id: str, detail: str, error: str, error_type: str) -> dict:
     """Failure before any search ran (configuration, model name): same shape as other failures."""
     return {
@@ -340,7 +378,9 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       Unicode code points (not UTF-16 units)
     - incomplete / finish_reason / native_finish_reason (only when the upstream cut the answer short, e.g.
       output cap or content filter): the answer is partial; a one-line note is appended after it
-    - usage (when the upstream reports it): prompt_tokens, completion_tokens, reasoning_tokens
+    - usage (when the upstream reports it): prompt_tokens, completion_tokens, reasoning_tokens. Multi-agent /
+      high-reasoning models can bill 0.5-1.6M prompt tokens for one search; for routine lookups pass a
+      lighter model= (only when the user asked for it) and avoid repeating a call that already answered
     - verification (when enabled): existence and reachability only, for the arXiv IDs / DOIs in the
       answer and the URLs Grok cited (extra sources are not checked). Identifiers are resolved against
       arXiv, Crossref and the doi.org registry (DataCite), URLs are fetched, and paper titles written next
@@ -349,12 +389,27 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       attached to (claim_support = "not_checked"). Treat unresolved (the registry or site said it does not
       exist: 404/410, other 4xx except 401/403/451, unknown domain) and possible_mismatch entries as
       suspect; treat lookup_failed (rate limit, 5xx, timeout, network, or a site that refuses scripted
-      requests with 401/403/451) as unknown, not as evidence against the citation; skipped lists what was
-      not checked and why (including DOI patterns written in prose, such as "10.48550/arXiv.*").
-    - extra_sources_report (when extra_sources > 0): share, results, errors and backfill per engine
+      requests with 401/403/451) as unknown, not as evidence against the citation; a bot-check or
+      interstitial page (captcha, "prove your humanity") is lookup_failed too, never reachable; skipped
+      lists what was not checked and why (including DOI patterns written in prose, such as
+      "10.48550/arXiv.*"). By default (GROK_VERIFY_DETAIL=compact, detail = "compact") only what needs
+      attention is listed: every unresolved and lookup_failed entry (URLs of one host that failed for the
+      same reason are one entry {kind: "url", host, reason, count, sample}), title_checks other than match,
+      urls_unusual (reachable URLs whose final status is not 200, e.g. a 202/203 bot check; only when
+      present) and the first 10 specific skipped entries (skipped_omitted counts the rest; URLs over the
+      per-answer limit or with checks disabled are only counted, in skipped_by_reason); checked and summary
+      keep every count (urls_reachable, identifiers_found, title_match, ...). GROK_VERIFY_DETAIL=full
+      also lists every resolved identifier record (arxiv, doi), every reachable URL with status and
+      title (urls), matching title checks and the full scope text.
+    - extra_sources_report (when extra_sources > 0): share, results, errors and backfill per engine; with a
+      platform also "platform": {requested, applied (domain_filter / query_hint / none), domains (sent to the
+      engines), also_accepted (short-link hosts kept by the filter), engines (tavily include_domains,
+      firecrawl site:), off_platform_skipped, query_hint, unresolved}
     - model_check (when model is given and differs from the default, also on failure): how the name was validated
     - error / error_type / retry_after_s / status / exhausted (failures only). error_type is one of:
-      config (GROK_API_URL / GROK_API_KEY missing or invalid), proxy_config, invalid_model, rate_limit
+      bad_request (the query is empty or only whitespace / invisible / control characters: refused locally,
+      nothing is sent to Grok or the extra-source engines), config (GROK_API_URL / GROK_API_KEY missing or
+      invalid), proxy_config, invalid_model, rate_limit
       (exhausted=true: this model's account pool is blocked), circuit_open, timeout (no complete answer in
       time, or gateway 522/524), network (connection/proxy failure), truncated_stream, empty_response,
       incomplete (the upstream stopped before any content, e.g. finish_reason length or content_filter;
@@ -363,17 +418,28 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       passed through from the upstream stream (for example invalid_request_error, model_not_found,
       server_error, upstream_error). Wait retry_after_s seconds or switch model before calling again
     """,
-    meta={"version": "2.3.0", "author": "guda.studio"},
+    meta={"version": "2.4.0", "author": "guda.studio"},
 )
 async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
-    platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'). Leave empty for general web search."] = "",
-    model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided. A thinking suffix such as 'grok-4(high)' or 'grok-4(8192)' is accepted: the base name is checked against /models and the full name is sent."] = "",
-    extra_sources: Annotated[int, Field(description="Number of additional results from the independent engines (Tavily/Firecrawl), 0-20, appended as an 'Extra sources' section and counted in extra_sources_count, not in sources_count. With both engines active the share is split (Tavily ceil(n/2), Firecrawl floor(n/2)); URLs Grok already cited are skipped and a failed engine is backfilled by the other. Default 0.", ge=0, le=_EXTRA_SOURCES_MAX)] = 0,
+    platform: Annotated[str, "Target platform to focus on (e.g., 'Twitter', 'GitHub', 'Reddit'; several may be comma-separated, e.g. 'GitHub, Reddit'). Grok is asked to focus on it. extra_sources are restricted to the platform's domains when the name is known (GitHub, Reddit, X/Twitter, Stack Overflow, Hacker News, YouTube, arXiv, Wikipedia, 知乎, Bilibili, 微博, CSDN, 掘金, V2EX, Hugging Face, PyPI, npm, GitLab, Medium, 小红书, 豆瓣, 微信公众号 and others) or is a hostname such as 'docs.python.org' (written in lower case; names such as 'discord.py' or 'ASP.NET' count as text); otherwise the platform text is added to the extra-source query. Leave empty for general web search."] = "",
+    model: Annotated[str, "Optional model ID for this request only. This value is used ONLY when user explicitly provided. A thinking suffix such as 'grok-4(high)' or 'grok-4(8192)' is accepted: the base name is checked against /models and the full name is sent. Non-chat models (TTS/voice/audio, image/video generation, embedding, moderation, realtime, rerank) are rejected locally as invalid_model."] = "",
+    extra_sources: Annotated[int, Field(description="Number of additional results from the independent engines (Tavily/Firecrawl), 0-20, appended as an 'Extra sources' section and counted in extra_sources_count, not in sources_count. With both engines active the share is split (Tavily ceil(n/2), Firecrawl floor(n/2)); URLs Grok already cited are skipped and a failed engine is backfilled by the other. With a known platform the engines search only its domains (Tavily include_domains, Firecrawl site:) and off-platform hits are dropped, so fewer than n may be returned; see extra_sources_report.platform. Default 0.", ge=0, le=_EXTRA_SOURCES_MAX)] = 0,
     instructions: Annotated[str, "Optional per-call instructions for the searcher, e.g. 'list at least 15 distinct sources' or 'return arXiv IDs with titles, no analogies'."] = "",
-    verify: Annotated[bool, "Attach the verification layer: identifier existence, link reachability and title comparison (NOT whether sources support the claims). Default true; identifier lookups follow GROK_VERIFY_IDS and URL checks GROK_VERIFY_URLS (both off: no verification)."] = True,
+    verify: Annotated[bool, "Attach the verification layer: identifier existence, link reachability and title comparison (NOT whether sources support the claims). Default true; identifier lookups follow GROK_VERIFY_IDS and URL checks GROK_VERIFY_URLS (both off: no verification); GROK_VERIFY_DETAIL=full lists every checked item instead of only problems and counts (compact, the default)."] = True,
 ) -> dict:
     session_id = new_session_id()
+    # A blank query is refused before anything that can reach the network (check_model may GET /models,
+    # Grok bills the system prompt and search tools even for an empty question, the engines bill per call).
+    if _is_blank(query):
+        await _SOURCES_CACHE.set(session_id, [])
+        return _early_failure(
+            session_id,
+            "查询为空（只包含空白或控制字符），未发送到上游；请提供具体的搜索问题",
+            "empty query",
+            "bad_request",
+        )
+    platform = "" if _is_blank(platform) else (platform or "").strip()
     try:
         api_url = config.grok_api_url
         api_key = config.grok_api_key
@@ -397,7 +463,7 @@ async def web_search(
 
     grok_provider = GrokSearchProvider(api_url, api_key, effective_model)
     wanted_extra = max(0, min(int(extra_sources or 0), _EXTRA_SOURCES_MAX))
-    extra_job = _ExtraSources(query, wanted_extra) if wanted_extra > 0 else None
+    extra_job = _ExtraSources(query, wanted_extra, platform) if wanted_extra > 0 else None
     grok_error: dict = {}
 
     async def _safe_grok() -> GrokResponse:
@@ -514,7 +580,7 @@ async def web_search(
     if verify and (config.verify_ids or config.verify_urls):
         try:
             # Only what Grok cited is verified; extra_sources hits are search results, not citations.
-            result["verification"] = await verify_answer(
+            verification = await verify_answer(
                 grok_answer,
                 cited_sources,
                 check_ids=config.verify_ids,
@@ -524,6 +590,8 @@ async def web_search(
                 fake_ip=config.verify_fake_ip,
                 doh_url=config.verify_doh_url,
             )
+            # compact (default): only what needs attention plus all counts; full: v1.12.0's complete listing.
+            result["verification"] = verification if config.verify_detail == "full" else compact_verification(verification)
         except Exception as e:
             result["verification"] = {"error": f"{type(e).__name__}: {e}", "claim_support": "not_checked"}
 
@@ -572,8 +640,12 @@ async def get_sources(
     }
 
 
-async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict]:
-    """Tavily Search for extra_sources. Raises ProviderError on failure, also when disabled or unconfigured."""
+async def _call_tavily_search(query: str, max_results: int = 6, include_domains: list[str] | None = None) -> list[dict]:
+    """Tavily Search for extra_sources. Raises ProviderError on failure, also when disabled or unconfigured.
+
+    include_domains restricts the results to those domains and their subdomains (Tavily's default
+    include_domains_mode "restrict"; https://docs.tavily.com/documentation/api-reference/endpoint/search).
+    """
     import httpx
     if not config.tavily_enabled:
         raise ProviderError("tavily", "disabled", "TAVILY_ENABLED=false")
@@ -589,6 +661,8 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict]:
         "include_raw_content": False,
         "include_answer": False,
     }
+    if include_domains:
+        body["include_domains"] = list(include_domains)
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
             response = await client.post(endpoint, headers=headers, json=body)
@@ -603,14 +677,21 @@ async def _call_tavily_search(query: str, max_results: int = 6) -> list[dict]:
     ]
 
 
-async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict]:
-    """Firecrawl Search for extra_sources. Raises ProviderError on failure."""
+async def _call_firecrawl_search(query: str, limit: int = 14, include_domains: list[str] | None = None) -> list[dict]:
+    """Firecrawl Search for extra_sources. Raises ProviderError on failure.
+
+    include_domains is written into the query as "site:a OR site:b" (the documented site: operator,
+    https://docs.firecrawl.dev/api-reference/endpoint/search). Firecrawl's v2 includeDomains parameter
+    builds the same suffix server-side; in the query text it also works with a v1 endpoint.
+    """
     import httpx
     api_key = config.firecrawl_api_key
     if not api_key:
         raise ProviderError("firecrawl", "not_configured", "FIRECRAWL_API_KEY is not set")
     endpoint = f"{config.firecrawl_api_url.rstrip('/')}/search"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    if include_domains:
+        query = f"{query} " + " OR ".join(f"site:{domain}" for domain in include_domains)
     body = {"query": query, "limit": limit}
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
@@ -634,40 +715,68 @@ async def _call_firecrawl_search(query: str, limit: int = 14) -> list[dict]:
     output_schema=None,
     annotations=_READ_ONLY_WEB,
     description="""
-    Fetches a URL and returns its content as Markdown. Read-only: several fetches may run in parallel.
+    Fetches a URL: web pages as Markdown, text files verbatim. Read-only: several fetches may run in parallel.
 
-    Backends (all run in the cloud): arXiv abstract pages use the arXiv API (complete metadata and abstract;
-    a requested version such as .../abs/1706.03762v1 is honoured; cached for an hour; when the API is slow or
-    throttled the extractors take over within GROK_FETCH_ARXIV_BUDGET_S, default 8 s, and the API is skipped
-    for 2 minutes: `arxiv-api:cooldown`). Other pages use Tavily Extract, falling back to Firecrawl when the
-    extract is missing or too short.
+    Backends:
+    - Text files (raw.githubusercontent.com, gist raw, GitHub/GitLab/Codeberg/Bitbucket file pages such as
+      github.com/<o>/<r>/blob/<ref>/<path>, which are read from their raw URL (Git LFS files included),
+      /raw/ URLs, and URLs ending in a code/config/text extension such as .py .h .toml .json .md .txt .patch,
+      commit/PR .patch/.diff and release assets on the forges too) are downloaded directly and returned
+      byte for byte (`source=direct`), also when served as application/octet-stream if the body is text;
+      the charset comes from a BOM, Content-Type, an XML declaration or, failing those, UTF-8, GB18030 when
+      the text reads as Chinese, else Windows-1252 with `warning=charset_guess` (`charset=` names a guessed
+      one; `warning=decode_errors` means undecodable bytes became U+FFFD).
+      Safety: public addresses only (the guard of citation verification), checked again on the connection
+      itself; at most 5 MB; no API key sent. Through a proxy (HTTP(S)_PROXY, system proxy) or a fake-ip TUN
+      the proxy decides where a name leads, so only GitHub, GitLab.com, Codeberg, Bitbucket, Gitea.com and
+      the jsDelivr/unpkg/npm/PyPI/Rust file hosts are downloaded directly then; other text URLs go to the
+      extractors. GROK_FETCH_DIRECT=false skips the
+      direct download. Without it, raw/gist/forge file and /raw/ URLs are read by Firecrawl and then Tavily;
+      a URL that only ends in such an extension (often a page: www.npmjs.com/package/chart.js,
+      en.wikipedia.org/wiki/Node.js) like a page, Tavily first, and Firecrawl when Tavily's copy is short
+      (its content type then tells a file from a page) or looks like damaged code. Visibly damaged code
+      (collapsed newlines, lost indentation, escaped "_", stripped #include targets) is marked
+      `warning=degraded_code degraded=<reasons>`: do not quote it. A URL whose origin
+      answers with HTML is fetched as a web page, and a backend copy reported as text/html is never flagged
+      as damaged code. A branch URL on GitHub's raw host can lag a push by ~5 min.
+    - arXiv abstract pages: the arXiv API (a requested version such as .../abs/1706.03762v1 is honoured;
+      cached for an hour; given up after GROK_FETCH_ARXIV_BUDGET_S, default 8 s, then skipped for 2 minutes:
+      `arxiv-api:cooldown`), then DataCite's record (`source=datacite`, latest version only), Firecrawl, Tavily.
+    - Other pages: Tavily Extract, then Firecrawl when the extract is missing, shorter than
+      GROK_FETCH_MIN_CHARS (2,000) or a bot check.
 
     The first line is a metadata header:
-    `[web_fetch] source=<backend> total_chars=N offset=O returned=R truncated=true|false [next_offset=X snapshot_id=S expires_in_s=T] [attempts=...] [warning=interstitial] [final_url=<url> title="<title>"]`
+    `[web_fetch] source=<backend> total_chars=N offset=O returned=R truncated=true|false [next_offset=X snapshot_id=S expires_in_s=T] [cached=true] [content_type=T charset=C status=S] [cache=hit|miss|bypassed|possible cached_at=T] [attempts=...] [warning=interstitial|degraded_code|size_limit|decode_errors|charset_guess] [degraded=...] [final_url=<url> title="<title>"]`
+    cache= is the backend's cache: Firecrawl is asked for a copy at most GROK_FETCH_MAX_AGE_S old (default 0:
+    `cache=bypassed`, scraped now); `cache=possible` is Tavily, which caches by URL without freshness
+    control, so a recently changed page may be stale. cached=true: served from a paging snapshot.
+    A backend in attempts= that failed while another answered gets a `- <backend>: <category> ...` line.
     The default page is GROK_FETCH_MAX_CHARS (40,000) characters, or GROK_FETCH_MAX_CHARS_CJK (20,000) when
     more than 30% of it is CJK text (about one token per character), to stay under the ~25k-token MCP result
     limit; an explicit max_chars is used as given.
     A page longer than one response is kept as a server-side snapshot. To read on, call again with the
     same url, `offset=next_offset` and `snapshot_id=S`: every page then comes from exactly the same text.
     offset > 0 without snapshot_id is refused; when a snapshot has expired, start again at offset 0.
-    final_url and title appear when Firecrawl was redirected. `warning=interstitial` plus a `注意:` line mean
-    the text is a login wall or anti-bot check (a redirect to a sign-in page, titles like "安全验证" or
-    "Just a moment..."), not the requested page: use another source.
+    final_url is the URL the text came from after a redirect or raw rewrite. `warning=interstitial` plus a
+    `注意:` line mean a login wall or anti-bot check ("安全验证", "Just a moment...", "Prove your humanity"),
+    not the requested page: use another source.
 
     On failure the first line is `[web_fetch] error=...`, followed by one line per backend with an error
     category (auth, quota, rate_limit, timeout, proxy_config, network, upstream_error, bad_request,
-    extract_failed, empty_content, disabled, not_configured), the HTTP status and a redacted detail.
+    unsupported_site, blocked, not_text, extract_failed, empty_content, http_error, disabled, not_configured),
+    the HTTP status and a redacted detail; unsupported_site is a provider refusing the site (Firecrawl's 403
+    "we do not support this site"), not a key problem.
     A page that itself answered HTTP >= 400 counts as failed ("target page answered HTTP 404"), and the
     first line adds `page_status=404`. Not an absolute http(s) URL with a host, localhost, or a
     loopback/private/link-local/CGNAT IP literal: refused locally without any backend call, as
     `[web_fetch] error=invalid_url reason=<malformed|missing_scheme|unsupported_scheme|missing_host|local_address>`
-    (host names are not resolved). The cloud backends cannot reach your machine or LAN.
+    (host names are not resolved for this check). The cloud backends cannot reach your machine or LAN.
 
     **Edge Cases & Best Practices:**
         - Ensure URL is complete and accessible (not behind authentication or paywalls).
         - May not capture dynamically loaded content requiring JavaScript execution.
     """,
-    meta={"version": "1.6.0", "author": "guda.studio"},
+    meta={"version": "1.7.0", "author": "guda.studio"},
 )
 async def web_fetch(
     url: Annotated[str, "Complete public http(s) URL of the target page (e.g. https://example.com/page). Local/LAN addresses are refused."],
@@ -688,6 +797,408 @@ def _map_failure(error: ProviderError, title: str) -> str:
     return "\n".join([head, "", title, f"- {error.summary()}"])
 
 
+def _url_host(url: str) -> str:
+    """Lower-case host of a URL or bare domain, without port or trailing dot; "" when there is none."""
+    text = (url or "").strip()
+    try:
+        host = urlparse(text if "://" in text else f"https://{text}").hostname or ""
+    except ValueError:
+        return ""
+    return host.lower().rstrip(".")
+
+
+def _site_host(host: str) -> str:
+    return host[4:] if host.startswith("www.") else host
+
+
+try:  # the regex parser, to check select_domains patterns without compiling them
+    from re import _constants as _sre_constants, _parser as _sre_parse
+except ImportError:  # Python 3.10
+    import sre_constants as _sre_constants
+    import sre_parse as _sre_parse
+
+MAP_HOST_MAX_CHARS = 253  # the longest valid DNS name
+MAP_MAX_PATTERNS = 20  # select_domains patterns per call, after removing duplicates
+MAP_PATTERN_MAX_CHARS = 300
+MAP_MATCHER_MEMORY_BYTES = 512 * 1024 * 1024  # memory a matcher may add to its own (RLIMIT_AS / Job Object)
+MAP_MATCHERS_AT_ONCE = 2  # matcher processes alive at the same time, across all web_map calls
+_REGEX_SCOPE_OPS = {
+    _sre_constants.SUBPATTERN, _sre_constants.MAX_REPEAT, _sre_constants.MIN_REPEAT, _sre_constants.BRANCH,
+    _sre_constants.ASSERT, _sre_constants.ASSERT_NOT, _sre_constants.GROUPREF_EXISTS,
+    getattr(_sre_constants, "POSSESSIVE_REPEAT", None), getattr(_sre_constants, "ATOMIC_GROUP", None),
+} - {None}
+
+# select_domains is matched against the result hosts by this program in a child process. A caller's
+# regex can backtrack for minutes or allocate gigabytes ((?:\b){50000000}x), which no reading of the
+# pattern rules out reliably; run here it would block the event loop and with it every tool, while a
+# child can be killed. A server killed outright cannot kill it, and a thread in the child would not run
+# while the regex engine holds the GIL, so the child brings its own ends: on POSIX it ends itself after
+# argv[2] seconds (SIGALRM, whose default action ends the process even inside the regex engine), on
+# Linux also as soon as the server (argv[3], its parent) is gone (PR_SET_PDEATHSIG), and it limits its
+# own memory (argv[1] bytes more than at start) and CPU time; on Windows the server's Job Object
+# (_matcher_job) limits its memory and ends it with the server. stdin: {"patterns": [...], "hosts":
+# [...]}; stdout: one boolean per host.
+_MAP_MATCHER = r"""
+import json, os, re, sys
+seconds = int(sys.argv[2])
+try:
+    import signal
+    signal.alarm(seconds)
+except (ImportError, AttributeError):
+    pass
+if sys.platform.startswith("linux") and len(sys.argv) > 3:
+    try:
+        import ctypes
+        ctypes.CDLL(None).prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG: SIGKILL when the parent ends
+    except Exception:
+        pass
+    if os.getppid() != int(sys.argv[3]):  # the server ended before that
+        sys.exit(1)
+try:
+    import resource
+except ImportError:
+    resource = None
+if resource is not None:
+    try:
+        with open("/proc/self/statm") as statm:
+            used = int(statm.read().split()[0]) * resource.getpagesize()
+    except (OSError, ValueError, IndexError):
+        used = 0
+    for name, value in (("RLIMIT_AS", used + int(sys.argv[1])), ("RLIMIT_CPU", seconds)):
+        try:
+            limit = getattr(resource, name)
+            hard = resource.getrlimit(limit)[1]
+            if hard != resource.RLIM_INFINITY:
+                value = min(value, hard)
+            resource.setrlimit(limit, (value, hard))
+        except (AttributeError, ValueError, OSError):
+            pass
+job = json.loads(sys.stdin.buffer.read())
+patterns = [re.compile(p) for p in job["patterns"]]
+sys.stdout.write(json.dumps([any(p.search(h) for p in patterns) for h in job["hosts"]]))
+"""
+
+
+def _lookbehind_problem(items) -> str:
+    """The error compiling would raise for a look-behind in a parsed pattern, or "" (the parser leaves it
+    to the compiler)."""
+    for op, av in items:
+        if op not in _REGEX_SCOPE_OPS:
+            continue
+        if op in (_sre_constants.ASSERT, _sre_constants.ASSERT_NOT):
+            if av[0] < 0:
+                low, high = av[1].getwidth()
+                if low != high:
+                    return "look-behind requires fixed-width pattern"
+                if low > 0xFFFFFFFF:
+                    return "looks too much behind"
+            parts = [av[1]]
+        elif op == _sre_constants.SUBPATTERN:
+            parts = [av[-1]]
+        elif op == _sre_constants.BRANCH:
+            parts = av[1]
+        elif op == _sre_constants.GROUPREF_EXISTS:
+            parts = [part for part in av[1:] if part is not None]
+        elif op == getattr(_sre_constants, "ATOMIC_GROUP", None):
+            parts = [av]
+        else:  # a repeat
+            parts = [av[2]]
+        for part in parts:
+            problem = _lookbehind_problem(part)
+            if problem:
+                return problem
+    return ""
+
+
+def _regex_problem(pattern: str) -> str:
+    """Why pattern is not a valid Python regular expression, or "".
+
+    The pattern is only parsed (linear in its length): compiling can take a tenth of a second for a
+    300-character pattern ((?i) with wide character ranges), and the matcher process compiles it."""
+    try:
+        return _lookbehind_problem(_sre_parse.parse(pattern))
+    except (re.error, OverflowError, RecursionError, ValueError, TypeError) as e:
+        return str(e) or type(e).__name__
+
+
+def _map_domain_patterns(values) -> tuple[list[str], str, str]:
+    """select_domains as sent to Tavily and matched locally: stripped, duplicates removed.
+
+    Returns (patterns, reason, message); reason is "" or the bad_request reason (too_many_patterns,
+    pattern_too_long, invalid_regex) and message says what to change."""
+    patterns = list(dict.fromkeys(v.strip() for v in values or [] if isinstance(v, str) and v.strip()))
+    if len(patterns) > MAP_MAX_PATTERNS:
+        return patterns, "too_many_patterns", (
+            f"select_domains 最多 {MAP_MAX_PATTERNS} 个正则（去重后），收到 {len(patterns)} 个；"
+            "请合并为更少的正则，例如 ^(docs|api|blog)\\.example\\.com$")
+    for pattern in patterns:
+        if len(pattern) > MAP_PATTERN_MAX_CHARS:
+            return patterns, "pattern_too_long", (
+                f"select_domains 的正则最长 {MAP_PATTERN_MAX_CHARS} 个字符，「{pattern[:80]}…」有 {len(pattern)} 个")
+    for pattern in patterns:
+        problem = _regex_problem(pattern)
+        if problem:
+            return patterns, "invalid_regex", (
+                f"select_domains 中的正则「{pattern[:80]}」不是有效的 Python 正则表达式: {redact(problem, 200)}")
+    return patterns, "", ""
+
+
+def _matcher_python() -> str:
+    """The interpreter that runs _MAP_MATCHER (-I -S: no site-packages, nothing from the environment).
+
+    On Windows a venv's python.exe is a launcher that runs the base interpreter as a second process, so
+    the base interpreter is started directly: killing the matcher then stops the process that runs the regex."""
+    if os.name == "nt":
+        base = getattr(sys, "_base_executable", "")
+        if base and os.path.isfile(base):
+            return base
+    return sys.executable
+
+
+def _matcher_env() -> dict:
+    """The matcher's whole environment. It runs re and json on the caller's input and needs nothing of
+    the server's (API keys, tokens, proxy settings); Python on Windows needs SYSTEMROOT to start."""
+    if os.name == "nt":
+        return {"SYSTEMROOT": os.environ.get("SYSTEMROOT") or "C:\\Windows"}
+    return {}
+
+
+def _kill(proc) -> None:
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass  # already gone
+
+
+# Windows has neither SIGALRM nor resource limits, so one Job Object holds every matcher: each may commit
+# MAP_MATCHER_MEMORY_BYTES more than a starting interpreter, and all are killed when the job's last handle
+# closes, that is when the server process ends, however it ends (the handle is not inherited).
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x100
+_JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION = 0x400  # no error dialog that keeps a crashed matcher alive
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+_MATCHER_STARTUP_BYTES = 64 * 1024 * 1024
+_matcher_job = None  # Windows: the job's handle once created, 0 when Windows refused one
+
+
+def _job_limit_information():
+    """ctypes layout of JOBOBJECT_EXTENDED_LIMIT_INFORMATION (144 bytes on 64-bit Windows, 112 on 32-bit)."""
+    import ctypes
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class BasicLimitInformation(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", ctypes.c_uint32), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32),
+                    ("SchedulingClass", ctypes.c_uint32)]
+
+    class ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", BasicLimitInformation), ("IoInfo", IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    return ExtendedLimitInformation
+
+
+def _kernel32():
+    """kernel32 with the signatures the matcher job uses (its own WinDLL object: ctypes.windll's is shared)."""
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    for name, restype, argtypes in (
+        ("CreateJobObjectW", ctypes.c_void_p, (ctypes.c_void_p, ctypes.c_wchar_p)),
+        ("SetInformationJobObject", ctypes.c_int, (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)),
+        ("OpenProcess", ctypes.c_void_p, (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)),
+        ("AssignProcessToJobObject", ctypes.c_int, (ctypes.c_void_p, ctypes.c_void_p)),
+        ("CloseHandle", ctypes.c_int, (ctypes.c_void_p,)),
+    ):
+        function = getattr(kernel32, name)
+        function.restype, function.argtypes = restype, argtypes
+    return kernel32
+
+
+def _create_matcher_job(kernel32) -> int:
+    """A Job Object with the matchers' limits, or 0 when Windows refuses one."""
+    import ctypes
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return 0
+    info = _job_limit_information()()
+    info.BasicLimitInformation.LimitFlags = (_JOB_OBJECT_LIMIT_PROCESS_MEMORY | _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                                             | _JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION)
+    info.ProcessMemoryLimit = MAP_MATCHER_MEMORY_BYTES + _MATCHER_STARTUP_BYTES
+    if not kernel32.SetInformationJobObject(job, _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+                                            ctypes.sizeof(info)):
+        kernel32.CloseHandle(job)
+        return 0
+    return job
+
+
+def _contain_matcher(pid: int) -> None:
+    """Windows: put a new matcher in the job before it is sent its input (until then it only waits on
+    stdin). When Windows refuses, the timeout kill remains its limit."""
+    global _matcher_job
+    if os.name != "nt" or _matcher_job == 0:
+        return
+    try:
+        kernel32 = _kernel32()
+        if _matcher_job is None:
+            _matcher_job = _create_matcher_job(kernel32) or 0
+        if not _matcher_job:
+            return
+        process = kernel32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, pid)
+        if process:
+            try:
+                kernel32.AssignProcessToJobObject(_matcher_job, process)
+            finally:
+                kernel32.CloseHandle(process)
+    except Exception:  # no ctypes, or an API that is missing
+        _matcher_job = _matcher_job or 0
+
+
+# Each matcher may use MAP_MATCHER_MEMORY_BYTES, so how many run at once bounds the memory web_map calls
+# can take together. One semaphore per event loop (an asyncio primitive belongs to the loop that first
+# waits on it; the server has one loop, tests have many).
+_matcher_slots = None  # (event loop, asyncio.Semaphore(MAP_MATCHERS_AT_ONCE))
+_live_matchers: set = set()  # running matcher processes, killed when the server shuts down
+# Exit statuses of a matcher that ended itself at its deadline (POSIX: SIGALRM, or SIGXCPU from RLIMIT_CPU).
+_MATCHER_DEADLINE_EXITS = frozenset(-getattr(signal, name) for name in ("SIGALRM", "SIGXCPU") if hasattr(signal, name))
+
+
+def _matcher_slot() -> asyncio.Semaphore:
+    global _matcher_slots
+    loop = asyncio.get_running_loop()
+    if _matcher_slots is None or _matcher_slots[0] is not loop:
+        _matcher_slots = (loop, asyncio.Semaphore(MAP_MATCHERS_AT_ONCE))
+    return _matcher_slots[1]
+
+
+def _kill_matchers() -> None:
+    """Kill the matchers still running (the server is exiting without cancelling its calls)."""
+    for proc in list(_live_matchers):
+        try:
+            _kill(proc)
+        except Exception:
+            pass
+
+
+async def _match_hosts(patterns: list[str], hosts: list[str]) -> tuple[list[bool] | None, str]:
+    """Which hosts one of patterns finds (re.search), decided by _MAP_MATCHER in a child process.
+
+    At most MAP_MATCHERS_AT_ONCE matchers run at a time; waiting for a free one counts toward
+    GROK_MAP_REGEX_TIMEOUT_S, after which the child is killed. Returns (matches, "") or (None, what went
+    wrong)."""
+    timeout = config.map_regex_timeout_s
+    if getattr(sys, "frozen", False):  # a bundled app: sys.executable is the app itself, not Python
+        return None, "failed; results not filtered (no Python interpreter for the matcher)"
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    slot = _matcher_slot()
+    try:
+        await asyncio.wait_for(slot.acquire(), timeout)
+    except asyncio.TimeoutError:
+        return None, (f"timed out; results not filtered (no free matcher within {timeout:g} s, at most "
+                      f"{MAP_MATCHERS_AT_ONCE} run at a time; GROK_MAP_REGEX_TIMEOUT_S)")
+    try:
+        return await _run_matcher(patterns, hosts, timeout, deadline - loop.time())
+    finally:
+        slot.release()
+
+
+async def _run_matcher(patterns: list[str], hosts: list[str], timeout: float,
+                       remaining: float) -> tuple[list[bool] | None, str]:
+    timed_out = (None, (f"timed out; results not filtered (select_domains matching stopped after {timeout:g} s, "
+                        "GROK_MAP_REGEX_TIMEOUT_S)"))
+    if remaining < 0.1:  # less than starting the interpreter takes: the slot came too late
+        return timed_out
+    payload = json.dumps({"patterns": patterns, "hosts": hosts}).encode("ascii")
+    # No console window per call when the server itself has none (Windows GUI clients).
+    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            _matcher_python(), "-I", "-S", "-c", _MAP_MATCHER, str(MAP_MATCHER_MEMORY_BYTES), str(math.ceil(remaining) + 1),
+            str(os.getpid()), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_matcher_env(), **flags)
+    except Exception as e:  # no usable interpreter, or an event loop without subprocess support
+        return None, f"failed; results not filtered (could not start the matcher: {type(e).__name__})"
+    _live_matchers.add(proc)
+    try:
+        _contain_matcher(proc.pid)
+        out, err = await asyncio.wait_for(proc.communicate(payload), remaining)
+    except asyncio.TimeoutError:
+        _kill(proc)
+        try:
+            await asyncio.wait_for(proc.wait(), 5)
+        except asyncio.TimeoutError:
+            pass
+        return timed_out
+    except BaseException:  # cancelled: the child must not outlive the call
+        _kill(proc)
+        raise
+    finally:
+        _live_matchers.discard(proc)
+    if proc.returncode in _MATCHER_DEADLINE_EXITS:
+        return timed_out
+    if proc.returncode != 0:
+        lines = err.decode("utf-8", "replace").strip().splitlines()
+        why = redact(lines[-1], 120) if lines else f"exit status {proc.returncode}"
+        return None, f"failed; results not filtered ({why})"
+    try:
+        matches = json.loads(out)
+    except ValueError:
+        matches = None
+    if not isinstance(matches, list) or len(matches) != len(hosts) or not all(isinstance(m, bool) for m in matches):
+        return None, "failed; results not filtered (unreadable matcher output)"
+    return matches, ""
+
+
+async def _scope_map_results(url: str, base_url, results, allow_external: bool,
+                             select_domains: list[str]) -> tuple[list, dict]:
+    """Apply web_map's scope to Tavily's result list on the client side.
+
+    Tavily does not count sibling subdomains (app., status., docs. ...) as external, and select_domains
+    only steers its crawl, so neither keeps them out of the list. With allow_external=false only URLs on
+    the start host are kept (www.<host> counts as <host>; Tavily's base_url host too; plain string
+    comparison), or, when select_domains is given, only URLs whose host matches one of its regexes
+    (re.search, as Tavily documents them). Those regexes come from the caller and the hosts from the
+    crawled site, so they are matched in a child process with a time limit (_match_hosts); hosts longer
+    than a DNS name are dropped. When matching does not finish, Tavily's list is returned unfiltered with
+    a scope_note. allow_external=true returns Tavily's list unchanged.
+    Returns the kept results and the fields describing the filter (scope, filtered_out[, scope_note]).
+    """
+    results = results if isinstance(results, list) else []
+    if allow_external:
+        return results, {"scope": "unfiltered", "filtered_out": 0}
+    # An entry that is not a URL string (host None) is left to Tavily.
+    hosts = [_url_host(link) if isinstance(link, str) else None
+             for link in (item.get("url") if isinstance(item, dict) else item for item in results)]
+    if select_domains:
+        scope = "select_domains"
+        candidates = sorted({host for host in hosts if host is not None and len(host) <= MAP_HOST_MAX_CHARS})
+        matches, problem = await _match_hosts(select_domains, candidates) if candidates else ([], "")
+        if problem:
+            return results, {"scope": "unfiltered", "filtered_out": 0, "scope_note": f"local regex filter {problem}"}
+        allowed = {host for host, matched in zip(candidates, matches) if matched}
+
+        def keep(host: str) -> bool:
+            return host in allowed
+    else:
+        scope = "exact_host"
+        sites = {_site_host(_url_host(u)) for u in (url, base_url) if isinstance(u, str)} - {""}
+
+        def keep(host: str) -> bool:
+            return _site_host(host) in sites
+
+    kept = [item for item, host in zip(results, hosts) if host is None or keep(host)]
+    return kept, {"scope": scope, "filtered_out": len(results) - len(kept)}
+
+
 async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 1,
                            max_breadth: int = 20, limit: int = 50, timeout: int = 150,
                            allow_external: bool = True, select_paths: list[str] | None = None,
@@ -699,6 +1210,9 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
     problem = url_problem(url if "://" in (url or "") else f"https://{(url or '').strip()}")
     if problem:
         return f"[web_map] error=invalid_url reason={problem[0]}\n\n无效的 URL: {problem[1]}"
+    domain_patterns, reason, message = _map_domain_patterns(select_domains)
+    if reason:
+        return f"[web_map] error=bad_request reason={reason}\n\n{message}"
     if not config.tavily_enabled:
         return _map_failure(ProviderError("tavily", "disabled", "TAVILY_ENABLED=false"),
                             "配置错误: Tavily 已禁用（TAVILY_ENABLED=false），web_map 不可用")
@@ -713,9 +1227,9 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
             "timeout": timeout, "allow_external": bool(allow_external)}
     if instructions:
         body["instructions"] = instructions
-    for key, values in (("select_paths", select_paths), ("select_domains", select_domains),
+    for key, values in (("select_paths", select_paths), ("select_domains", domain_patterns),
                         ("exclude_paths", exclude_paths), ("exclude_domains", exclude_domains)):
-        cleaned = [v.strip() for v in values or [] if isinstance(v, str) and v.strip()]
+        cleaned = list(dict.fromkeys(v.strip() for v in values or [] if isinstance(v, str) and v.strip()))
         if cleaned:
             body[key] = cleaned
     try:
@@ -723,11 +1237,7 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
             response = await client.post(endpoint, headers=headers, json=body)
             response.raise_for_status()
             data = response.json()
-            return json.dumps({
-                "base_url": data.get("base_url", ""),
-                "results": data.get("results", []),
-                "response_time": data.get("response_time", 0)
-            }, ensure_ascii=False, indent=2)
+            base_url, results, response_time = data.get("base_url", ""), data.get("results", []), data.get("response_time", 0)
     except Exception as e:
         error = classify_exception("tavily", e)
         if isinstance(e, httpx.TimeoutException):
@@ -737,6 +1247,10 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
         else:
             title = "映射失败: Tavily Map 未能完成"
         return _map_failure(error, title)
+    # Outside the try: the local filter reports its own problems in scope_note, never as a Tavily failure.
+    results, scope = await _scope_map_results(url, base_url, results, bool(allow_external), domain_patterns)
+    return json.dumps({"base_url": base_url, "results": results, "response_time": response_time, **scope},
+                      ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
@@ -749,24 +1263,40 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
     **Key Features:**
         - **Graph Traversal:** Explores website structure starting from root URL.
         - **Depth & Breadth Control:** Configure traversal limits to balance coverage and performance.
-        - **Scope Control:** allow_external (Tavily's default is true, so links to other sites are
-          included), select_paths / select_domains to keep only matching URLs, exclude_paths /
-          exclude_domains to drop matching URLs (all regular expressions).
+        - **Scope Control:** allow_external (default true: links to other sites are included).
+          allow_external=false keeps only URLs on the start URL's host (www.<host> counts as the same
+          host); other subdomains such as app. or status. are removed client-side, because Tavily
+          treats subdomains of the same site as internal. With allow_external=false and select_domains,
+          the select_domains regexes decide instead (Python re.search against each result's host, also
+          client-side), e.g. ['^(docs|api)\\.example\\.com$'] or ['^([\\w-]+\\.)*example\\.com$']. They are
+          matched in a separate process (no environment variables, limited memory, at most 2 at a time;
+          waiting for one counts toward the limit) that is killed after GROK_MAP_REGEX_TIMEOUT_S (default
+          2 s), so a slow pattern never blocks the server: the list then comes back unfiltered with
+          scope_note "local regex filter timed out; results not filtered". select_domains takes at most 20 patterns
+          (duplicates removed) of at most 300 characters; more, longer or invalid ones are refused locally
+          with `[web_map] error=bad_request reason=too_many_patterns|pattern_too_long|invalid_regex`.
+          select_paths keeps only matching paths; exclude_paths / exclude_domains drop matching URLs (all
+          regular expressions; these three are applied by Tavily only).
         - **Instruction Filtering:** Use natural language to focus crawler on specific content types.
 
-    **Output:** on success a JSON object {base_url, results, response_time}. On failure the first line is
+    **Output:** on success a JSON object {base_url, results, response_time, scope, filtered_out}: scope is
+    exact_host (allow_external=false), select_domains (allow_external=false with select_domains) or
+    unfiltered (allow_external=true, or the local select_domains filter timed out or failed; scope_note
+    says why), and filtered_out counts the URLs removed client-side. On failure the first line is
     `[web_map] error=<category> provider=tavily [status=<HTTP status>]` (categories as in web_fetch: auth,
-    quota, rate_limit, timeout, network, upstream_error, bad_request, disabled, not_configured, ...), then a
+    quota, rate_limit, timeout, network, upstream_error, bad_request, unsupported_site (Tavily refuses the
+    site; not a key problem), http_error, disabled, not_configured, ...), then a
     short message and a redacted detail line. Local/LAN addresses and non-http(s) URLs are refused locally
     with `[web_map] error=invalid_url reason=...` (Tavily runs in the cloud and cannot reach them).
 
     **Edge Cases & Best Practices:**
         - Start with low max_depth (1-2) for initial exploration, increase if needed.
-        - Use allow_external=false or select_domains to stay on the starting site.
+        - Use allow_external=false to stay on the start host; add select_domains (with allow_external=false)
+          to allow several hosts of the same site.
         - Use instructions to filter for specific content (e.g., "only documentation pages").
         - Large sites may hit timeout limits; adjust timeout and limit parameters accordingly.
     """,
-    meta={"version": "1.5.0", "author": "guda.studio"},
+    meta={"version": "1.6.0", "author": "guda.studio"},
 )
 async def web_map(
     url: Annotated[str, "Root URL to begin the mapping (e.g., 'https://docs.example.com')."],
@@ -775,9 +1305,9 @@ async def web_map(
     max_breadth: Annotated[int, Field(description="Maximum number of links to follow per page.", ge=1, le=500)] = 20,
     limit: Annotated[int, Field(description="Total number of links to process before stopping.", ge=1, le=500)] = 50,
     timeout: Annotated[int, Field(description="Maximum time in seconds for the operation.", ge=10, le=150)] = 150,
-    allow_external: Annotated[bool, "Include links to other domains in the results (Tavily's default is true). Set false to stay on the starting site."] = True,
+    allow_external: Annotated[bool, "Include links to other domains and subdomains in the results (default true). false keeps only URLs on the start URL's host (www. counts as the same host; other subdomains are removed client-side), or, with select_domains, on hosts matching those regexes."] = True,
     select_paths: Annotated[list[str] | None, "Regex patterns; only URLs whose path matches are returned, e.g. ['/docs/.*']."] = None,
-    select_domains: Annotated[list[str] | None, "Regex patterns restricting the crawl to matching domains or subdomains, e.g. ['^docs\\.example\\.com$']."] = None,
+    select_domains: Annotated[list[str] | None, "Regex patterns (Python syntax, at most 20 of at most 300 characters) restricting the crawl to matching domains or subdomains, e.g. ['^docs\\.example\\.com$']. With allow_external=false the results are also filtered client-side to hosts matching one of them (re.search on the host, in a time-limited child process); with allow_external=true they only steer the crawl."] = None,
     exclude_paths: Annotated[list[str] | None, "Regex patterns; URLs whose path matches are skipped, e.g. ['/blog/.*']."] = None,
     exclude_domains: Annotated[list[str] | None, "Regex patterns; matching domains or subdomains are skipped."] = None,
 ) -> str:
@@ -830,8 +1360,11 @@ def _masked_breaker_snapshot() -> dict:
         - **Breaker State:** Shows which model tiers are currently cooling down after rate limits.
         - **Connection Test:** Sends request to /models endpoint to validate API access; a transport
           failure (connection reset or refused, proxy tunnel closed) is retried once.
-        - **Model Discovery:** Lists all available models from the API and refreshes the cached list
-          that web_search(model=...) is validated against.
+        - **Model Discovery:** Lists all available models from the API (available_models) and refreshes
+          the cached list that web_search(model=...) is validated against. chat_models are the ones
+          web_search / switch_model accept; non_chat_models (TTS/voice/audio, image/video generation,
+          embedding, moderation, realtime, rerank, recognised by name unless the gateway's /models entry
+          declares text output, as OpenRouter's architecture.output_modalities does) are listed but rejected.
         - **Model Source:** GROK_MODEL_SOURCE is env, switch_model (set in this process), config
           (config file) or default; GROK_MODEL_NOTE says how long a switch_model choice lasts.
         - **Warnings:** config_warnings lists environment values that were not understood (their
@@ -842,7 +1375,7 @@ def _masked_breaker_snapshot() -> dict:
         - API keys are masked (at most a quarter of a key is shown) and credentials in URLs are hidden.
         - Connection test timeout is 10 seconds per attempt; network issues may cause delays.
     """,
-    meta={"version": "1.6.0", "author": "guda.studio"},
+    meta={"version": "1.7.0", "author": "guda.studio"},
 )
 async def get_config_info() -> str:
     import json
@@ -884,7 +1417,10 @@ async def get_config_info() -> str:
                     test_result["message"] += f"，共 {len(models_data['data'])} 个模型"
                     model_names = [m["id"] for m in models_data["data"] if isinstance(m, dict) and isinstance(m.get("id"), str)]
                     if model_names:
+                        remember_capabilities(api_url, models_data["data"])
                         test_result["available_models"] = model_names
+                        test_result["chat_models"] = [m for m in model_names if not model_kind(m, api_url)]
+                        test_result["non_chat_models"] = [m for m in model_names if model_kind(m, api_url)]
                         _MODEL_CACHE.put(api_url, api_key, model_names)
                         test_result["model_cache"] = "refreshed"
             except Exception:
@@ -916,6 +1452,16 @@ async def get_config_info() -> str:
         if "retried_after" in test_result:
             test_result["attempts"] = _CONNECTION_TEST_ATTEMPTS
 
+    # After the connection test: a /models list that declares capabilities (OpenRouter) overrides the name.
+    try:
+        default_kind = model_kind(routing_base(config_info.get("GROK_MODEL") or ""), config.grok_api_url)
+    except ValueError:  # GROK_API_URL missing
+        default_kind = non_chat_kind(routing_base(config_info.get("GROK_MODEL") or ""))
+    if default_kind:
+        config_info.setdefault("config_warnings", []).append(
+            f"GROK_MODEL={config_info['GROK_MODEL']}（来源: {config_info.get('GROK_MODEL_SOURCE')}）看起来不是对话/搜索模型"
+            f"（{default_kind}），web_search 会被上游拒绝；请用 switch_model 或 GROK_MODEL 换成 chat_models 中的模型"
+        )
     config_info["connection_test"] = test_result
     return json.dumps(config_info, ensure_ascii=False, indent=2)
 
@@ -929,8 +1475,12 @@ async def get_config_info() -> str:
     **Key Features:**
         - **Validation:** The name is stripped and checked against the proxy's /models list the same
           way as web_search(model=...): a thinking suffix such as "(high)" is accepted, an empty,
-          over-long or unlisted name is rejected and nothing changes. When /models cannot be reached
-          the switch is applied unverified, with a warning.
+          over-long or unlisted name is rejected and nothing changes. Non-chat models (TTS/voice/audio,
+          image/video generation, embedding, moderation, realtime, rerank) are rejected even when
+          /models lists them. When /models cannot be reached the switch is applied unverified, with a
+          warning.
+        - **Already active:** Switching to the model already in use changes nothing (no file write,
+          GROK_MODEL_SOURCE stays as it was) and answers with already_active=true.
         - **Persistent Storage:** Model preference saved to ~/.config/grok-search/config.json (a private
           temp directory, with a warning, when that is not writable).
         - **Immediate Effect:** New model used for all subsequent operations in this process.
@@ -939,9 +1489,10 @@ async def get_config_info() -> str:
         - Use get_config_info to see the available models and GROK_MODEL_SOURCE.
         - When the GROK_MODEL environment variable is set it takes precedence over the config file, so
           the switch lasts only for this process and GROK_MODEL wins again after a restart; the response
-          carries a warning in that case.
+          carries a warning in that case. Switching back to the GROK_MODEL value restores
+          GROK_MODEL_SOURCE=env.
     """,
-    meta={"version": "1.5.0", "author": "guda.studio"},
+    meta={"version": "1.6.0", "author": "guda.studio"},
 )
 async def switch_model(
     model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-4.20-multi-agent-0309(high)'). Must be non-empty."]
@@ -975,6 +1526,22 @@ async def switch_model(
             if check.status == "unverified":
                 warnings.append(f"未能通过 /models 校验模型名（{check.detail}），已按原样切换")
 
+        already_active = check.status == "default" if check is not None else config._apply_model_suffix(name) == previous_model
+        if already_active:
+            config_file = config.config_file
+            result = {
+                "status": "✅ 成功",
+                "previous_model": previous_model,
+                "current_model": previous_model,
+                "message": f"{previous_model} 已是当前模型（来源: {config.grok_model_source}），无需切换；未做任何修改",
+                "config_file": str(config_file) if config_file else None,
+                "model_source": config.grok_model_source,
+                "already_active": True,
+            }
+            if warnings:
+                result["warning"] = "\n".join(warnings)
+            return reply(**result)
+
         save_warning = config.set_model(name)
         current_model = config.grok_model
         config_file = config.config_file
@@ -987,14 +1554,14 @@ async def switch_model(
             "config_file": str(config_file) if config_file else None,
             "model_source": config.grok_model_source,
         }
-        if check is not None and check.status != "default":
+        if check is not None:
             result["model_check"] = check.to_dict()
         if save_warning:
             warnings.append(save_warning)
         elif config.config_file_is_temporary:
             warnings.append(f"~/.config/grok-search 不可写，配置保存在临时目录 {config_file}，服务器重启后不会保留")
         env_model = (os.getenv("GROK_MODEL") or "").strip()
-        if env_model:
+        if env_model and config._apply_model_suffix(env_model) != current_model:
             warnings.append(
                 f"环境变量 GROK_MODEL={env_model} 已设置，它的优先级高于配置文件："
                 f"本次切换只在当前进程有效，服务器重启后会恢复为 {env_model}。"
@@ -1475,6 +2042,7 @@ def main():
     # 信号处理（仅主线程）
     if threading.current_thread() is threading.main_thread():
         def handle_shutdown(signum, frame):
+            _kill_matchers()
             os._exit(0)
         signal.signal(signal.SIGINT, handle_shutdown)
         if sys.platform != 'win32':
@@ -1526,6 +2094,7 @@ def main():
         exit_code = 1
         _report_fatal_error()
     finally:
+        _kill_matchers()
         os._exit(exit_code)
 
 

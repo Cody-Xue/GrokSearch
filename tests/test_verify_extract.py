@@ -205,7 +205,8 @@ async def test_fabricated_dois_next_to_markup_are_looked_up(monkeypatch):
     result = await verify.verify_answer(answer, [], check_urls=False, timeout_s=5)
     assert result["skipped"] == []
     assert sorted(item["value"] for item in result["unresolved"]) == ["10.1109/FAKE.2099.12345", "10.5555/fabricated.2099"]
-    assert {item["reason"] for item in result["unresolved"]} == {"not found"}
+    assert {item["value"]: item["reason"] for item in result["unresolved"]} == {
+        "10.1109/FAKE.2099.12345": "not found", "10.5555/fabricated.2099": verify.DOI_TEST_PREFIX_REASON}
     assert "api.crossref.org" in calls
 
 

@@ -2,6 +2,7 @@ import asyncio
 import codecs
 import httpx
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -20,22 +21,91 @@ from ..config import config
 from ..throttle import breaker, get_semaphore, BreakerOpen
 
 
-def get_local_time_info() -> str:
-    """获取本地时间信息，注入到每次搜索的用户消息前"""
+# The time block must be plain ASCII apart from our own weekday name. On Windows CPython builds the name of
+# datetime.now().astimezone() from the C runtime's strftime("%Z"), which converts the localized display
+# name ("中国标准时间") through the ANSI code page: a code page that cannot encode it yields "??????", and
+# an LC_CTYPE mismatch yields mojibake or lone surrogates. The numeric UTC offset is derived from
+# localtime/gmtime and is reliable, so the block carries the offset plus an IANA name only when one can be
+# read from the configuration (TZ, /etc/localtime, /etc/timezone) and agrees with that offset.
+_LOCALTIME_LINK = "/etc/localtime"
+_TIMEZONE_FILE = "/etc/timezone"
+_IANA_KEY_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,2}")
+
+
+def _format_utc_offset(offset) -> str:
+    """'UTC+08:00', 'UTC-03:30', 'UTC+05:45'; a missing offset counts as UTC."""
+    minutes = round(offset.total_seconds() / 60) if offset is not None else 0
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    return f"UTC{sign}{hours:02d}:{mins:02d}"
+
+
+def _iana_candidates(local_now: datetime) -> list[str]:
+    candidates = []
+    key = getattr(local_now.tzinfo, "key", None)
+    if isinstance(key, str):
+        candidates.append(key)
+    tz_env = (os.environ.get("TZ") or "").strip().lstrip(":")
+    if tz_env:
+        candidates.append(tz_env.split("zoneinfo/")[-1] if "zoneinfo/" in tz_env else tz_env)
     try:
-        local_tz = datetime.now().astimezone().tzinfo
-        local_now = datetime.now(local_tz)
+        target = os.readlink(_LOCALTIME_LINK)
+        if "zoneinfo/" in target:
+            candidates.append(target.rsplit("zoneinfo/", 1)[1])
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(_TIMEZONE_FILE, encoding="ascii") as f:
+            candidates.append(f.read(100).strip())
+    except (OSError, ValueError):
+        pass
+    return candidates
+
+
+def _iana_zone_name(local_now: datetime) -> str:
+    """An ASCII IANA key for the local zone whose offset right now equals the local offset, or ""."""
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:  # pragma: no cover - Python < 3.9
+        return ""
+    offset = local_now.utcoffset()
+    for key in _iana_candidates(local_now):
+        if not key.isascii() or not _IANA_KEY_RE.fullmatch(key):
+            continue
+        try:
+            if local_now.astimezone(ZoneInfo(key)).utcoffset() == offset:
+                return key
+        except Exception:
+            # Unknown key, no tz database (Windows without the tzdata package), unreadable file.
+            continue
+    return ""
+
+
+def get_local_time_info() -> str:
+    """获取本地时间信息，注入到每次搜索的用户消息前（时区用 ASCII 的 UTC 偏移 + 可确定时的 IANA 名称）"""
+    try:
+        local_now = datetime.now().astimezone()
+        offset = local_now.utcoffset()
     except Exception:
         local_now = datetime.now(timezone.utc)
+        offset = None
+    zone = _format_utc_offset(offset)
+    try:
+        iana = _iana_zone_name(local_now) if offset is not None else ""
+    except Exception:
+        iana = ""
+    if iana:
+        zone += f" ({iana})"
 
     weekdays_cn = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     weekday = weekdays_cn[local_now.weekday()]
 
+    # Digits formatted here rather than by the C runtime's strftime, which is locale-dependent on Windows.
     return (
         f"[Current Time Context]\n"
-        f"- Date: {local_now.strftime('%Y-%m-%d')} ({weekday})\n"
-        f"- Time: {local_now.strftime('%H:%M:%S')}\n"
-        f"- Timezone: {local_now.tzname() or 'Local'}\n"
+        f"- Date: {local_now.year:04d}-{local_now.month:02d}-{local_now.day:02d} ({weekday})\n"
+        f"- Time: {local_now.hour:02d}:{local_now.minute:02d}:{local_now.second:02d}\n"
+        f"- Timezone: {zone}\n"
     )
 
 
@@ -557,7 +627,7 @@ class GrokSearchProvider(BaseSearchProvider):
             "Content-Type": "application/json",
         }
         query = _scrub_surrogates(query or "")
-        platform = _scrub_surrogates(platform or "")
+        platform = _scrub_surrogates(platform or "").strip()
         instructions = _scrub_surrogates(instructions or "")
         platform_prompt = ""
         if platform:
@@ -567,6 +637,8 @@ class GrokSearchProvider(BaseSearchProvider):
         user_content = time_context + query + platform_prompt
         if instructions and instructions.strip():
             user_content += "\n\n[Additional instructions from the caller]\n" + instructions.strip() + "\n"
+        # The whole message, not only the caller's parts: nothing in it may break the UTF-8 request body.
+        user_content = _scrub_surrogates(user_content)
 
         payload = {
             "model": self.model,

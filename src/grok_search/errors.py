@@ -23,7 +23,10 @@ CATEGORIES = {
     "proxy_config": "local proxy environment (HTTP(S)_PROXY / NO_PROXY) is invalid",
     "network": "connection failed (DNS, TLS or connection refused)",
     "upstream_error": "provider-side server error",
-    "bad_request": "request rejected (for example an unsupported or invalid URL)",
+    "bad_request": "request rejected (for example an invalid URL)",
+    "unsupported_site": "the provider does not support or is not allowed to fetch this site (not a key problem)",
+    "blocked": "refused locally: the destination is, or resolves to, a non-public or unverifiable address",
+    "not_text": "not a plain-text resource (HTML or binary), so the verbatim download was not used",
     "http_error": "unexpected HTTP status",
     "extract_failed": "the provider could not extract this page",
     "empty_content": "the provider answered without content",
@@ -107,6 +110,16 @@ class ProviderError(Exception):
         return data
 
 
+class PageStatusError(ProviderError):
+    """The backend reached the page, but the page itself answered with an HTTP error status."""
+
+    def __init__(self, provider: str, status: int, detail: str = ""):
+        category = "rate_limit" if status == 429 else "upstream_error" if status >= 500 else "extract_failed"
+        text = f"target page answered HTTP {status}" + (f" ({detail})" if detail else "")
+        super().__init__(provider, category, text, status=status)
+        self.page_status = status
+
+
 # Cloudflare edge errors (the gateway is behind Cloudflare). Their bodies are HTML pages whose
 # first few hundred characters are boilerplate, so the code is named instead of quoting the page.
 CLOUDFLARE_ERRORS = {
@@ -170,13 +183,31 @@ def response_error_message(response) -> str:
     return json.dumps(data, ensure_ascii=False) if data else ""
 
 
+# A 403 from a provider means two very different things: the key is not allowed (auth), or the
+# provider will not fetch this particular site (Firecrawl: "we do not support this site", Tavily:
+# "URL is not supported", robots.txt or block lists). Only the first is a configuration problem.
+_AUTH_403_RE = re.compile(
+    r"api[\s_-]?keys?\b|apikey|access[\s_-]?keys?\b|\btokens?\b|credential|unauthori[sz]ed|authenticat|\bbearer\b",
+    re.IGNORECASE,
+)
+_UNSUPPORTED_SITE_RE = re.compile(
+    r"do(?:es)?\s+not\s+support|don'?t\s+support|not\s+supported|unsupported|no\s+longer\s+supported|"
+    r"\bblock(?:ed|list)\b|robots|not\s+allowed\s+to\s+(?:scrape|crawl|fetch)",
+    re.IGNORECASE,
+)
+
+
 def category_for_status(status: int, message: str = "") -> str:
-    lowered = (message or "").lower()
+    message = message or ""
     if status == 401:
         return "auth"
     if status == 403:
-        # Tavily answers 403 for "URL is not supported"; everyone else uses it for permissions.
-        return "bad_request" if ("not supported" in lowered or "unsupported" in lowered) else "auth"
+        if _AUTH_403_RE.search(message):
+            return "auth"
+        if _UNSUPPORTED_SITE_RE.search(message):
+            return "unsupported_site"
+        # A bare 403 says neither; the status and the detail are shown as they are.
+        return "http_error"
     if status in (402, 432, 433):
         return "quota"
     if status == 429:

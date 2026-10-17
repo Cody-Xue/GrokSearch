@@ -124,3 +124,30 @@ async def test_verify_answer_ties_titles_to_identifiers(monkeypatch):
     result = await verify.verify_answer(answer, [], check_urls=False, timeout_s=5)
     assert {(t["id"], t["status"]) for t in result["title_checks"]} == {("2211.17192", "not_stated"), ("2302.01318", "match")}
     assert result["summary"]["title_possible_mismatch"] == 0
+
+
+ATTENTION = "Attention Is All You Need"
+
+
+@pytest.mark.parametrize("id_line, identifier, registry", [
+    # Grok's usual list layout: the title line, then the identifier as a Markdown link.
+    ("- arXiv: [1706.03762](https://arxiv.org/abs/1706.03762)", "1706.03762", ATTENTION),
+    ("- DOI: [10.1038/s41586-021-03819-2](https://doi.org/10.1038/s41586-021-03819-2)", "10.1038/s41586-021-03819-2", ALPHAFOLD),
+    ("- **arXiv:** [1706.03762](https://arxiv.org/abs/1706.03762)", "1706.03762", ATTENTION),
+    ("- arXiv (1706.03762)", "1706.03762", ATTENTION),
+    ("- 论文链接：【1706.03762】", "1706.03762", ATTENTION),
+])
+def test_identifier_after_label_and_link_opener_reads_the_title_line_above(id_line, identifier, registry):
+    right = f"**Paper**\n- Title: {registry}\n{id_line}\n"
+    assert verify.compare_title(right, identifier, registry)["status"] == "match"
+    # A wrong title in the same layout is a possible mismatch, not "not stated".
+    wrong = f"**Paper**\n- Title: Deep Residual Learning for Image Recognition\n{id_line}\n"
+    check = verify.compare_title(wrong, identifier, registry)
+    assert check["status"] == "possible_mismatch" and check["answer_title"] == "Deep Residual Learning for Image Recognition"
+
+
+def test_link_opener_after_label_does_not_reach_past_another_identifier():
+    answer = ("- Title: Deep Residual Learning for Image Recognition\n- arXiv: [1512.03385](https://arxiv.org/abs/1512.03385)\n"
+              "- arXiv: [1706.03762](https://arxiv.org/abs/1706.03762)\n")
+    others = [("1512.03385", "Deep Residual Learning for Image Recognition")]
+    assert verify.compare_title(answer, "1706.03762", ATTENTION, others=others)["status"] == "not_stated"
