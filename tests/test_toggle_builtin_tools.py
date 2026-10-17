@@ -25,9 +25,30 @@ def home(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_refuses_to_guess_and_writes_nothing(home, tmp_path):
-    data = await toggle({"action": "on"})
-    assert data["blocked"] is None and "project_dir" in data["error"]
+async def test_an_unmarked_working_directory_is_the_project(home, tmp_path):
+    # v1.13.1 field report: without CLAUDE_PROJECT_DIR and a .git/.claude above it, the tool used to refuse.
+    work = home / "work"
+    status = await toggle({"action": "status"})
+    assert status["project_dir"] == str(work.resolve()) and status["project_dir_source"] == "working_directory"
+    assert status["warning"].startswith("没有 CLAUDE_PROJECT_DIR") and not list(tmp_path.rglob("settings.json"))
+    on = await toggle({"action": "on"})
+    assert on["blocked"] is True and on["file"] == str((work / ".claude" / "settings.json").resolve())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["argument", "CLAUDE_PROJECT_DIR", "working_directory"])
+@pytest.mark.parametrize("action", ["on", "off", "status"])
+async def test_the_home_directory_is_never_the_project(home, monkeypatch, tmp_path, source, action):
+    # ~/.claude/settings.json is the user-level file: "on" there blocked the tools in every project.
+    arguments = {"action": action}
+    if source == "argument":
+        arguments["project_dir"] = str(home)
+    elif source == "CLAUDE_PROJECT_DIR":
+        monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(home))
+    else:
+        monkeypatch.chdir(home)
+    data = await toggle(arguments)
+    assert data["blocked"] is None and "用户主目录" in data["error"] and "未做任何修改" in data["error"]
     assert not list(tmp_path.rglob("settings.json"))
 
 

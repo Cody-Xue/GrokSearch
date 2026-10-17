@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -100,6 +101,12 @@ def mask_url(url: str) -> str:
         return "***"
 
 
+# Used when neither GROK_MODEL nor the config file names a model. The "(high)" thinking suffix is CPA's
+# (CLIProxyAPI turns it into reasoning effort high); on a gateway that does not take thinking suffixes set
+# GROK_MODEL. A multi-agent search bills 0.5-1.6M prompt tokens (about $0.5-0.9 in 2026-10 tests).
+DEFAULT_MODEL = "grok-4.20-multi-agent-0309(high)"
+
+
 class Config:
     _instance = None
     _SETUP_COMMAND = (
@@ -108,7 +115,7 @@ class Config:
         '"git+https://github.com/Cody-Xue/GrokSearch@main","grok-search"],'
         '"env":{"GROK_API_URL":"your-api-url","GROK_API_KEY":"your-api-key"}}\''
     )
-    _DEFAULT_MODEL = "grok-4-fast"
+    _DEFAULT_MODEL = DEFAULT_MODEL
 
     def __new__(cls):
         if cls._instance is None:
@@ -360,6 +367,19 @@ class Config:
     def planning_tools_enabled(self) -> bool:
         return _env_bool("GROK_PLANNING_TOOLS", False)
 
+    @property
+    def tool_prefix(self) -> str:
+        """GROK_TOOL_PREFIX, put before every tool name (read at start): for clients that do not namespace MCP
+        tools and drop one of two tools with the same name (AstrBot replaces its own web_search with this
+        server's, or the other way round). Letters, digits, "_" and "-", at most 20 characters; empty by default."""
+        value = _env_value("GROK_TOOL_PREFIX")
+        if value is None:
+            return ""
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,20}", value):
+            _ENV_WARNINGS.pop("GROK_TOOL_PREFIX", None)
+            return value
+        return _env_fallback("GROK_TOOL_PREFIX", value, "")
+
     # ----------------------------------------------------------------- fetch
     @property
     def fetch_min_chars(self) -> int:
@@ -385,6 +405,25 @@ class Config:
         """Oldest Firecrawl cache entry web_fetch accepts (sent as maxAge). 0 always scrapes fresh;
         Firecrawl's own default would serve copies up to 2 days old."""
         return max(0.0, _env_float("GROK_FETCH_MAX_AGE_S", 0.0))
+
+    @property
+    def fetch_page_first(self) -> str:
+        """Which extractor reads an ordinary web page first. firecrawl (default): a live scrape (maxAge
+        GROK_FETCH_MAX_AGE_S), Tavily only when it fails; tavily: Tavily's cached copy first (cheaper and
+        faster, but Tavily has no freshness control and served a python.org copy over a week old)."""
+        value = _env_value("GROK_FETCH_PAGE_FIRST")
+        if value is None:
+            return "firecrawl"
+        if value.lower() in ("firecrawl", "tavily"):
+            _ENV_WARNINGS.pop("GROK_FETCH_PAGE_FIRST", None)
+            return value.lower()
+        return _env_fallback("GROK_FETCH_PAGE_FIRST", value, "firecrawl")
+
+    @property
+    def fetch_strip_images(self) -> bool:
+        """Drop Markdown image markup from extracted web pages (badges, icons, logos; the alt text stays).
+        Verbatim files are never changed."""
+        return _env_bool("GROK_FETCH_STRIP_IMAGES", True)
 
     @property
     def fetch_direct_enabled(self) -> bool:
@@ -673,12 +712,15 @@ class Config:
             "GROK_VERIFY_DOH_URL": mask_url(self.verify_doh_url),
             "GROK_VERIFY_DETAIL": self.verify_detail,
             "GROK_PLANNING_TOOLS": self.planning_tools_enabled,
+            "GROK_TOOL_PREFIX": self.tool_prefix or "未设置",
             "GROK_FETCH_MIN_CHARS": self.fetch_min_chars,
             "GROK_FETCH_MAX_CHARS": self.fetch_max_chars,
             "GROK_FETCH_SNAPSHOT_TTL_S": self.fetch_snapshot_ttl_s,
             "GROK_FETCH_MAX_CHARS_CJK": self.fetch_max_chars_cjk,
             "GROK_FETCH_ARXIV_BUDGET_S": self.fetch_arxiv_budget_s,
             "GROK_FETCH_MAX_AGE_S": self.fetch_max_age_s,
+            "GROK_FETCH_PAGE_FIRST": self.fetch_page_first,
+            "GROK_FETCH_STRIP_IMAGES": self.fetch_strip_images,
             "GROK_FETCH_DIRECT": self.fetch_direct_enabled,
             "GROK_MAP_REGEX_TIMEOUT_S": self.map_regex_timeout_s,
             "TAVILY_API_URL": mask_url(self.tavily_api_url),

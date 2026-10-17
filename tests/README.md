@@ -22,8 +22,14 @@ When native citations exist, `web_search.content` keeps the original answer (whi
 sources section included) except that adjacent repeated citation markers are collapsed;
 every offset is then checked against that content. Offsets that point exactly at a
 `[[n]](url)` marker for the same URL (or at exactly one Markdown link to it) are kept and shifted
-if markers were collapsed; others are relocated to the next unclaimed marker for that URL
-or lose their coordinates. The upstream values stay in `upstream_start_index`/`upstream_end_index`
-and `position` says `relocated` or `removed`. Existing text-source extraction remains the fallback for APIs
-without annotations. Native sources, text sources, and optional extra search
-results are merged by URL, with native citation metadata taking precedence.
+if markers were collapsed; others are relocated to the next unclaimed marker for that URL (or, when
+the answer has none, to its next Markdown link or bare URL) or lose their coordinates. The upstream values
+stay in `upstream_start_index`/`upstream_end_index` and `position` says `relocated` or `removed`.
+Native sources, the links and URLs written in the answer, and optional extra search results are merged
+by URL, with native citation metadata taking precedence. An annotation with an empty span (0/0), no
+citation number and a URL the answer never mentions is a page the search only consulted: it is kept
+apart (`consulted`), not counted and not verified.
+
+`fixtures/responses_stream.sse` (grok-4.7) and `fixtures/responses_multi_agent.sse`
+(grok-4.20-multi-agent-0309(high), 2026-10-17) are real Responses API streams from the CPA gateway
+with the encrypted reasoning content removed; `test_consulted_sources.py` replays the second one.

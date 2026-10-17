@@ -156,6 +156,8 @@ def mocked_network(monkeypatch):
                 return httpx.Response(200, text="<title>Fine page</title>")
             if path == "/waf":
                 return httpx.Response(202, headers={"x-amzn-waf-action": "challenge"})
+            if path == "/queued":
+                return httpx.Response(202, text="<title>Accepted</title>")
             if path == "/busy":
                 return httpx.Response(503)
             return httpx.Response(404)
@@ -169,15 +171,18 @@ def mocked_network(monkeypatch):
 @pytest.mark.asyncio
 async def test_compact_of_a_real_verification(mocked_network):
     answer = "SWE-Review: Closing the Loop (arXiv:2607.06065); also arXiv:2612.99999."
-    sources = [{"url": f"https://site.example.test/{p}"} for p in ("ok", "waf", "busy", "dead")] + [{"url": "ftp://x.test/f"}]
+    sources = [{"url": f"https://site.example.test/{p}"} for p in ("ok", "waf", "queued", "busy", "dead")] + [{"url": "ftp://x.test/f"}]
     full = await verify.verify_answer(answer, sources, check_urls=True, timeout_s=5)
     assert "detail" not in full and full["scope"] == verify.SCOPE  # full mode stays as in v1.12.0
     assert [t["status"] for t in full["title_checks"]] == ["match"]
     out = verify.compact_verification(full)
     assert {(u["kind"], u["value"]) for u in out["unresolved"]} == {("arxiv", "2612.99999"), ("url", "https://site.example.test/dead")}
-    assert [u["value"] for u in out["lookup_failed"]] == ["https://site.example.test/busy"]
+    # AWS WAF's challenge (202 + x-amzn-waf-action) is a bot check, not the page.
+    failed = {u["value"]: u["reason"] for u in out["lookup_failed"]}
+    assert set(failed) == {"https://site.example.test/busy", "https://site.example.test/waf"}
+    assert failed["https://site.example.test/waf"] == "bot check / interstitial (page may exist)"
     assert out["title_checks"] == []
-    assert out["urls_unusual"] == [{"url": "https://site.example.test/waf", "status": 202, "title": ""}]
+    assert out["urls_unusual"] == [{"url": "https://site.example.test/queued", "status": 202, "title": "Accepted"}]
     assert [s["value"] for s in out["skipped"]] == ["ftp://x.test/f"]
     assert out["summary"] == full["summary"] and out["summary"]["urls_reachable"] == 2
     assert out["summary"]["identifiers_found"] == 1 and out["summary"]["title_match"] == 1

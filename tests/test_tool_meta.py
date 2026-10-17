@@ -176,3 +176,42 @@ async def test_get_config_info_reports_breaker_and_version(configured, monkeypat
     assert data["server_version"]
     assert data["breaker"]["test-model @ https://api.example.test/v1"]["state"] == "open"
     assert data["GROK_MODEL_SOURCE"] == "env"
+
+
+_LIST_TOOLS = """
+import asyncio, json
+from fastmcp import Client
+from grok_search import server
+
+async def main():
+    async with Client(server.mcp) as client:
+        tools = await client.list_tools()
+    print(json.dumps({tool.name: tool.description for tool in tools}))
+
+asyncio.run(main())
+"""
+
+
+def _tool_listing(tmp_path, prefix=None) -> dict:
+    import os
+    import subprocess
+    import sys
+    env = {k: v for k, v in os.environ.items() if k not in ("GROK_TOOL_PREFIX", "GROK_PLANNING_TOOLS")}
+    env.update(GROK_LOG_DIR=str(tmp_path / "logs"), HOME=str(tmp_path))
+    if prefix is not None:
+        env["GROK_TOOL_PREFIX"] = prefix
+    out = subprocess.run([sys.executable, "-c", _LIST_TOOLS], env=env, capture_output=True, text=True, timeout=120, check=True)
+    return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def test_tool_prefix_for_clients_without_namespaces(tmp_path):
+    # AstrBot keeps one of two tools with the same name (AstrBotDevs/AstrBot#5689): its own web_search or this one.
+    plain = _tool_listing(tmp_path)
+    assert {"web_search", "web_fetch", "get_sources", "toggle_builtin_tools"} <= set(plain)
+    assert "GROK_TOOL_PREFIX" not in plain["web_search"]
+    prefixed = _tool_listing(tmp_path, "grok_")
+    assert set(prefixed) == {"grok_" + name for name in plain}
+    assert "Tool names carry the prefix 'grok_' (GROK_TOOL_PREFIX)" in prefixed["grok_web_search"]
+    assert "grok_get_sources" in prefixed["grok_web_search"]
+    # An unusable prefix is ignored (with a config warning), not half-applied.
+    assert set(_tool_listing(tmp_path, "grok search!")) == set(plain)

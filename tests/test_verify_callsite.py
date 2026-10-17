@@ -72,9 +72,9 @@ async def test_description_explains_unresolved_versus_lookup_failed():
     async with Client(server.mcp) as client:
         tools = {tool.name: tool for tool in await client.list_tools()}
     description = " ".join(tools["web_search"].description.split())
-    assert ("lookup_failed (rate limit, 5xx, timeout, network, or a site that refuses scripted requests with "
-            "401/403/451) as unknown") in description
-    assert "other 4xx except 401/403/451" in description
+    assert ("lookup_failed (rate limit, 5xx, timeout, network, any other 4xx such as 401/403/451 refusals or the "
+            "400/405/406/418 of bot defences) as unknown") in description
+    assert "does not exist: 404/410, unknown domain)" in description and "except 401/403/451" not in description
     assert "Treat unresolved (the registry or site said it does not exist" in description
     verify_param = tools["web_search"].input_schema["properties"]["verify"]["description"]
     assert "GROK_VERIFY_IDS" in verify_param and "GROK_VERIFY_URLS" in verify_param

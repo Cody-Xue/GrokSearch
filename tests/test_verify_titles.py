@@ -151,3 +151,73 @@ def test_link_opener_after_label_does_not_reach_past_another_identifier():
               "- arXiv: [1706.03762](https://arxiv.org/abs/1706.03762)\n")
     others = [("1512.03385", "Deep Residual Learning for Image Recognition")]
     assert verify.compare_title(answer, "1706.03762", ATTENTION, others=others)["status"] == "not_stated"
+
+
+# v1.13.1 field report: four title checks were all not_stated although each title was written two lines above
+# its identifier. The window only reached one line up, and only when that line was not blank.
+BERT = "BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding"
+RESNET = "Deep Residual Learning for Image Recognition"
+# The answer of grok-4.20-multi-agent-0309(high) to "BERT 和 ResNet 的 arXiv 编号、完整英文标题、第一作者和 DOI"
+# (2026-10-17, evidence paragraphs left out): v1.13.0 found no title for 10.18653/v1/N19-1423.
+BERT_RESNET = (
+    "**BERT**\n\n- arXiv 编号：1810.04805\n- 完整英文标题：" + BERT + "\n- 第一作者：Jacob Devlin\n"
+    "- 正式发表会议 DOI：10.18653/v1/N19-1423 (NAACL 2019)[[1]](https://arxiv.org/abs/1810.04805)[[2]](https://aclanthology.org/N19-1423/)\n\n"
+    "**ResNet (" + RESNET + ")**\n\n- arXiv 编号：1512.03385\n- 完整英文标题：" + RESNET + "\n- 第一作者：Kaiming He\n"
+    "- 正式发表会议 DOI：10.1109/CVPR.2016.90 (CVPR 2016)[[3]](https://arxiv.org/abs/1512.03385)\n"
+)
+BERT_RESNET_IDS = [("1810.04805", BERT), ("10.18653/v1/N19-1423", BERT), ("1512.03385", RESNET), ("10.1109/CVPR.2016.90", RESNET)]
+
+
+@pytest.mark.parametrize("identifier, registry", BERT_RESNET_IDS)
+def test_titles_of_a_field_list_are_found_for_every_identifier(identifier, registry):
+    assert verify.compare_title(BERT_RESNET, identifier, registry, others=BERT_RESNET_IDS)["status"] == "match"
+
+
+@pytest.mark.parametrize("answer", [
+    f"**{ATTENTION}**\n\n- arXiv: 1706.03762\n- Authors: Vaswani et al.\n",  # title, blank line, list
+    f"### {ATTENTION}\n- Authors: Vaswani et al.\n- Venue: NeurIPS 2017\n- arXiv: 1706.03762\n",  # two fields up
+    f"1. **{ATTENTION}**\n\n   - 作者：Vaswani 等\n\n   - arXiv：1706.03762\n",  # a loose list
+    f"- arXiv: 1706.03762\n- Title: {ATTENTION}\n",  # the identifier first
+    f"- **DOI:** 10.48550/arXiv.1706.03762\n- **Title:** {ATTENTION}\n",
+])
+def test_the_rest_of_the_record_is_read(answer):
+    identifier = "10.48550/arXiv.1706.03762" if "10.48550" in answer else "1706.03762"
+    assert verify.compare_title(answer, identifier, ATTENTION)["status"] == "match"
+
+
+def test_a_wrong_title_in_a_field_list_is_still_reported():
+    answer = "**Attention Was Never Needed**\n\n- arXiv: 1706.03762\n- Authors: Vaswani et al.\n"
+    check = verify.compare_title(answer, "1706.03762", ATTENTION)
+    assert check["status"] in ("partial", "possible_mismatch") and check["answer_title"] == "Attention Was Never Needed"
+
+
+@pytest.mark.parametrize("answer", [
+    # Two blank lines end the record; a paragraph is not a record.
+    f"**{ATTENTION}**\n\n\n- arXiv: 1706.03762\n",
+    f"Transformers are discussed in {ATTENTION} by Vaswani.\n\nMany later systems build on arXiv 1706.03762 in their design.\n",
+    # The next record's title is not this identifier's.
+    f"- arXiv: 1706.03762\n\n**{ATTENTION}**\n",
+])
+def test_the_window_stops_at_the_record(answer):
+    assert verify.compare_title(answer, "1706.03762", ATTENTION)["status"] == "not_stated"
+
+
+def test_the_record_of_the_previous_identifier_is_not_taken():
+    answer = f"**{RESNET}**\n- arXiv: 1512.03385\n- Note: residual connections\n- arXiv: 1706.03762\n"
+    others = [("1512.03385", RESNET)]
+    assert verify.compare_title(answer, "1706.03762", ATTENTION, others=others)["status"] == "not_stated"
+
+
+def test_record_windows_stay_bounded_on_hostile_layouts():
+    lines = "\n".join(["- Label: value"] * 50_000 + ["", ""] * 50_000)
+    answer = lines + "\n- arXiv: 1706.03762\n" + "\n".join(["- Field: x"] * 50_000)
+    started = time.monotonic()
+    assert verify.compare_title(answer, "1706.03762", ATTENTION)["status"] == "not_stated"
+    assert time.monotonic() - started < 2
+
+
+def test_record_lines_with_huge_indentation_are_cheap():
+    answer = ("x\n" + " " * 1_000_000 + "y\n") * 3 + "- arXiv: 1706.03762\n" + (" " * 1_000_000 + "- Note: z\n") * 3
+    started = time.monotonic()
+    assert verify.compare_title(answer, "1706.03762", ATTENTION)["status"] == "not_stated"
+    assert time.monotonic() - started < 2

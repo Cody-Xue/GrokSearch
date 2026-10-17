@@ -385,12 +385,15 @@ async def check_model(requested: str, *, default_model: str, api_url: str, api_k
     if name.suffix_kind == "unknown":
         if listing.models and lookup in listing.models:
             return ModelCheck(True, send, "listed", name.base)
-        return ModelCheck(
-            False, requested, "invalid", name.base,
-            f"unsupported thinking suffix '({name.suffix})': use a token budget such as (8192) or one of "
-            + ", ".join(THINKING_LEVELS),
-            reason="unsupported_suffix",
-        )
+        detail = (f"unsupported thinking suffix '({name.suffix})': use a token budget such as (8192) or one of "
+                  + ", ".join(THINKING_LEVELS))
+        suggestions: list[str] = []
+        # Both problems at once: "grok-99-fake(ultra)" used to be refused for its suffix alone, and only the
+        # second attempt revealed that the model does not exist either.
+        if listing.models and not listing.stale and not base_is_listed(name.base, listing.models):
+            detail += f"; and '{name.base}' is not in the proxy's /models list"
+            suggestions = suggest_models(name.base, listing.models)
+        return ModelCheck(False, requested, "invalid", name.base, detail, suggestions, reason="unsupported_suffix")
     if listed(listing.models):
         return ModelCheck(True, send, "listed", name.base)
     if listing.models and not listing.stale and listing.from_cache and cache.now() - listing.fetched_at >= MISS_REFRESH_MIN_AGE_S:

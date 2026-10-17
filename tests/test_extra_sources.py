@@ -89,6 +89,26 @@ async def test_duplicates_with_grok_and_across_engines_are_skipped(configured, m
 
 
 @pytest.mark.asyncio
+async def test_a_repository_and_its_readme_are_one_result(configured, monkeypatch):
+    # v1.13.1 field report: github.com/o/r and its README.md came back as two extra sources.
+    repo = [{"url": "https://github.com/fastapi/fastapi", "title": "fastapi/fastapi"},
+            {"url": "https://github.com/fastapi/fastapi/blob/master/README.md", "title": "README.md"},
+            {"url": "https://docs.example.test/guide/index.html", "title": "Guide"}]
+    other = [{"url": "https://raw.githubusercontent.com/FastAPI/FastAPI/master/README.md", "title": "raw README"},
+             {"url": "https://docs.example.test/guide/", "title": "Guide again"},
+             {"url": "https://github.com/fastapi/fastapi/blob/master/docs/README.md", "title": "docs README"}]
+    monkeypatch.setattr(server, "_call_tavily_search", engine(lambda n: repo + results("t", n)))
+    monkeypatch.setattr(server, "_call_firecrawl_search", engine(lambda n: other + results("f", n)))
+    out = await search(configured, extra_sources=6)
+    report = out["extra_sources_report"]
+    assert report["returned"] == 6 and report["duplicates_skipped"] == 2
+    content = out["content"]
+    assert "](https://github.com/fastapi/fastapi)" in content and "fastapi/blob/master/README.md" not in content
+    assert "raw README" not in content and content.count("](https://docs.example.test/guide/") == 1
+    assert "docs README" in content  # another README is another document
+
+
+@pytest.mark.asyncio
 async def test_tavily_enabled_false_is_honoured(configured, monkeypatch):
     monkeypatch.setenv("TAVILY_ENABLED", "false")
     tavily, firecrawl = engine(lambda n: results("t", n)), engine(lambda n: results("f", n))

@@ -18,7 +18,7 @@ from ..errors import classify_exception, describe_transport_error, redact, summa
 from ..models import routing_base
 from ..utils import build_search_prompt
 from ..logger import log_info, logger
-from ..config import config
+from ..config import DEFAULT_MODEL, config
 from ..throttle import breaker, get_semaphore, BreakerOpen
 
 
@@ -525,6 +525,8 @@ class GrokResponse:
     dropped_events: int = field(default=0, compare=False)
     # Queries of the upstream's own web/X searches (Responses API web_search_call / x_search_call items).
     search_queries: list[str] = field(default_factory=list, compare=False)
+    # Search-call items the stream showed (searches and page opens), by item id.
+    search_calls_seen: set = field(default_factory=set, compare=False)
 
     @property
     def incomplete(self) -> bool:
@@ -572,6 +574,14 @@ class GrokResponse:
                     out[name] = calls
         return out or None
 
+    def search_queries_partial(self, usage: Optional[dict] = None) -> bool:
+        """Whether search_queries leaves searches out: more distinct queries than are listed, or the upstream
+        billed more search calls than the stream showed. A multi-agent model runs most of its searches in
+        sub-agents whose calls never appear in the stream (73 billed, 5 shown: 2 searches and 3 page opens)."""
+        usage = self.compact_usage() if usage is None else usage
+        billed = sum((usage or {}).get(name, 0) for name in ("web_search_calls", "x_search_calls"))
+        return len(self.search_queries) > _MAX_SEARCH_QUERIES or billed > len(self.search_calls_seen)
+
     def result_fields(self) -> dict:
         """Completion state and token usage that web_search adds to a successful result."""
         out: dict = {}
@@ -582,6 +592,8 @@ class GrokResponse:
             out["usage"] = usage
         if self.search_queries:
             out["search_queries"] = self.search_queries[:_MAX_SEARCH_QUERIES]
+            if self.search_queries_partial(usage):
+                out["search_queries_partial"] = True
         if self.dropped_events:
             out["dropped_events"] = self.dropped_events
         return out
@@ -637,7 +649,7 @@ class _SSELineSplitter:
 
 
 class GrokSearchProvider(BaseSearchProvider):
-    def __init__(self, api_url: str, api_key: str, model: str = "grok-4-fast", api_mode: Optional[str] = None):
+    def __init__(self, api_url: str, api_key: str, model: str = DEFAULT_MODEL, api_mode: Optional[str] = None):
         # "https://host/v1/" must not become "https://host/v1//chat/completions" (404 on CPA).
         super().__init__((api_url or "").strip().rstrip("/"), (api_key or "").strip())
         self.model = model
@@ -755,6 +767,9 @@ class GrokSearchProvider(BaseSearchProvider):
             if not isinstance(item, dict) or not str(item.get("type") or "").endswith("search_call"):
                 return
             action = item.get("action")
+            # The terminal response object repeats the streamed items: an item is counted once by its id.
+            item_id = item.get("id")
+            result.search_calls_seen.add(item_id if isinstance(item_id, str) and item_id else json.dumps(item, sort_keys=True, default=str))
             query = action.get("query") if isinstance(action, dict) else None
             if isinstance(query, str) and query.strip() and query.strip() not in result.search_queries:
                 result.search_queries.append(query.strip())

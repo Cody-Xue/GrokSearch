@@ -20,25 +20,25 @@ Grok Search MCP 是一个基于 [FastMCP](https://github.com/jlowin/fastmcp) 构
 ```
 Claude ──MCP──► Grok Search Server
                   ├─ web_search  ───► Grok API（AI 搜索）
-                  ├─ web_fetch   ───► 直连下载（文本/代码文件）→ Tavily Extract → Firecrawl Scrape（内容抓取，自动降级）
+                  ├─ web_fetch   ───► 直连下载（文本/代码文件）→ Firecrawl Scrape（现抓）→ Tavily Extract（内容抓取，自动降级）
                   └─ web_map     ───► Tavily Map（站点映射）
 ```
 
 ### 功能特性
 
 - **双引擎**：Grok 搜索 + Tavily 抓取/映射，互补协作
-- **Firecrawl 托底**：Tavily 提取失败时自动降级到 Firecrawl Scrape，支持空内容自动重试
+- **网页先实时抓取**：普通网页默认先用 Firecrawl 现抓（`maxAge=0`），Firecrawl 失败、遇到人机验证或内容过短时才用 Tavily 的缓存副本，并明确提示它可能过期；`GROK_FETCH_PAGE_FIRST=tavily` 恢复 Tavily 优先的旧顺序
 - **OpenAI 兼容接口**，支持任意 Grok 镜像站
 - **自动时间注入**（每次搜索注入本地日期、时间与 ASCII 时区：UTC 偏移如 `UTC+08:00`，能确定时附 IANA 名称）
 - **只读工具注解**：`web_search`/`web_fetch`/`web_map`/`get_sources`/`get_config_info` 声明 `readOnlyHint`，Claude Code 会并行执行同一轮里的多次调用，而不是逐个排队
 - **并发上限 + 按模型熔断**：`GROK_MAX_CONCURRENCY` 限制同时在途的 Grok 请求；连续 429 或账号池耗尽时按模型熔断（同一模型的不同思考档位，如 `(high)`/`(low)`/`(8192)`，共用一套熔断状态）并返回结构化错误，冷却后自动探测恢复。CLIProxyAPI / xAI 的账号池耗尽响应（503 `auth_unavailable`、429 `model_cooldown`、`free-usage-exhausted` 等）第一次就会熔断；排队等并发名额的调用拿到名额后会再检查一次熔断状态
 - **失败必有回声**：上游流内错误帧、429、空响应、超时、网络故障和中途断开的流都会变成 `error`/`error_type`/`retry_after_s` 字段，不再静默返回空正文；被上游截断或过滤的回答标记 `incomplete`。工具失败按设计以普通结果返回（MCP `isError=false`），请以 `error` 字段或首行判断
 - **搜索时长有上限**：`GROK_READ_TIMEOUT_S`（单次读取）与 `GROK_SEARCH_TIMEOUT_S`（整次调用，含排队、重试与等待）保证网关卡住时搜索也会结束并返回 `timeout`
-- **两种上游接口**：`GROK_API_MODE=chat`（默认，`/chat/completions`）或 `responses`（`/responses`，即 Responses API）。CLIProxyAPI 的 chat 接口要等整个回答生成完才发出第一个字节，Responses 接口则边生成边推送事件（实测 2–3 秒内即有响应），长时间的多智能体搜索不再受读取超时和 Cloudflare 100 秒限制的影响；xAI 还会在用量里给出本次花费（`usage.cost_usd`）与搜索次数，结果里附上 Grok 用过的搜索词（`search_queries`）
+- **两种上游接口**：`GROK_API_MODE=chat`（默认，`/chat/completions`）或 `responses`（`/responses`，即 Responses API）。CLIProxyAPI 的 chat 接口要等整个回答生成完才发出第一个字节，Responses 接口则边生成边推送事件（实测 2–3 秒内即有响应），长时间的多智能体搜索不再受读取超时和 Cloudflare 100 秒限制的影响；xAI 还会在用量里给出本次花费（`usage.cost_usd`）与搜索次数，结果里附上流中可见的搜索词（`search_queries`；多智能体模型的大部分搜索在子智能体里进行、不出现在流中，此时标 `search_queries_partial: true`）
 - **按次换模型**：`web_search(model=...)` 支持 CPA 风格的思考后缀（如 `grok-4.7(high)`、`grok-4.7(8192)`），按基础名称对照 `/models` 校验、请求时保留完整名称；模型列表缓存有有效期，获取失败不缓存；TTS/语音、图像、嵌入等非对话模型按名称在本地拒绝，相近建议只列对话模型（同系列优先）
-- **额外信源双引擎分配**：`extra_sources` 在 Tavily 与 Firecrawl 之间对半分配，与 Grok 已引用的链接及引擎之间去重，一方失败由另一方补位，过程写入 `extra_sources_report`；指定 `platform` 时引擎只在该平台的域名内搜索（Tavily `include_domains`、Firecrawl `site:`），平台外结果被丢弃
-- **核验层（不是事实核验）**：回答里的 arXiv 号、DOI 经 arXiv API / Crossref / doi.org 登记处 / DataCite 确认存在（包括 arXiv 自己的 `10.48550/arXiv.<id>` DOI、Zenodo 以及万方/ISTIC 等其他登记机构的 DOI），Grok 引用的 URL 确认可访问，回答中写出的论文标题与登记标题自动比对（`title_checks`）；**不检查来源是否支持对应论断**（`claim_support: not_checked`）。`unresolved` 表示登记处或网站明确答复不存在（应视为可疑）；`lookup_failed` 表示没拿到答复（限流、5xx、超时、人机验证或登录墙页面，如 Reddit “Prove your humanity”），不能当作反对引用的证据；没检查的条目连同原因列在 `skipped`。只核验 Grok 引用的来源，不核验 `extra_sources` 的结果；URL 请求前先确认目标地址都是公网地址，Clash/mihomo fake-ip 环境下先经 DNS-over-HTTPS 查出真实地址（局限见 `web_search` 一节）。默认精简输出（`GROK_VERIFY_DETAIL=compact`）：只列需要关注的条目，计数全部保留
-- **原样抓取文本文件、新鲜内容与快照分页**：raw.githubusercontent.com、gist、GitHub/GitLab/Codeberg/Bitbucket 文件页和代码/配置/文本扩展名的 URL 由本机直连下载、逐字节原样返回（`source=direct`；只访问公网地址，最大 5 MB，不发送任何 API Key）；Firecrawl 默认要求现抓（`maxAge=0`），首行标出后端缓存状态（`cache=`）；普通网页 Tavily 结果过短或是人机验证页时回退 Firecrawl；arXiv 摘要页走 arXiv API（带版本号的链接返回该版本），不可用时改用 DataCite 记录；超长页面首屏返回 `snapshot_id`，后续页按 `offset` + `snapshot_id` 固定读取同一份内容，不会错页；CJK 为主的页面默认每页 20,000 字符；页面本身返回 HTTP ≥ 400 时算作失败（`page_status=`），Firecrawl 被重定向时首行给出 `final_url=`/`title=`，登录墙与反爬验证页标记 `warning=interstitial`；非 http(s) 链接和本机/局域网 IP 直接在本地拒绝（`error=invalid_url`），不调用付费后端；失败时逐个列出各后端的错误类别、HTTP 状态和脱敏详情
+- **额外信源双引擎分配**：`extra_sources` 在 Tavily 与 Firecrawl 之间对半分配，与 Grok 已引用的链接及引擎之间去重（仓库主页与它的根目录 README 算同一文档），一方失败由另一方补位，过程写入 `extra_sources_report`；指定 `platform` 时引擎只在该平台的域名内搜索（Tavily `include_domains`、Firecrawl `site:`），平台外结果被丢弃
+- **核验层（不是事实核验）**：回答里的 arXiv 号、DOI 经 arXiv API / Crossref / doi.org 登记处 / DataCite 确认存在（包括 arXiv 自己的 `10.48550/arXiv.<id>` DOI、Zenodo 以及万方/ISTIC 等其他登记机构的 DOI），Grok 引用的 URL 确认可访问，回答中写出的论文标题与登记标题自动比对（`title_checks`）；**不检查来源是否支持对应论断**（`claim_support: not_checked`）。`unresolved` 表示登记处或网站明确答复不存在（404/410、域名不存在；应视为可疑）；`lookup_failed` 表示没拿到答复（限流、5xx、超时、其他 4xx 拒绝、人机验证或登录墙页面，如 Reddit “Prove your humanity”、NASA ADS 的 AWS WAF 验证码 405），不能当作反对引用的证据；没检查的条目连同原因列在 `skipped`。只核验 Grok 引用的来源（先查回答里写出的链接），不核验 `extra_sources` 的结果，也不核验上游只是“查阅过”而没有引用的页面；URL 请求前先确认目标地址都是公网地址，Clash/mihomo fake-ip 环境下先经 DNS-over-HTTPS 查出真实地址（局限见 `web_search` 一节）。默认精简输出（`GROK_VERIFY_DETAIL=compact`）：只列需要关注的条目，计数全部保留
+- **原样抓取文本文件、新鲜内容与快照分页**：raw.githubusercontent.com、gist、GitHub/GitLab/Codeberg/Bitbucket 文件页和代码/配置/文本扩展名的 URL 由本机直连下载、逐字节原样返回（`source=direct`；只访问公网地址，最大 5 MB，不发送任何 API Key）；Firecrawl 默认要求现抓（`maxAge=0`），首行标出后端缓存状态（`cache=`）；普通网页先用 Firecrawl 现抓，Tavily 的缓存副本只作后备并附“可能过期”提示；网页副本里的图片标记（徽章、图标）被去掉；源站已答复 404/410 的地址不再调用付费提取服务；arXiv 摘要页走 arXiv API（带版本号的链接返回该版本），不可用时改用 DataCite 记录；超长页面首屏返回 `snapshot_id`，后续页按 `offset` + `snapshot_id` 固定读取同一份内容，不会错页；CJK 为主的页面默认每页 20,000 字符；页面本身返回 HTTP ≥ 400 时算作失败（`page_status=`），Firecrawl 被重定向时首行给出 `final_url=`/`title=`，登录墙与反爬验证页标记 `warning=interstitial`；非 http(s) 链接和本机/局域网 IP 直接在本地拒绝（`error=invalid_url`），不调用付费后端；失败时逐个列出各后端的错误类别、HTTP 状态和脱敏详情
 - **输出风格与引用规则**：默认 `concise`，`explanatory` 增加术语解释与类比。两种风格都只给来源直接陈述的事实挂引用；推断须标注“Inference:/推断：”，自写的解释与类比不挂引用；查不到的东西只表述为“本次检索未找到”；并附数字原样引用、不跨来源拼区间的硬规则
 - 一键禁用 Claude Code 官方 WebSearch/WebFetch，强制路由到本工具
 - 智能重试（任何状态码都解析 Retry-After + 指数退避；确定性错误不重试；Cloudflare 520/521/523/530 重试一次，522/524 按超时处理）
@@ -102,7 +102,7 @@ claude mcp add-json grok-search --scope user '{
 }'
 ```
 
-> **固定版本（推荐）**：`@main` 是分支，uvx 每次启动都会到 GitHub 解析它：总是运行主分支的最新代码，修复来得最快；代价是每次启动多花几秒，GitHub 不可达时服务器无法启动，而且未经你审阅的改动（包括不兼容的改动）会在下次启动时直接生效。日常使用建议固定到发布标签或提交，把上面的 `git+https://github.com/Cody-Xue/GrokSearch@main` 换成 `git+https://github.com/Cody-Xue/GrokSearch@v1.13.0`（以仓库实际存在的标签为准，打标签之前可用 `@<提交 SHA>`）：每次运行的都是同一份代码，可复现，缓存后启动不再依赖 GitHub；代价是升级要手动改版本号。两种写法都可以，下文示例沿用 `@main`。
+> **固定版本（推荐）**：`@main` 是分支，uvx 每次启动都会到 GitHub 解析它：总是运行主分支的最新代码，修复来得最快；代价是每次启动多花几秒，GitHub 不可达时服务器无法启动，而且未经你审阅的改动（包括不兼容的改动）会在下次启动时直接生效。日常使用建议固定到发布标签或提交，把上面的 `git+https://github.com/Cody-Xue/GrokSearch@main` 换成 `git+https://github.com/Cody-Xue/GrokSearch@v1.13.1`（以仓库实际存在的标签为准，打标签之前可用 `@<提交 SHA>`）：每次运行的都是同一份代码，可复现，缓存后启动不再依赖 GitHub；代价是升级要手动改版本号。两种写法都可以，下文示例沿用 `@main`。
 
 <details> <summary>如果遇到 SSL / 证书验证错误</summary>
 
@@ -140,11 +140,11 @@ claude mcp add-json grok-search --scope user '{
 |------|------|--------|------|
 | `GROK_API_URL` | ✅ | - | Grok API 地址（OpenAI 兼容格式）；首尾空白与末尾的 `/` 会被忽略（`https://host/v1/` 也可用） |
 | `GROK_API_KEY` | ✅ | - | Grok API 密钥；首尾空白会被忽略 |
-| `GROK_MODEL` | ❌ | `grok-4-fast` | 默认模型（设置后优先于 `~/.config/grok-search/config.json` 与 `switch_model`；空值视为未设置）。费用提示：多智能体/高推理档位（如 `grok-4.20-multi-agent-0309(high)`）每次搜索实测消耗 50 万–160 万 prompt tokens；日常查询建议用轻量模型，如 `grok-4.7`（本版实测每次约 1.9 万–13 万），设为 `GROK_MODEL` 或按次传 `web_search(model=...)` |
+| `GROK_MODEL` | ❌ | `grok-4.20-multi-agent-0309(high)` | 默认模型（设置后优先于 `~/.config/grok-search/config.json` 与 `switch_model`；空值视为未设置）。内置默认值是多智能体模型、推理强度 high：`(high)` 是 CLIProxyAPI 风格的思考后缀，不支持这种后缀的网关请设置 `GROK_MODEL`；网关的 `/models` 列表里没有当前模型时，`get_config_info` 的 `config_warnings` 会提示并给出相近的可用模型。费用提示：多智能体/高推理档位（包括这个默认值）每次搜索实测消耗 50 万–160 万 prompt tokens（约 0.5–0.9 美元）；日常查询建议用轻量模型，如 `grok-4.7`（本版实测每次约 1.9 万–13 万），设为 `GROK_MODEL` 或按次传 `web_search(model=...)` |
 | `TAVILY_API_KEY` | ❌ | - | Tavily API 密钥（用于 web_fetch / web_map） |
 | `TAVILY_API_URL` | ❌ | `https://api.tavily.com` | Tavily API 地址 |
 | `TAVILY_ENABLED` | ❌ | `true` | 是否启用 Tavily；`false` 时 `web_fetch`、`web_map`、`extra_sources` 都不会调用 Tavily（即使配置了 key） |
-| `FIRECRAWL_API_KEY` | ❌ | - | Firecrawl API 密钥（Tavily 失败时托底） |
+| `FIRECRAWL_API_KEY` | ❌ | - | Firecrawl API 密钥（`web_fetch` 默认先用它现抓普通网页，并读取代码文件；`extra_sources` 的第二个引擎） |
 | `FIRECRAWL_API_URL` | ❌ | `https://api.firecrawl.dev/v2` | Firecrawl API 地址 |
 | `GROK_DEBUG` | ❌ | `false` | 调试模式（日志会记录完整的提示词与回答）。进度消息（如 `Begin Fetch`、`Fetch Finished`）只在开启时写入日志并推送给客户端；警告与错误始终写入并推送；客户端通知失败（如连接已关闭）不会让工具失败 |
 | `GROK_LOG_LEVEL` | ❌ | `INFO` | 日志级别 |
@@ -172,7 +172,10 @@ claude mcp add-json grok-search --scope user '{
 | `GROK_VERIFY_DOH_URL` | ❌ | `https://cloudflare-dns.com/dns-query` | `GROK_VERIFY_FAKE_IP=doh` 使用的 DoH JSON 接口（Cloudflare/Google JSON 格式，如 `https://dns.google/resolve`），经配置的代理访问；`web_fetch` 的直连下载也使用这两项 |
 | `GROK_VERIFY_DETAIL` | ❌ | `compact` | 核验块的详细程度：`compact` 只列需要关注的内容（全部 `unresolved` 与 `lookup_failed`、`match` 以外的 `title_checks`、`urls_unusual`、前 10 条 `skipped` 及 `skipped_omitted`），`checked`/`summary` 保留全部计数，scope 为一句简述；`full` 另列每条已解析的 arXiv/DOI 记录、每个可访问 URL（状态与标题）、一致的标题比对和完整的 scope 说明（即 v1.12.0 的输出）。无法识别的值按 `compact` 处理并列入 `config_warnings` |
 | `GROK_PLANNING_TOOLS` | ❌ | `false` | 是否注册 `plan_*` 六个搜索规划工具 |
-| `GROK_FETCH_MIN_CHARS` | ❌ | `2000` | 普通网页的 Tavily 抓取结果低于此长度时回退 Firecrawl。不用于直连下载、代码文件回退和 arXiv 摘要页回退（这些内容本来就可能很短） |
+| `GROK_TOOL_PREFIX` | ❌ | 空 | 加在所有工具名前的前缀（启动时读取；字母、数字、`_`、`-`，最长 20 字符），如 `grok_` 得到 `grok_web_search`。给不区分 MCP 命名空间、遇到同名工具只保留一个的客户端用（AstrBot 的内置 `web_search` 与本服务的 `web_search` 会互相覆盖，见 [AstrBot#5689](https://github.com/AstrBotDevs/AstrBot/issues/5689)）；Claude Code 自带命名空间，不需要设置 |
+| `GROK_FETCH_PAGE_FIRST` | ❌ | `firecrawl` | 普通网页先用哪个提取服务：`firecrawl`（默认）先现抓，Firecrawl 失败、遇到人机验证或结果过短时才用 Tavily；`tavily` 先用 Tavily 的缓存副本（更快、更省 Firecrawl 额度，但 Tavily 没有新鲜度控制：2026-10-17 实测它的 python.org/downloads 副本在 3.15.0 发布 8 天后仍写着最新版是 3.14.8）。没有 Firecrawl key 时总是 Tavily 优先。无法识别的值按 `firecrawl` 处理 |
+| `GROK_FETCH_STRIP_IMAGES` | ❌ | `true` | 去掉网页副本中的 Markdown 图片标记：带链接的图片保留链接、用 alt 文本作链接文字，其他图片变成 `[image: alt]`，没有 alt 的图片直接去掉；首行报告 `images_stripped=N`。直连下载与按文件读取的内容从不改动。实测 pypi.org/project/fastapi 的 Tavily 副本 85,329 字符中 41% 是图片标记（325 个是发布历史里的装饰图标） |
+| `GROK_FETCH_MIN_CHARS` | ❌ | `2000` | 普通网页先读到的副本低于此长度时再问另一个提取服务（默认顺序下：Firecrawl 结果过短时问 Tavily，Tavily 的副本至少长一倍才采用）。不用于直连下载、代码文件回退和 arXiv 摘要页回退（这些内容本来就可能很短） |
 | `GROK_FETCH_MAX_CHARS` | ❌ | `40000` | `web_fetch` 单次默认返回字符数 |
 | `GROK_FETCH_MAX_CHARS_CJK` | ❌ | `20000` | 页面中 CJK 字符超过 30% 时 `web_fetch` 的默认每页字符数（不超过 `GROK_FETCH_MAX_CHARS`），避免单次结果超过 Claude Code 约 25k token 的 MCP 输出上限 |
 | `GROK_FETCH_ARXIV_BUDGET_S` | ❌ | `8` | `web_fetch` 走 arXiv API 的总时限（秒，含 3 秒闸门与一次重试）；限流、超时、网络或 5xx 失败后 2 分钟内跳过 arXiv API（`attempts=arxiv-api:cooldown`）。arXiv API 失败时先用 DataCite 的记录生成摘要页（免费），再依次 Firecrawl、Tavily |
@@ -210,11 +213,12 @@ claude mcp list
 
 通过 Grok API 执行 AI 驱动的网络搜索，默认仅返回 Grok 的回答正文，并返回 `session_id` 以便后续获取信源。
 
-`web_search` 输出不展开信源，只返回计数；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。`sources_count` / `distinct_domains` 只统计 Grok 引用的来源（不含 `extra_sources`）；`extra_sources_count` 是额外信源条数，`total_sources_count` 是两者之和（即 `get_sources` 列表的长度）。
+`web_search` 输出不展开信源，只返回计数；信源会按 `session_id` 缓存在服务端，可用 `get_sources` 拉取。`sources_count` / `distinct_domains` 只统计 Grok 引用的来源（原生引用，加上回答里写出的引用标记、Markdown 链接和 URL；不含 `extra_sources`，也不含上游只是“查阅过”的页面，见下文）；`extra_sources_count` 是额外信源条数，`total_sources_count` 是两者之和（即 `get_sources` 列表的长度）。
 
 参数 `instructions` 用于按次追加给搜索模型的要求（例如"至少覆盖 15 个不同域名"或"只列 arXiv 号和标题"）。失败时有 `error`/`error_type`/`retry_after_s`（按需还有 `status`、`exhausted`），正文一律以 `[搜索失败]` 开头；失败前已找到的额外信源仍附在后面，指定了 `model` 时 `model_check` 也照常返回。
 
-- **引用位置**：有原生引用时，相邻重复的引用标记（如 `[[1]](u)[[1]](u)`）会合并，`get_sources` 返回的 `start_index`/`end_index` 一律对应最终返回的正文，按 Unicode 码点计（不是 UTF-16 单元）。对不上的位置会重新定位（`position: relocated`）或去掉坐标（`position: removed`），上游原值保留在 `upstream_start_index`/`upstream_end_index`，统计见 `citation_positions`。
+- **引用位置**：有原生引用时，相邻重复的引用标记（如 `[[1]](u)[[1]](u)`）会合并，`get_sources` 返回的 `start_index`/`end_index` 一律对应最终返回的正文，按 Unicode 码点计（不是 UTF-16 单元）。对不上的位置会重新定位到同一页面的引用标记（回答没有 `[[n]]` 标记时，定位到同一页面的普通 Markdown 链接或 URL；`position: relocated`），找不到时去掉坐标（`position: removed`），上游原值保留在 `upstream_start_index`/`upstream_end_index`，统计见 `citation_positions`。
+- **引用与“查阅过”的页面**：Responses API（xAI，经 CPA 转发）除了真正的行内引用，还会把搜索打开过的每个页面都作为一条 `url_citation` 注解发来，偏移是 0/0、标题就是 URL 本身。v1.13.0 把它们全当成引用：grok-4.7 的一次中文查询报 `sources_count: 77`（其中 61 条是这种页面，如 `cpython/Lib/ssl.py`、`rclone/commits`，大多与回答无关），一个一条引用都没有的回答报了 40 个来源、27 个域名，核验的 30 个 URL 名额被它们占满，回答里真正写出的 16 个链接反而被跳过。现在：只有空区间（`start_index == end_index`）、没有编号、回答里也没提到的注解算作“查阅过”，不计入 `sources_count`/`distinct_domains`，不核验；数量见 `consulted_sources_count`（与 `citation_positions.consulted_only`），列表见 `get_sources` 的 `consulted`。回答里写出的链接都算引用，核验时先检查它们。默认的多智能体模型用 `[[n]]` 标记引用，实测（2026-10-17，两次搜索）没有这类注解。
 - **上游错误与重试**：
   - `error_type` 取值：`bad_request`（查询为空或只含空白/不可见/控制字符：在本地拒绝，正文以 `[搜索失败] 查询为空…` 开头，不调用 Grok、`/models` 或额外信源引擎，不产生费用）、`config`（`GROK_API_URL`/`GROK_API_KEY` 缺失或无效）、`proxy_config`（本地代理环境错误）、`invalid_model`、`rate_limit`（`exhausted: true` 表示该模型的账号池被封，等待 `retry_after_s` 或换模型）、`circuit_open`、`timeout`（`GROK_SEARCH_TIMEOUT_S` 内没拿到完整回答、读取超时，或 Cloudflare 522/524）、`network`（连接、代理或 TLS 故障，消息不会为空）、`truncated_stream`（流在既没有 `finish_reason` 也没有 `[DONE]` 时关闭，会重试）、`empty_response`、`auth`（网关没有该模型可用的凭据，如 CPA `auth_not_found`，不重试）、`http_<状态码>`、`unknown`，以及上游流内透传的错误码（如 `invalid_request_error`、`model_not_found`、`server_error`、`upstream_error`）。
   - `rate_limit` + `exhausted: true` 也涵盖 CLIProxyAPI 的 503 `auth_unavailable`/“no auth available”、429 `model_cooldown`/“cooling down” 和 xAI 的 `free-usage-exhausted`，第一次就会熔断。`retry_after_s` 取自任何状态码的 Retry-After 头，或 CPA 错误帧里的 `reset_seconds`。
@@ -223,19 +227,19 @@ claude mcp list
   - 熔断器：排队等 `GROK_MAX_CONCURRENCY` 名额的调用拿到名额后会再检查一次熔断状态；半开探测名额只能由探测调用自己释放。
 - **核验层 `verification`**：检查回答里的 arXiv 号 / DOI 和 Grok 引用的 URL（`extra_sources` 的结果不检查），只看是否存在、能否访问，以及回答里写在标识符旁边的论文标题与登记标题是否一致（`title_checks`：`match` / `partial` / `possible_mismatch` / `not_stated`）。**不检查来源是否支持对应论断**，`claim_support` 固定为 `not_checked`。
   - arXiv 号包括旧式编号（如 `hep-th/9711200`）和 `10.48550/arXiv.<id>` 形式的 DOI；DOI 先查 Crossref，Crossref 返回 404 时由 doi.org 登记处判断是否存在、由 DataCite 提供标题。
-  - `unresolved`（视为可疑）：登记处答复不存在、页面返回 404/410 或其他 4xx、域名不存在（NXDOMAIN）。401/403/451 附注“拒绝自动访问，页面可能仍存在”。
-  - `lookup_failed`（结果未知，不能当作反对引用的证据）：429、5xx、超时、网络错误、登记处冷却、人机验证页、核验总时限到期；原因里写明 HTTP 状态。`summary` 中也有 `lookup_failed` 计数。返回 2xx/3xx 的人机验证页和登录墙（Reddit 的 JS 验证 “Prove your humanity”、PyPI 的 Fastly “Client Challenge”、百度“安全验证”、跳转到 `/login`）同样列入 `lookup_failed`，原因为 `bot check / interstitial (page may exist)`，不计入可访问的 URL；判定规则与 `web_fetch` 共用。
+  - `unresolved`（视为可疑）：登记处答复不存在、页面返回 404/410、域名不存在（NXDOMAIN）。
+  - `lookup_failed`（结果未知，不能当作反对引用的证据）：429、5xx、其他 4xx（401/403/451 附注“拒绝自动访问，页面可能仍存在”；400/405/406/418 等是反爬系统对脚本请求的常见答复，附注“请求被拒绝或无法理解，不说明页面是否存在”）、Cloudflare（`cf-mitigated: challenge`）与 AWS WAF（`x-amzn-waf-action: captcha|challenge`，如 NASA ADS 的 405）的人机验证、超时、网络错误、登记处冷却、核验总时限到期；原因里写明 HTTP 状态。`summary` 中也有 `lookup_failed` 计数。返回 2xx/3xx 的人机验证页和登录墙（Reddit 的 JS 验证 “Prove your humanity”、PyPI 的 Fastly “Client Challenge”、百度“安全验证”、跳转到 `/login`）同样列入 `lookup_failed`，原因为 `bot check / interstitial (page may exist)`，不计入可访问的 URL；判定规则与 `web_fetch` 共用。
   - 10.5555 前缀的 DOI（Crossref 的测试前缀，ACM DL 用它标识未注册的条目）查不到时仍列入 `unresolved`，原因附提示：请按标题核对论文。
   - `skipped`：未检查的条目及原因（超出数量上限、URL 检查已关闭、标识符检查已关闭（`GROK_VERIFY_IDS=false`）、非公网地址、非 http 链接、arxiv.org/doi.org 链接里没有可识别的编号、超过 400 字符或含 `.`/`..` 路径段的 DOI 形文本；回答里写的 DOI 模板如 `10.48550/arXiv.<id>`、`10.1145/3XXXXXX.3XXXXXX` 排在最后，最多列 20 条）。
-  - `title_checks` 只使用为该标识符写的标题：离它最近的明确标题，不会取到另一篇论文的标题；标识符位于行首时上一行也算，标识符写成标签后的 Markdown 链接时也一样（如 `- arXiv: [1706.03762](https://arxiv.org/abs/1706.03762)`）；作者-年份文字、期刊名、以冒号结尾的标签和不足 3 个词的片段不算标题。
+  - `title_checks` 只使用为该标识符写的标题：离它最近的明确标题，不会取到另一篇论文的标题；标识符位于行首（标签之后，如 `- arXiv:`、`- 正式发表会议 DOI：`）时，同一条记录的其他行也算：向上经过 `- 作者：…` 这类字段行（可隔一个空行）直到记录的标题行，向下包括紧随其后的字段行（如先写 `- arXiv: …` 再写 `- Title: …`），最多各 6 行，遇到另一篇论文的标识符或两个连续空行即止；标识符写成标签后的 Markdown 链接时也一样（如 `- arXiv: [1706.03762](https://arxiv.org/abs/1706.03762)`）；作者-年份文字、期刊名、以冒号结尾的标签和不足 3 个词的片段不算标题。
   - **精简输出（默认）**：`GROK_VERIFY_DETAIL=compact` 时 `verification` 带 `detail: "compact"`，`scope` 换成一句 112 字符的简述（`claim_support` 仍为 `not_checked`；各列表的含义见本节），只列需要关注的内容：全部 `unresolved` 与 `lookup_failed`、`match` 以外的 `title_checks`（`partial`/`possible_mismatch`/`not_stated`）、`urls_unusual`（最终状态不是 200 的可访问 URL，如 202/203 的人机验证页；只在有时出现）、前 10 条 `skipped`（其余条数见 `skipped_omitted`），以及 `timed_out`（如有）。`checked` 与 `summary` 保留全部计数（`urls_reachable`、`identifiers_found`、`title_match` 等）。精简模式下没有 `arxiv`、`doi`、`urls` 三个键（不是空列表）。`GROK_VERIFY_DETAIL=full` 恢复 v1.12.0 的完整输出。3 次实测搜索中，核验块合计从 18,756 字符降到 7,352 字符（-61%），整个 `web_search` 结果从 29,021 降到 17,617 字符（-39%）；大量引用拒绝脚本访问的站点（如 Reddit）时 `lookup_failed` 不截断，核验块仍可能较大。
 - **URL 检查会访问哪些地址**：请求前及每次重定向前先用系统解析器解析域名（含 hosts 文件与局域网名称），只要有一个地址不是公网地址就不访问并记入 `skipped`。回环、内网、链路本地、CGNAT（100.64.0.0/10）、`127.1`/`2130706433`/`0x7f.0.0.1` 这类数字写法，以及 IPv4 映射、6to4、NAT64 中内嵌的非公网地址都算在内。Clash/mihomo fake-ip 模式下本地解析只得到 198.18.0.0/15：`GROK_VERIFY_FAKE_IP=doh`（默认）时经配置的代理用 DNS-over-HTTPS 查出真实地址，同样要求全部是公网地址，再经代理访问；`skip`、`allow` 见环境变量表。重定向逐跳跟随，从不读取重定向的响应体；正文最多读取解码后的 64 KB（gzip/deflate 限量解压，其他编码不解码）。经代理得到的 502/503/504 记为 `lookup_failed`（来自代理或网站）。本地解析不了的域名记为 `unresolved`（`dns lookup failed`）。局限：检查时的解析与实际连接是两次独立解析，无法防御 DNS 重绑定；经 HTTP/SOCKS 代理请求时由代理决定真实目标（代理可能使用不同的、例如分流的 DNS）；DoH 模式会让 DoH 服务商看到被引用的域名。登记处（arXiv / Crossref / doi.org / DataCite）与 DoH 查询访问固定域名，不经过此检查。
 - **模型 `model`**：可带 CPA 思考后缀，如 `grok-4.7(high)`、`grok-4.7(8192)`、`grok-4.7(auto)`。与默认模型完全相同（含后缀）或基础名称相同时直接放行；其他模型按基础名称对照 `/models` 校验，请求时保留完整名称。列表获取失败时不拦截（`model_check.status = unverified`）。OpenRouter 地址下按次指定的模型同样会自动加 `:online`，也可以显式写 `model:online`。
   - 非对话模型按名称识别（名称中含 tts、voice、audio、speech、whisper、transcribe、image、imagine、video、embed/embedding、moderation、realtime、rerank 等独立片段），在本地以 `invalid_model` 拒绝，`model_check.reason` 为 `not_chat_model`，不会发出搜索请求（最多读取 `/models` 列表以给出建议；`/models` 不可用时同样拒绝）。例：`grok-tts` → “'grok-tts' is not a chat/search model (audio/speech model, name contains 'tts')”。
   - 相近建议只列对话模型，同系列优先，再按名称相似度排序，例如 `grok-4.8` → `grok-4.7`。无效结果的 `model_check.reason` 为 `bad_name`、`unsupported_suffix`、`not_listed` 或 `not_chat_model`。
   - 配置的默认模型（`GROK_MODEL` 或配置文件）不会被拦截，只在 `get_config_info` 的 `config_warnings` 中提示；名称恰好含上述片段的真实对话模型可以这样使用。
-  - **费用**：多智能体/高推理档位（如默认的 `grok-4.20-multi-agent-0309(high)`）每次搜索实测消耗 50 万–160 万 prompt tokens（`platform=GitHub` 时约 159 万）；`grok-4.7` 在本版的实测中每次约 1.9 万–13 万。日常查询建议用轻量模型：设为 `GROK_MODEL`，或按次传 `web_search(model="grok-4.7")`。`usage.prompt_tokens` 显示每次的实际用量；上游报告花费时（xAI，两种接口都可能有，Responses 模式实测都有）`usage.cost_usd` 直接给出美元金额：本版实测默认模型每次约 0.5–0.7 美元，`grok-4.7` 约 0.02–0.05 美元。
-- **额外信源 `extra_sources`**（0–20，超出范围由参数校验拒绝）：两个引擎都可用时 Tavily 分 ⌈n/2⌉、Firecrawl 分 ⌊n/2⌋，每个引擎多取 2 条备用；与 Grok 已引用的链接及引擎之间去重（忽略协议、`www.`、片段、末尾斜杠和跟踪参数），按轮流顺序选取；某个引擎失败或结果不足时，由另一个引擎补一次（补取数量为缺口 + 2 条余量 + 已遇到的重复条数，最多 20）。结果附在正文末尾的 "Extra sources" 小节，每条一行纯文本（标题、链接、引擎、最多 300 字符的摘要）；过程见 `extra_sources_report`。
+  - **费用**：多智能体/高推理档位（如默认的 `grok-4.20-multi-agent-0309(high)`）每次搜索实测消耗 50 万–160 万 prompt tokens（`platform=GitHub` 时约 159 万）；`grok-4.7` 在本版的实测中每次约 1.9 万–13 万。日常查询建议用轻量模型：设为 `GROK_MODEL`，或按次传 `web_search(model="grok-4.7")`。`usage.prompt_tokens` 显示每次的实际用量；上游报告花费时（xAI，两种接口都可能有，Responses 模式实测都有）`usage.cost_usd` 直接给出美元金额：实测默认模型每次约 0.5–0.9 美元（v1.13.1 的两次实测为 0.77、0.87 美元），`grok-4.7` 约 0.02–0.05 美元。
+- **额外信源 `extra_sources`**（0–20，超出范围由参数校验拒绝）：两个引擎都可用时 Tavily 分 ⌈n/2⌉、Firecrawl 分 ⌊n/2⌋，每个引擎多取 2 条备用；与 Grok 已引用的链接及引擎之间去重（忽略协议、`www.`、片段、末尾斜杠和跟踪参数；仓库主页、它的默认分支目录与根目录 README 算同一文档，目录与其 `index.html` 也是），按轮流顺序选取；某个引擎失败或结果不足时，由另一个引擎补一次（补取数量为缺口 + 2 条余量 + 已遇到的重复条数，最多 20）。结果附在正文末尾的 "Extra sources" 小节，每条一行纯文本（标题、链接、引擎、最多 300 字符的摘要）；过程见 `extra_sources_report`。
   - **按平台搜索**：指定 `platform` 且平台名已知（GitHub、GitLab、Reddit、X/Twitter、Stack Overflow、Hacker News、YouTube、arXiv、Wikipedia、知乎、B站、微博、CSDN、掘金、V2EX、Hugging Face、PyPI、npm、Medium、小红书、豆瓣、微信公众号等约 40 个），或写的是主机名（如 `docs.python.org`）时，引擎只在该平台的主域名内搜索：Tavily 用 `include_domains`，Firecrawl 在查询后加 `site:`（[文档](https://docs.firecrawl.dev/api-reference/endpoint/search)）；结果再按主机名后缀过滤（`githubhelp.com` 不算 GitHub），平台外结果被丢弃并计入 `off_platform_skipped`，补位时一并多取，因此可能少于请求数。短链/内容域名（githubusercontent.com、redd.it、youtu.be、b23.tv、weibo.cn、hf.co）只由本地过滤接受，不发给引擎（实测 Firecrawl 在 `site:github.com OR site:githubusercontent.com` 下会漏出平台外结果）。多个平台用逗号分隔（如 `"GitHub, Reddit"`）；平台名旁的其他词（如 `GitHub issues`）会追加到引擎查询。未知平台不过滤，只把平台文字追加到引擎查询。`extra_sources_report.platform` 记录 `requested`、`applied`（`domain_filter` / `query_hint` / `none`）、`domains`、`also_accepted`、`engines`、`off_platform_skipped`、`query_hint`、`unresolved`。实测 `platform="GitHub"`、`extra_sources=6`：6 条全部在 github.com。
 - **“没找到”的含义**：回答中的“本次检索未找到”只代表这次搜索没找到；需要确定结论时，直接到对应平台核实（例如用 `web_fetch` 打开仓库的 issue 搜索页）。
 
@@ -253,11 +257,13 @@ claude mcp list
 返回值（结构化字典）：
 - `session_id`: 本次查询的会话 ID
 - `content`: Grok 回答正文。没有原生引用时保留全文，只剥离信源标题下的纯链接列表；有原生引用时保留原文，只合并重复标记。回答被截断时紧接正文附一行 `[回答不完整] …` 说明，"Extra sources" 小节在其后
-- `sources_count` / `distinct_domains`: Grok 引用的信源数量 / 不同站点数（没有原生引用时，按正文中的引用标记、Markdown 链接和 URL 统计）
+- `sources_count` / `distinct_domains`: Grok 引用的信源数量 / 不同站点数（原生引用加上正文中的引用标记、Markdown 链接和 URL）
+- `consulted_sources_count`: 仅在非零时出现，上游搜索打开过但没有引用、回答也没提到的页面数（见上文“引用与‘查阅过’的页面”）
 - `extra_sources_count` / `total_sources_count`: 额外信源数量 / 两者合计
 - `incomplete` / `finish_reason` / `native_finish_reason`: 仅在上游提前结束生成时出现（`finish_reason` 为 `length` 或 `content_filter`，或 `native_finish_reason` 不是 `stop`），表示回答不完整
 - `usage`: 上游报告用量时给出 `{prompt_tokens, completion_tokens, reasoning_tokens}`，上游提供时还有 `cached_tokens`、`cost_usd`（本次计费，美元）与 `web_search_calls` / `x_search_calls`（Grok 自己发起的搜索次数）（多智能体模型每次可达 50 万–160 万 prompt tokens，见上文“费用”）
-- `search_queries`: Responses 模式下 Grok 实际使用的搜索词（最多 10 个），可用来判断“本次检索未找到”是否搜对了词
+- `search_queries`: Responses 模式下流中可见的搜索词（最多 10 个），可用来判断“本次检索未找到”是否搜对了词
+- `search_queries_partial`: `true` 表示 Grok 实际搜索次数多于列出的搜索词（`usage.web_search_calls`/`x_search_calls` 是总数）。多智能体模型的搜索大多在子智能体里进行，流中看不到：实测一次搜索计费 73 次，流中只有 5 次调用（2 次搜索、3 次打开页面）。此时不能据此判断“没找到”是否搜对了词
 - `dropped_events`: 仅在有 SSE 帧无法解码时出现
 - `error` / `error_type` / `retry_after_s` / `status` / `exhausted`: 仅失败时出现，见上文
 - `citation_positions`、`verification`、`extra_sources_report`、`model_check`：见上文，按需出现
@@ -275,16 +281,17 @@ claude mcp list
 - `sources_count`: 列表总条数（即 `web_search` 的 `total_sources_count`）
 - `cited_sources_count` / `extra_sources_count`: 其中 Grok 引用的 / 额外信源的条数
 - `sources`: 信源列表，先列 Grok 引用的（`provider: grok`），再列 `extra_sources` 的结果（`provider: tavily` / `firecrawl`，Grok 并未引用）。每项包含 `url`，可能包含 `title`/`description`/`provider`/`citations`。`citations` 中的 `start_index`/`end_index` 是对 `web_search` 返回正文的 Unicode 码点偏移；额外信源的 `description` 是折叠空白后最多 500 字符的摘要（截断时以 `…` 结尾），全文请用 `web_fetch`
+- `consulted` / `consulted_sources_count`: 仅在有时出现。上游搜索打开过但没有引用、回答也没提到的页面（最多列 100 条，计数是全部）；它们不是任何论断的来源，常与回答无关
 
 ### `web_fetch` — 网页内容抓取
 
 获取网页内容（Markdown）或原样获取文本文件。按 URL 类型选择后端：
 
-- **文本/代码文件**：raw.githubusercontent.com、gist.githubusercontent.com、GitHub/GitLab/Codeberg/Bitbucket 的文件页（如 `github.com/<o>/<r>/blob/<ref>/<path>`，改读对应的 raw 地址）、`/raw/` 链接，以及以代码/配置/文本扩展名结尾的 URL（`.py` `.h` `.c` `.rs` `.go` `.js` `.ts` `.toml` `.yaml` `.json` `.md` `.txt` `.csv` `.xml` `.sql` `.lock` 等）由本机直接下载（不会重复抓取），逐字节原样返回（`source=direct`，首行带 `content_type=` 与 `status=`，文件页改写为 raw 时带 `final_url=`）。只接受 `text/*`（HTML 除外）与 JSON/XML/YAML/TOML/JS 类型。直连下载在你的机器上运行：请求前及每次重定向前都经过与核验层相同的地址检查（只访问公网地址；fake-ip 环境按 `GROK_VERIFY_FAKE_IP`/`GROK_VERIFY_DOH_URL` 处理），解压后最多 5 MB，超时 30 秒，不发送任何 API Key。源站会看到你的 IP，`GROK_FETCH_DIRECT=false` 可关闭。直连失败或关闭时，Firecrawl（优先）和 Tavily 读取 raw 地址；明显损坏的代码（换行被合并、缩进丢失、`_` 被转义为 `\_`、`#include <…>` 的目标被删）标记 `warning=degraded_code degraded=<原因>`，不应引用。返回 HTML 的地址按普通网页抓取。只靠扩展名判断的 URL（如 `bundlephobia.com/package/chart.js`）无法直连（代理、下载失败、`GROK_FETCH_DIRECT=false`）时按网页读取，先用 Tavily：短于 `GROK_FETCH_MIN_CHARS` 的结果会再试 Firecrawl（多一次调用），由其内容类型决定它是文件（此时优先采用 Firecrawl 原样返回的 text/plain 副本，Tavily 的副本也会检查是否损坏）还是网页；更长且 Markdown 链接很少的结果按文件采用，并检查是否损坏。GitHub raw CDN 对分支地址缓存约 5 分钟（`cache-control: max-age=300`），刚推送后可能仍是旧内容；固定到提交的地址总是准确的。
+- **文本/代码文件**：raw.githubusercontent.com、gist.githubusercontent.com、GitHub/GitLab/Codeberg/Bitbucket 的文件页（如 `github.com/<o>/<r>/blob/<ref>/<path>`，改读对应的 raw 地址）、`/raw/` 链接，以及以代码/配置/文本扩展名结尾的 URL（`.py` `.h` `.c` `.rs` `.go` `.js` `.ts` `.toml` `.yaml` `.json` `.md` `.txt` `.csv` `.xml` `.sql` `.lock` 等）由本机直接下载（不会重复抓取），逐字节原样返回（`source=direct`，首行带 `content_type=` 与 `status=`，文件页改写为 raw 时带 `final_url=`）。只接受 `text/*`（HTML 除外）与 JSON/XML/YAML/TOML/JS 类型。直连下载在你的机器上运行：请求前及每次重定向前都经过与核验层相同的地址检查（只访问公网地址；fake-ip 环境按 `GROK_VERIFY_FAKE_IP`/`GROK_VERIFY_DOH_URL` 处理），解压后最多 5 MB，超时 30 秒，不发送任何 API Key。源站会看到你的 IP，`GROK_FETCH_DIRECT=false` 可关闭。直连失败或关闭时，Firecrawl（优先）和 Tavily 读取 raw 地址；明显损坏的代码（换行被合并、缩进丢失、`_` 被转义为 `\_`、`#include <…>` 的目标被删）标记 `warning=degraded_code degraded=<原因>`，不应引用。返回 HTML 的地址按普通网页抓取。只靠扩展名判断的 URL（如 `bundlephobia.com/package/chart.js`）无法直连（代理、下载失败、`GROK_FETCH_DIRECT=false`）时按网页读取，先用 Firecrawl：由其内容类型决定它是文件（原样返回，任何长度都完整，并检查是否损坏）还是网页；Firecrawl 失败时用 Tavily，更长且 Markdown 链接很少的副本按文件采用并检查是否损坏（`GROK_FETCH_PAGE_FIRST=tavily` 时先用 Tavily，短结果再试 Firecrawl）。源站本身已答复 404 或 410 时不再调用任何提取服务（它们读取同一地址，只会得到同样的结果）：首行 `error=fetch_failed attempts=direct:extract_failed page_status=404`。GitHub raw CDN 对分支地址缓存约 5 分钟（`cache-control: max-age=300`），刚推送后可能仍是旧内容；固定到提交的地址总是准确的。
 - **arXiv 摘要页**：走 arXiv API，带版本号的链接（如 `/abs/1706.03762v1`）返回该版本，front matter 中有 `version: v1`（未指定版本时为 `vN (latest)`）。arXiv API 不可用时，用 DataCite 对 `10.48550/arXiv.<id>` 的记录生成摘要页（`source=datacite`，免费：标题、全部作者、摘要、分类、备注、首末提交日期；只有最新版本，指定了其他版本时跳过），再依次 Firecrawl、Tavily，不适用长度门槛，不会重复抓取。
-- **其他网页**：Tavily Extract；结果缺失、短于 `GROK_FETCH_MIN_CHARS` 或是人机验证页时再用 Firecrawl Scrape。
+- **其他网页**：Firecrawl Scrape 现抓；Firecrawl 失败、遇到人机验证页，或结果短于 `GROK_FETCH_MIN_CHARS` 而 Tavily 的副本至少长一倍时，用 Tavily Extract。Firecrawl 现抓时源站答复 404/410、最后用了 Tavily 的副本时，另有一行提示该页面现在很可能已不存在。`GROK_FETCH_PAGE_FIRST=tavily`（或没有 Firecrawl key）时先用 Tavily，结果缺失、过短或是人机验证页时再用 Firecrawl。网页副本中的 Markdown 图片标记默认被去掉（`GROK_FETCH_STRIP_IMAGES`，首行 `images_stripped=N`），文件内容从不改动。
 
-**新鲜度**：Firecrawl 按 `GROK_FETCH_MAX_AGE_S` 发送 `maxAge`（默认 `0`：总是现抓；不设时 Firecrawl 默认最多返回 2 天前的缓存，见 [文档](https://docs.firecrawl.dev/features/fast-scraping)）。首行的 `cache=` 是后端的缓存状态：`hit`/`miss` 是 Firecrawl 报告的 `cacheState`（命中时带 `cached_at=`），`bypassed` 表示 `maxAge=0` 现抓，`possible` 表示 Tavily（按 URL 缓存，Extract API 没有新鲜度参数，见 [文档](https://docs.tavily.com/documentation/api-reference/endpoint/extract)，近期改动的页面可能是旧内容）。`cached=true` 另指本服务的分页快照。
+**新鲜度**：Firecrawl 按 `GROK_FETCH_MAX_AGE_S` 发送 `maxAge`（默认 `0`：总是现抓；不设时 Firecrawl 默认最多返回 2 天前的缓存，见 [文档](https://docs.firecrawl.dev/features/fast-scraping)）。首行的 `cache=` 是后端的缓存状态：`hit`/`miss` 是 Firecrawl 报告的 `cacheState`（命中时带 `cached_at=`），`bypassed` 表示 `maxAge=0` 现抓，`possible` 表示 Tavily（按 URL 缓存，Extract API 没有新鲜度参数，见 [文档](https://docs.tavily.com/documentation/api-reference/endpoint/extract)，近期改动的页面可能是旧内容；2026-10-17 实测它的 python.org/downloads 副本在 3.15.0 发布 8 天后仍写着最新版是 3.14.8），此时第二行另有 `注意: 这是 Tavily 的缓存副本…` 提示，版本号、日期、价格等时效性信息不要只凭此页确认。`cached=true` 另指本服务的分页快照。
 
 云端后端访问不到你的机器或局域网，因此调用前先在本地拒绝这类 URL：没有 http(s) 协议、没有主机名、`localhost`/`*.localhost`，以及回环/内网/链路本地/CGNAT 的 IP 字面量。结果为 `[web_fetch] error=invalid_url reason=<malformed|missing_scheme|unsupported_scheme|missing_host|local_address>`，不调用任何后端；此检查不解析域名。
 
@@ -330,18 +337,18 @@ Firecrawl 被重定向时首行出现 `final_url` 与 `title`（`title` 总在�
 无需参数。显示所有配置状态（含 Tavily/Firecrawl 实际是否启用）、测试 Grok API 连接、返回响应时间和可用模型列表（API Key 自动脱敏），并刷新 `web_search(model=...)` 校验用的模型列表缓存。本地代理环境错误（如 `NO_PROXY` 中的 `[::1]`）会单独标为“本地代理环境错误”。
 
 - `GROK_MODEL_SOURCE` 为 `env` | `switch_model` | `config` | `default`，`GROK_MODEL_NOTE` 说明 `switch_model` 的选择能保持多久。
-- 还会列出 `GROK_CONFIG_FILE`、`GROK_LOG_RETENTION_DAYS`、`GROK_RETRY_MULTIPLIER`、`GROK_RETRY_MAX_WAIT`、`GROK_API_MODE`、`GROK_READ_TIMEOUT_S`、`GROK_SEARCH_TIMEOUT_S`、各项 `GROK_VERIFY_*`（含 `GROK_VERIFY_FAKE_IP`、`GROK_VERIFY_DOH_URL`、`GROK_VERIFY_DETAIL`）、`GROK_FETCH_*`（含 `GROK_FETCH_DIRECT`、`GROK_FETCH_MAX_AGE_S`）与 `GROK_MAP_REGEX_TIMEOUT_S`；`config_warnings` 列出无法识别的环境变量值以及配置文件、日志目录的问题。
+- 还会列出 `GROK_CONFIG_FILE`、`GROK_LOG_RETENTION_DAYS`、`GROK_RETRY_MULTIPLIER`、`GROK_RETRY_MAX_WAIT`、`GROK_API_MODE`、`GROK_READ_TIMEOUT_S`、`GROK_SEARCH_TIMEOUT_S`、各项 `GROK_VERIFY_*`（含 `GROK_VERIFY_FAKE_IP`、`GROK_VERIFY_DOH_URL`、`GROK_VERIFY_DETAIL`）、`GROK_TOOL_PREFIX`、`GROK_FETCH_*`（含 `GROK_FETCH_PAGE_FIRST`、`GROK_FETCH_STRIP_IMAGES`、`GROK_FETCH_DIRECT`、`GROK_FETCH_MAX_AGE_S`）与 `GROK_MAP_REGEX_TIMEOUT_S`；`config_warnings` 列出无法识别的环境变量值以及配置文件、日志目录的问题。
 - API Key 最多显示四分之一（不足 24 个字符时最多显示末 4 位）；URL 中的凭据（用户信息、查询参数值）显示为 `***`。
-- `connection_test` 中的 `available_models` 不变，另有 `chat_models`（`web_search`/`switch_model` 接受的模型）与 `non_chat_models`（按名称识别的 TTS/语音/音频、图像/视频生成、嵌入、审核、实时、重排模型，总是被拒绝）。`GROK_MODEL` 本身像非对话模型时，`config_warnings` 会给出提示。
+- `connection_test` 中的 `available_models` 不变，另有 `chat_models`（`web_search`/`switch_model` 接受的模型）与 `non_chat_models`（按名称识别的 TTS/语音/音频、图像/视频生成、嵌入、审核、实时、重排模型，总是被拒绝）。`GROK_MODEL` 本身像非对话模型时，`config_warnings` 会给出提示；`connection_test.current_model_listed` 表示 `GROK_MODEL`（按基础名称）是否在 `/models` 列表里，不在时（例如设成了网关没有的模型，或没设 `GROK_MODEL` 时网关不提供内置默认值）`config_warnings` 会提示并给出相近的对话模型。
 - 连接测试遇到传输错误（连接重置或拒绝、代理隧道关闭）时重试一次（`retried_after`/`attempts`）；空错误信息会写成 `proxy tunnel closed or upstream unreachable (ConnectError)`；Cloudflare 错误页只给出名称。
 
 ### `switch_model` — 模型切换
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| `model` | string | ✅ | 模型 ID（如 `"grok-4-fast"`, `"grok-2-latest"`） |
+| `model` | string | ✅ | 模型 ID（如 `"grok-4.7"`, `"grok-4.20-multi-agent-0309(high)"`） |
 
-- 名称会去掉首尾空白，并像 `web_search(model=...)` 一样对照 `/models` 校验：允许 `(high)` 这类思考后缀；空名、超过 200 个字符、不在列表中的名称以及非对话模型（如 `grok-tts`，即使 `/models` 不可达）会被拒绝并给出相近的对话模型建议，不做任何修改。`/models` 不可达时其他名称照常切换，但附警告（未校验）。
+- 名称会去掉首尾空白，并像 `web_search(model=...)` 一样对照 `/models` 校验：允许 `(high)` 这类思考后缀；空名、超过 200 个字符、不在列表中的名称以及非对话模型（如 `grok-tts`，即使 `/models` 不可达）会被拒绝并给出相近的对话模型建议，不做任何修改。后缀无法识别且模型名也不在列表中时（如 `grok-99-fake(ultra)`），两个问题一次报出。`/models` 不可达时其他名称照常切换，但附警告（未校验）。
 - 切换到当前已在使用的模型不做任何修改：返回 `already_active: true`，不写 `config.json`，`GROK_MODEL_SOURCE` 保持不变（例如仍为 `env`）。切回 `GROK_MODEL` 的值时来源恢复为 `env`，不再有 `GROK_MODEL_NOTE` 和警告。
 - 选择保存到 `~/.config/grok-search/config.json`；该目录不可写时改存私有临时目录（重启后不保留，并给出警告）。
 - 若 MCP 配置的 `env` 中设置了 `GROK_MODEL`，它优先：切换只对当前进程有效，重启后仍以 `GROK_MODEL` 为准。要永久更换模型，请修改 `GROK_MODEL`。
@@ -353,7 +360,7 @@ Firecrawl 被重定向时首行出现 `final_url` 与 `title`（`title` 总在�
 | `action` | string | ❌ | `"status"` | `"on"`（别名 `"block"`）禁用官方工具 / `"off"`（别名 `"allow"`）恢复官方工具 / `"status"` 查看状态；其他值（包括有歧义的 `enable`/`disable`）会被拒绝 |
 | `project_dir` | string | ❌ | `""` | 项目根目录；不传时按下述顺序确定 |
 
-修改 `<项目目录>/.claude/settings.json` 的 `permissions.deny`，一键禁用 Claude Code 官方的 WebSearch 和 WebFetch。项目目录依次取：`project_dir` 参数 → 环境变量 `CLAUDE_PROJECT_DIR` → 从服务进程当前目录向上找到的、含 `.git` 或 `.claude` 的最近目录（不会取到用户主目录或文件系统根目录）。都找不到时不写任何文件，并提示传入 `project_dir`；配置文件无法解析时也不会覆盖。
+修改 `<项目目录>/.claude/settings.json` 的 `permissions.deny`，一键禁用 Claude Code 官方的 WebSearch 和 WebFetch。项目目录依次取：`project_dir` 参数 → 环境变量 `CLAUDE_PROJECT_DIR` → 从服务进程当前目录向上找到的、含 `.git` 或 `.claude` 的最近目录 → 服务进程的当前目录本身（Claude Code 在项目目录中启动 MCP 服务器；此时 `project_dir_source` 为 `working_directory` 并附提示）。用户主目录（它的 `.claude/settings.json` 是作用于所有项目的用户级设置）和文件系统根目录无论来自哪里都会被拒绝，不写任何文件；配置文件无法解析时也不会覆盖。
 
 `.claude/settings.local.json` 与 `~/.claude/settings.json` 中的拒绝规则只读取、不修改，列在 `denied_elsewhere`，合并后的结果见 `effective`；执行 `off` 时如果这些文件仍屏蔽着工具会给出提示。指向项目之外的 `.claude` 目录或设置文件符号链接会被拒绝；写入采用原子替换；只读的 `settings.json` 不会被修改。（旧版未写入文档的 `disable` 实际会恢复官方工具，现在会被拒绝。）
 
@@ -368,7 +375,7 @@ Firecrawl 被重定向时首行出现 `final_url` 与 `title`（`title` 总在�
 <summary>
 Q: 必须同时配置 Grok 和 Tavily 吗？
 </summary>
-A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：配置 Tavily 后 `web_fetch` 对普通网页优先使用 Tavily Extract，失败时降级到 Firecrawl Scrape；文本/代码文件由本机直连下载，不需要这两个服务（直连失败时才用它们）；两者均未配置时其他页面的 `web_fetch` 返回配置错误提示。`web_map` 依赖 Tavily。设置 `TAVILY_ENABLED=false` 可以在保留 key 的情况下停用 Tavily：此时 `web_fetch` 只用 Firecrawl，`web_map` 不可用，`extra_sources` 只走 Firecrawl。
+A: Grok（`GROK_API_URL` + `GROK_API_KEY`）为必填，提供核心搜索能力。Tavily 和 Firecrawl 均为可选：两者都配置时 `web_fetch` 对普通网页先用 Firecrawl 现抓，失败时改用 Tavily 的缓存副本（`GROK_FETCH_PAGE_FIRST=tavily` 时反过来）；只配置其中一个时就只用它；文本/代码文件由本机直连下载，不需要这两个服务（直连失败时才用它们）；两者均未配置时其他页面的 `web_fetch` 返回配置错误提示。`web_map` 依赖 Tavily。设置 `TAVILY_ENABLED=false` 可以在保留 key 的情况下停用 Tavily：此时 `web_fetch` 只用 Firecrawl，`web_map` 不可用，`extra_sources` 只走 Firecrawl。
 </details>
 
 <details>
@@ -420,6 +427,38 @@ A: 在 Claude 对话中说"显示 grok-search 配置信息"，将自动测试 AP
 </div>
 
 ## 变更记录
+
+### v1.13.1（2026-10-17）
+
+按一份实测报告修复；所有问题先在 `grok-4.20-multi-agent-0309(high)`（Responses 模式）下复核，2026-10-17 的两次搜索录制为测试数据（`tests/fixtures/responses_multi_agent.sse`）。
+
+**web_search**
+
+- 修复：上游只是“查阅过”的页面不再算作引用。Responses API 把搜索打开过的每个页面都作为偏移 0/0、标题为 URL 的 `url_citation` 发来；grok-4.7 的一次查询因此报 `sources_count: 77`（61 条是这种页面，大多与回答无关），一个没有任何引用的回答报 40 个来源、27 个域名。现在空区间、无编号、回答也没提到的注解只计入新的 `consulted_sources_count`（`get_sources` 的 `consulted` 列出，最多 100 条），不计数、不核验；标题等于 URL 时不再当作标题。
+- 修复：回答里写出的链接都算引用。有原生引用时，正文中没有对应注解的 Markdown 链接和 URL 以前既不计数也不核验（多智能体模型的实测回答写了 python.org 的发布页地址却从未检查）；现在计入 `sources_count`，核验时按在回答中出现的顺序先检查它们，30 个 URL 的名额不再被无关页面占满。
+- 修复：偏移对不上、回答又没有 `[[n]]` 标记时（模型写普通 Markdown 链接），引用重新定位到同一页面的 Markdown 链接或 URL，不再全部 `removed`。
+- 修复：`search_queries` 不完整时标出 `search_queries_partial: true`。多智能体模型的搜索大多在子智能体里进行：实测计费 73 次（`usage.web_search_calls`），流中只有 5 次调用（2 次搜索、3 次打开页面），以前只列出 2 个搜索词且没有任何提示。
+
+**核验层**
+
+- 修复：只有 404/410（和不存在的域名）判为 `unresolved`。其他 4xx 是反爬系统对脚本请求的常见答复（NASA ADS 对任何 User-Agent 都返回 405 和 AWS WAF 验证码），改列 `lookup_failed`；`x-amzn-waf-action: captcha|challenge` 与 Cloudflare 的 `cf-mitigated: challenge` 一样识别为人机验证，2xx 的验证页（AWS WAF 用 202）也不再算可访问。
+- 修复：标题检查读取整条记录。标识符在行首（标签之后）时，向上经过字段行、隔一个空行直到记录的标题行，向下包括紧随的字段行。实测回答“**BERT** / 空行 / - arXiv 编号… / - 完整英文标题… / - 正式发表会议 DOI：10.18653/v1/N19-1423”中，这个 DOI 以前是 `not_stated`，现在 4 个标识符全部 `match`。
+
+**web_fetch**
+
+- 修复：普通网页默认先用 Firecrawl 现抓（新设置 `GROK_FETCH_PAGE_FIRST`，默认 `firecrawl`）。Tavily 没有新鲜度控制：2026-10-17 它的 python.org/downloads 副本仍写着最新版是 3.14.8、3.15 是“计划中的预发布版”，而 3.15.0 已于 10-09 发布，Firecrawl 现抓的页面写的是 3.15.0。Tavily 只在 Firecrawl 失败、遇到人机验证或结果过短（且 Tavily 的副本至少长一倍）时使用，结果第二行附“这是 Tavily 的缓存副本…”提示；Firecrawl 现抓得到 404/410 而用了 Tavily 副本时另有提示。`GROK_FETCH_PAGE_FIRST=tavily` 恢复旧顺序（更快、省 Firecrawl 额度）。注意：默认顺序下每次抓取普通网页都会消耗 1 个 Firecrawl credit。
+- 修复：源站已答复 404/410 时不再调用 Tavily 和 Firecrawl（报告中 GitHub 直连 404 之后两者各被调用一次，结果也都是 404）。
+- 网页副本去掉 Markdown 图片标记（新设置 `GROK_FETCH_STRIP_IMAGES`，默认开启，首行 `images_stripped=N`）：带链接的图片保留链接，其他图片保留 alt 文本，文件内容从不改动。pypi.org/project/fastapi 的 Tavily 副本 85,329 字符中有 397 个图片（34,852 字符）。
+
+**其他**
+
+- `extra_sources` 去重时，仓库主页、默认分支目录与根目录 README 算同一文档，目录与 `index.html` 也是。
+- `switch_model`：后缀无法识别且模型不存在时（如 `grok-99-fake(ultra)`）两个问题一次报出，附相近模型。
+- 内置默认模型改为 `grok-4.20-multi-agent-0309(high)`（多智能体模型，推理强度 high）。以前的 `grok-4-fast` 不在 CLIProxyAPI 的 `/models` 列表里，没设 `GROK_MODEL` 时搜索会失败；新默认值每次搜索约 50 万–160 万 prompt tokens、0.5–0.9 美元，日常查询可设 `GROK_MODEL=grok-4.7` 或按次传 `model`。不支持 `(high)` 这类思考后缀的网关请设置 `GROK_MODEL`。
+- `get_config_info`：`GROK_MODEL`（或内置默认值）不在网关的 `/models` 列表时给出警告与相近模型，`connection_test.current_model_listed` 给出结果。
+- `toggle_builtin_tools`：找不到 `CLAUDE_PROJECT_DIR` 和 `.git`/`.claude` 时改用服务进程的当前目录（`project_dir_source: working_directory`，附提示），不再直接报错；用户主目录无论来自参数、环境变量还是当前目录都会被拒绝（以前显式传入只给警告，`on` 会改动作用于所有项目的 `~/.claude/settings.json`）。
+- 新设置 `GROK_TOOL_PREFIX`：给所有工具名加前缀，供不区分 MCP 命名空间的客户端使用（AstrBot 遇到同名工具只保留一个，内置的 `web_search` 与本服务的会互相覆盖：[AstrBot#5689](https://github.com/AstrBotDevs/AstrBot/issues/5689)）。Claude Code 不需要设置。
+- 工具元数据版本：`web_search` 2.5.0、`get_sources` 1.2.0、`web_fetch` 1.8.0、`get_config_info` 1.8.0、`switch_model` 1.7.0、`toggle_builtin_tools` 1.6.0。版本号 1.13.1；安装说明中的固定版本改为 `@v1.13.1`。
 
 ### v1.13.0（2026-10-17）
 

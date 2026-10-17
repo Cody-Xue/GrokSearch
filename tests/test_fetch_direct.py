@@ -75,6 +75,9 @@ def _isolated(monkeypatch):
     monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0.0)
     for name in ("GROK_FETCH_DIRECT", "GROK_FETCH_MAX_AGE_S", "GROK_VERIFY_FAKE_IP", "TAVILY_ENABLED"):
         monkeypatch.delenv(name, raising=False)
+    # The Tavily-first page order (GROK_FETCH_PAGE_FIRST=tavily); test_fetch_live.py covers the default.
+    monkeypatch.setenv("GROK_FETCH_PAGE_FIRST", "tavily")
+    monkeypatch.setenv("GROK_FETCH_STRIP_IMAGES", "false")  # page texts are compared as the backends sent them
 
 
 @pytest.fixture
@@ -422,9 +425,9 @@ async def test_html_answer_falls_back_to_the_page_extractors(monkeypatch, dns):
     tavily, firecrawl = extractors(monkeypatch, tavily="rendered docs " * 300)
     out = await fetching.fetch_page("https://docs.example.test/guide/intro.md")
     lines, _ = split(out)
-    # A page that answered as a page is not worth a note once the extractors read it.
+    # A page that answered as a page is not worth a note once the extractors read it (Tavily's cache note stays).
     assert lines == [f"[web_fetch] source=tavily total_chars={len('rendered docs ' * 300)} offset=0 returned={len('rendered docs ' * 300)} "
-                     "truncated=false cache=possible"]
+                     "truncated=false cache=possible", fetching.TAVILY_CACHE_NOTE]
     tavily.assert_awaited_once_with("https://docs.example.test/guide/intro.md")
     assert firecrawl.await_count == 0
     # When the extractors fail too, the direct answer is part of the failure message.
@@ -452,11 +455,12 @@ async def test_missing_file_is_reported_with_its_status(monkeypatch, dns):
         return httpx.Response(404, text="404: Not Found", headers={"content-type": "text/plain"})
 
     serve(monkeypatch, handler)
-    extractors(monkeypatch)
-    monkeypatch.setattr(fetching, "_call_firecrawl_scrape", AsyncMock(side_effect=fetching.PageStatusError("firecrawl", 404)))
+    tavily, firecrawl = extractors(monkeypatch)
     out = await fetching.fetch_page("https://raw.githubusercontent.com/o/r/main/gone.py")
-    assert out.startswith("[web_fetch] error=fetch_failed attempts=direct:extract_failed,firecrawl:extract_failed,tavily:empty_content page_status=404")
+    # The origin said the file does not exist: the extractors, which would read the same URL, are not billed.
+    assert out.startswith("[web_fetch] error=fetch_failed attempts=direct:extract_failed page_status=404\n\n源站答复 HTTP 404")
     assert "- direct: extract_failed (HTTP 404) — target page answered HTTP 404" in out
+    assert tavily.await_count == firecrawl.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -473,7 +477,8 @@ async def test_damaged_tavily_copy_of_code_is_flagged(monkeypatch, dns):
     assert "attempts=direct:network,firecrawl:empty_content,tavily:degraded" in lines[0]
     assert lines[0].endswith("warning=degraded_code degraded=escaped_underscores,include_target_stripped")
     assert lines[1].startswith("注意: 这是提取服务把源代码/文本文件当网页转换后的结果") and "下划线被转义" in lines[1]
-    assert lines[2].startswith("- direct: network — ") and lines[3] == "- firecrawl: empty_content — no content"
+    assert lines[2] == fetching.TAVILY_CACHE_NOTE
+    assert lines[3].startswith("- direct: network — ") and lines[4] == "- firecrawl: empty_content — no content"
     assert firecrawl.await_args.args[0] == RAW and tavily.await_args.args[0] == RAW
 
 
@@ -612,8 +617,8 @@ async def test_reddit_bot_check_from_tavily_is_flagged_and_firecrawl_403_is_not_
     lines, body = split(out)
     assert body == REDDIT_TAVILY
     assert lines[0].endswith("cache=possible attempts=tavily:interstitial,firecrawl:unsupported_site warning=interstitial")
-    assert lines[1].startswith("注意: 这很可能不是请求页面的正文")
-    assert lines[2].startswith("- firecrawl: unsupported_site (HTTP 403) — We apologize for the inconvenience but we do not support this site")
+    assert lines[1].startswith("注意: 这很可能不是请求页面的正文") and lines[2] == fetching.TAVILY_CACHE_NOTE
+    assert lines[3].startswith("- firecrawl: unsupported_site (HTTP 403) — We apologize for the inconvenience but we do not support this site")
     assert "auth" not in out
 
 
@@ -742,7 +747,7 @@ async def test_an_html_error_page_for_a_js_url_is_read_as_a_page_without_a_code_
     out = await fetching.fetch_page("https://www.npmjs.com/package/chart.js")
     lines, body = split(out)
     assert body == NPM_PAGE and lines[0].startswith("[web_fetch] source=firecrawl")
-    assert "degraded" not in out and "注意" not in out and "direct" not in lines[0]
+    assert "degraded" not in out and "注意: 这是提取服务" not in out and "direct" not in lines[0]
     assert "attempts=tavily:extract_failed,firecrawl:ok" in lines[0]
     assert firecrawl.await_args.args[0] == "https://www.npmjs.com/package/chart.js"
 
@@ -782,7 +787,7 @@ async def test_a_page_with_a_code_like_url_is_read_by_tavily_alone(monkeypatch, 
     out = await fetching.fetch_page(WIKI_NODE)
     lines, body = split(out)
     assert body == WIKI_PAGE and lines[0].startswith("[web_fetch] source=tavily")
-    assert "degraded" not in out and "注意" not in out
+    assert "degraded" not in out and "注意: 这是提取服务" not in out
     assert tavily.await_args.args[0] == WIKI_NODE and firecrawl.await_count == 0
     assert hits == ([] if setup != "timeout" else [WIKI_NODE])
 
@@ -800,7 +805,7 @@ async def test_firecrawl_html_for_a_code_like_url_is_never_flagged_as_damaged_co
     out = await fetching.fetch_page(WIKI_NODE)
     lines, body = split(out)
     assert body == NPM_PAGE and lines[0].startswith("[web_fetch] source=firecrawl")
-    assert "degraded" not in out and "注意" not in out and f"tavily:short({len(flat)}),firecrawl:ok" in lines[0]
+    assert "degraded" not in out and "注意: 这是提取服务" not in out and f"tavily:short({len(flat)}),firecrawl:ok" in lines[0]
     firecrawl.assert_awaited_once()
     # A longer flat copy is kept as a page would be, without a code warning.
     long_flat = flat * 3
@@ -946,7 +951,7 @@ async def test_a_collapsed_short_copy_of_a_code_file_goes_on_to_firecrawl(monkey
         assert "warning=degraded_code degraded=" + ",".join(damage) in lines[0]
         assert lines[1].startswith("注意: 这是提取服务把源代码/文本文件当网页转换后的结果")
     else:
-        assert "degraded" not in lines[0] and "注意" not in "\n".join(lines)
+        assert "degraded" not in lines[0] and lines[1:] == [fetching.TAVILY_CACHE_NOTE, "- firecrawl: empty_content — no content"]
 
 
 @pytest.mark.asyncio

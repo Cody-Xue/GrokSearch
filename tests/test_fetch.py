@@ -10,6 +10,14 @@ from grok_search import fetching, server, verify
 
 
 @pytest.fixture(autouse=True)
+def _cached_page_order(monkeypatch):
+    # These tests describe the Tavily-first page order (GROK_FETCH_PAGE_FIRST=tavily, and every setup without a
+    # Firecrawl key); test_fetch_live.py covers the default, Firecrawl's live scrape first.
+    monkeypatch.setenv("GROK_FETCH_PAGE_FIRST", "tavily")
+    monkeypatch.setenv("GROK_FETCH_STRIP_IMAGES", "false")  # page texts are compared as the backends sent them
+
+
+@pytest.fixture(autouse=True)
 def _fast_arxiv(monkeypatch):
     monkeypatch.setattr(verify, "ARXIV_MIN_INTERVAL_S", 0.0)
     monkeypatch.setattr(verify, "ARXIV_RETRY_DELAY_S", 0.0)
@@ -376,9 +384,10 @@ async def test_firecrawl_error_page_never_replaces_a_short_tavily_extract(monkey
         "markdown": blocked, "metadata": {"statusCode": 403, "error": "Forbidden"}}}))
     out = await fetching.fetch_page("https://example.test/release-notes")
     header, body = out.split("\n\n", 1)
-    first, detail = header.split("\n")
+    first, note, detail = header.split("\n")
     assert first.startswith(f"[web_fetch] source=tavily total_chars={len(valid)}")
     assert first.endswith(f"attempts=tavily:short({len(valid)}),firecrawl:extract_failed")
+    assert note == fetching.TAVILY_CACHE_NOTE
     assert detail == "- firecrawl: extract_failed (HTTP 403) — target page answered HTTP 403 (Forbidden)"
     assert body == valid
 
@@ -421,7 +430,8 @@ async def test_interstitial_never_replaces_a_short_tavily_extract(monkeypatch):
     out = await fetching.fetch_page("https://example.test/page")
     header, body = out.split("\n\n", 1)
     assert header.startswith("[web_fetch] source=tavily") and body == short
-    assert header.endswith(f"attempts=tavily:short({len(short)}),firecrawl:interstitial")
+    assert header.split("\n") == [header.split("\n")[0], fetching.TAVILY_CACHE_NOTE]
+    assert header.split("\n")[0].endswith(f"attempts=tavily:short({len(short)}),firecrawl:interstitial")
     assert "warning=" not in header
 
 

@@ -15,27 +15,27 @@ try:
     from grok_search.providers.grok import GrokResponse, GrokSearchProvider, GrokUpstreamError
     from grok_search.logger import log_info, log_error, logger
     from grok_search.config import config, mask_url
-    from grok_search.sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
+    from grok_search.sources import SourcesCache, consulted_identities, document_identity, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
     from grok_search.planning import engine as planning_engine, _split_csv
     from grok_search.throttle import breaker, BreakerOpen
     from grok_search.verify import compact_verification, verify_answer
     from grok_search.fetching import fetch_page, url_problem
     from grok_search.citations import normalize_citations
     from grok_search.errors import ProviderError, classify_exception, redact, sanitize_no_proxy_env, summarize_error_body
-    from grok_search.models import ModelListCache, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base
+    from grok_search.models import ModelListCache, base_is_listed, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base, suggest_models
     from grok_search.platforms import resolve_platform
 except ImportError:
     from .providers.grok import GrokResponse, GrokSearchProvider, GrokUpstreamError
     from .logger import log_info, log_error, logger
     from .config import config, mask_url
-    from .sources import SourcesCache, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
+    from .sources import SourcesCache, consulted_identities, document_identity, merge_sources, new_session_id, sources_from_annotations, sources_from_text, split_answer_and_sources, url_identity as _url_identity
     from .planning import engine as planning_engine, _split_csv
     from .throttle import breaker, BreakerOpen
     from .verify import compact_verification, verify_answer
     from .fetching import fetch_page, url_problem
     from .citations import normalize_citations
     from .errors import ProviderError, classify_exception, redact, sanitize_no_proxy_env, summarize_error_body
-    from .models import ModelListCache, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base
+    from .models import ModelListCache, base_is_listed, check_model, model_kind, model_name_problem, non_chat_kind, remember_capabilities, routing_base, suggest_models
     from .platforms import resolve_platform
 
 import asyncio
@@ -56,7 +56,7 @@ def _package_version() -> str:
         from importlib.metadata import version as _version
         return _version("grok-search")
     except Exception:
-        return "1.13.0"
+        return "1.13.1"
 
 
 mcp = FastMCP("grok-search", version=_package_version())
@@ -66,6 +66,25 @@ mcp = FastMCP("grok-search", version=_package_version())
 # of searches is executed in parallel instead of one after another.
 _READ_ONLY_WEB = {"readOnlyHint": True, "openWorldHint": True}
 _READ_ONLY_LOCAL = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
+
+# GROK_TOOL_PREFIX (read once, at start) goes before every tool name, for clients that do not namespace MCP
+# tools and merge tools of the same name (AstrBot replaces its own web_search with this server's, or the other
+# way round: https://github.com/AstrBotDevs/AstrBot/issues/5689). The descriptions then say so.
+_TOOL_PREFIX = config.tool_prefix
+_TOOL_NAMES = ("web_search", "get_sources", "web_fetch", "web_map", "get_config_info", "switch_model", "toggle_builtin_tools")
+
+
+def _tool_name(name: str) -> str:
+    return _TOOL_PREFIX + name
+
+
+def _tool_description(text: str) -> str:
+    if not _TOOL_PREFIX:
+        return text
+    names = ", ".join(_tool_name(name) for name in _TOOL_NAMES)
+    return text.rstrip() + (f"\n\n    Tool names carry the prefix '{_TOOL_PREFIX}' (GROK_TOOL_PREFIX): the tools named in this "
+                            f"text without it are {names}.\n")
+
 
 _SOURCES_CACHE = SourcesCache(max_size=256)
 _MODEL_CACHE = ModelListCache()
@@ -153,7 +172,8 @@ class _ExtraSources:
     2. Each engine is asked for its share + 2 (at most 20), in parallel with the Grok search, so
        duplicates can be absorbed without another round trip.
     3. Dedup: URLs Grok already cited and repeats across engines are dropped (scheme, "www.",
-       fragment, trailing slash and tracking parameters are ignored).
+       fragment, trailing slash and tracking parameters are ignored; a repository's page, its default
+       tree and its root README are one document, as are a directory and its index.html).
     4. Selection: round-robin across engines, keeping each engine's own ranking.
     5. Backfill: if an engine failed or the selection is still short, every engine that answered
        and may have more results is asked once more for (previous request + shortfall + 2 + the
@@ -193,9 +213,9 @@ class _ExtraSources:
         state["status"] = "ok"
         state[f"{phase}_received"] = len(got)
         state["exhausted"] = len(got) < limit
-        known = {_url_identity(item["url"]) for item in self.items[engine]}
+        known = {document_identity(item["url"]) for item in self.items[engine]}
         for item in got:
-            key = _url_identity(item["url"])
+            key = document_identity(item["url"])
             if self.scope is not None and not self.scope.allows(item["url"]):
                 # The engines filter by domain themselves; this catches what slips through
                 # (look-alike hosts such as githubhelp.com are not GitHub).
@@ -226,7 +246,7 @@ class _ExtraSources:
                 queue = queues[engine]
                 while queue:
                     item = queue.pop(0)
-                    key = _url_identity(item["url"])
+                    key = document_identity(item["url"])
                     if key in seen:
                         duplicates += 1
                         continue
@@ -238,7 +258,7 @@ class _ExtraSources:
         return picked, duplicates
 
     async def finish(self, exclude_urls) -> tuple[list[dict], dict]:
-        exclude = {_url_identity(url) for url in exclude_urls}
+        exclude = {document_identity(url) for url in exclude_urls}
         picked, duplicates = self._select(exclude)
         for engine in self.engines:
             shortfall = self.wanted - len(picked)
@@ -327,6 +347,44 @@ def _format_extra_section(extra: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_CONSULTED_LISTED = 100  # get_sources lists at most this many consulted-only pages (all are counted)
+
+
+def _cited_and_consulted(answer: str, native: list[dict], split_off: list[dict],
+                         annotations: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    """(cited, consulted, cited in the order the answer mentions them) for one answer.
+
+    Cited: the native citations, then the documents the answer itself names (inline markers, Markdown
+    links, bare URLs) and a split-off sources list, each once. A native source whose annotations all have
+    an empty span (consulted_identities) and that the answer never names is a page the upstream's search
+    opened, not a citation: it is listed in consulted, never counted in sources_count and never verified.
+    The third list puts what the answer mentions first, so the per-answer limit of URL checks is spent
+    on the links a reader sees.
+    """
+    written = sources_from_text(answer) if answer else []
+    for item in split_off:
+        item.setdefault("provider", "grok")
+    mentioned = {_url_identity(item["url"]) for item in written + split_off}
+    unpositioned = consulted_identities(annotations) - mentioned
+    native_cited = [item for item in native if _url_identity(item["url"]) not in unpositioned]
+    consulted = [{key: item[key] for key in ("url", "provider", "title") if key in item}
+                 for item in merge_sources([item for item in native if _url_identity(item["url"]) in unpositioned])]
+    # A native source keeps its own citations; the answer's link text can still give it a title.
+    link_titles = {_url_identity(item["url"]): item["title"] for item in written if item.get("title")}
+    native_keys = set()
+    for i, item in enumerate(native_cited):
+        key = _url_identity(item["url"])
+        native_keys.add(key)
+        if not item.get("title") and key in link_titles:
+            native_cited[i] = {**item, "title": link_titles[key]}
+    cited = merge_sources(native_cited, [item for item in written if _url_identity(item["url"]) not in native_keys], split_off)
+    first_mention: dict[str, int] = {}
+    for i, item in enumerate(written):
+        first_mention.setdefault(_url_identity(item["url"]), i)
+    in_answer_order = sorted(cited, key=lambda item: first_mention.get(_url_identity(item["url"]), len(written)))
+    return cited, consulted, in_answer_order
+
+
 def _counts(cited: list[dict], extra: list[dict], total: list[dict]) -> dict:
     return {
         "sources_count": len(cited),
@@ -354,10 +412,10 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
 
 
 @mcp.tool(
-    name="web_search",
+    name=_tool_name("web_search"),
     output_schema=None,
     annotations=_READ_ONLY_WEB,
-    description="""
+    description=_tool_description("""
     Performs a deep web search through Grok's live web search and returns the answer directly.
     Read-only: several searches may be issued in parallel.
 
@@ -369,13 +427,18 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       statements of a source. "Not found in this search" only means this search did not find it; to
       confirm that something does not exist, check the platform directly (for example web_fetch its issue
       search page).
-    - sources_count / distinct_domains: how many sources Grok cited and on how many distinct sites (native
-      citations; when the upstream sends none, the markers, links and URLs written in the answer).
-      extra_sources hits are not included: extra_sources_count counts them and total_sources_count is
-      cited + extra (the length of the get_sources list)
-    - citation_positions: native citation offsets that were valid, relocated or removed after repeated
-      markers were collapsed; offsets returned by get_sources always refer to this content and count
-      Unicode code points (not UTF-16 units)
+    - sources_count / distinct_domains: how many sources Grok cited and on how many distinct sites: its
+      native citations plus the markers, links and URLs written in the answer. extra_sources hits are not
+      included: extra_sources_count counts them and total_sources_count is cited + extra (the length of
+      the get_sources list)
+    - consulted_sources_count (only when non-zero): pages the upstream reported as opened by its search
+      without citing them (Responses API annotations with an empty span) and that the answer never
+      mentions; often unrelated to the answer. Not sources, not counted above, not verified; get_sources
+      lists them separately as consulted
+    - citation_positions: native citation offsets that were valid, relocated (to the marker, or when the
+      answer has none, the Markdown link or URL of the same page) or removed after repeated markers were
+      collapsed; consulted_only counts the consulted pages. Offsets returned by get_sources always refer
+      to this content and count Unicode code points (not UTF-16 units)
     - incomplete / finish_reason / native_finish_reason (only when the upstream cut the answer short, e.g.
       output cap or content filter): the answer is partial; a one-line note is appended after it
     - usage (when the upstream reports it): prompt_tokens, completion_tokens, reasoning_tokens, and when
@@ -383,18 +446,22 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       x_search_calls (searches Grok ran itself). Multi-agent / high-reasoning models can bill 0.5-1.6M prompt
       tokens for one search; for routine lookups pass a lighter model= (only when the user asked for it) and
       avoid repeating a call that already answered
-    - search_queries (GROK_API_MODE=responses): the queries Grok searched with, at most 10 — useful to judge
-      whether a "not found" covered the right terms
+    - search_queries (GROK_API_MODE=responses): queries Grok searched with that the stream showed, at most
+      10. search_queries_partial=true: Grok ran more searches than are listed (multi-agent models run most
+      of them in sub-agents whose queries are never reported; usage.web_search_calls / x_search_calls give
+      the totals), so the list cannot tell whether a "not found" covered the right terms
     - verification (when enabled): existence and reachability only, for the arXiv IDs / DOIs in the
-      answer and the URLs Grok cited (extra sources are not checked). Identifiers are resolved against
+      answer and the URLs Grok cited, the ones written in the answer first (extra sources and consulted
+      pages are not checked). Identifiers are resolved against
       arXiv, Crossref and the doi.org registry (DataCite), URLs are fetched, and paper titles written next
-      to an identifier are compared with the registry title (title_checks: match / partial /
+      to an identifier or in the same record (the lines of a "- Title: / - arXiv: / - DOI:" list under its
+      heading) are compared with the registry title (title_checks: match / partial /
       possible_mismatch / not_stated). It does NOT check whether a source supports the sentence it is
       attached to (claim_support = "not_checked"). Treat unresolved (the registry or site said it does not
-      exist: 404/410, other 4xx except 401/403/451, unknown domain) and possible_mismatch entries as
-      suspect; treat lookup_failed (rate limit, 5xx, timeout, network, or a site that refuses scripted
-      requests with 401/403/451) as unknown, not as evidence against the citation; a bot-check or
-      interstitial page (captcha, "prove your humanity") is lookup_failed too, never reachable; skipped
+      exist: 404/410, unknown domain) and possible_mismatch entries as suspect; treat lookup_failed (rate
+      limit, 5xx, timeout, network, any other 4xx such as 401/403/451 refusals or the 400/405/406/418 of bot
+      defences) as unknown, not as evidence against the citation; a bot-check or interstitial page
+      (captcha, "prove your humanity", Cloudflare / AWS WAF challenge) is lookup_failed too, never reachable; skipped
       lists what was not checked and why (including DOI patterns written in prose, such as
       "10.48550/arXiv.*"). By default (GROK_VERIFY_DETAIL=compact, detail = "compact") only what needs
       attention is listed: every unresolved and lookup_failed entry (URLs of one host that failed for the
@@ -421,8 +488,8 @@ def _early_failure(session_id: str, detail: str, error: str, error_type: str) ->
       repeating it), auth (the gateway has no usable credential for the model), http_<status>, unknown, or an error code
       passed through from the upstream stream (for example invalid_request_error, model_not_found,
       server_error, upstream_error). Wait retry_after_s seconds or switch model before calling again
-    """,
-    meta={"version": "2.4.0", "author": "guda.studio"},
+    """),
+    meta={"version": "2.5.0", "author": "guda.studio"},
 )
 async def web_search(
     query: Annotated[str, "Clear, self-contained natural-language search query."],
@@ -507,12 +574,11 @@ async def web_search(
         answer, native_sources, citation_report = normalize_citations(grok_result.content, native_sources)
     elif answer:
         # No native citations: the answer is kept as written (only a pure link list under a sources
-        # heading was split off) and its inline markers, Markdown links and URLs are the cited sources.
+        # heading was split off).
         answer, _, _ = normalize_citations(answer, [])
-        grok_sources = merge_sources(sources_from_text(answer), grok_sources)
-    for item in grok_sources:
-        item.setdefault("provider", "grok")
-    cited_sources = merge_sources(native_sources, grok_sources)
+    cited_sources, consulted, verify_order = _cited_and_consulted(answer, native_sources, grok_sources, grok_result.annotations)
+    if citation_report is not None and consulted:
+        citation_report["consulted_only"] = len(consulted)
 
     extra: list[dict] = []
     extra_report = None
@@ -520,9 +586,11 @@ async def web_search(
         extra, extra_report = await extra_job.finish(item["url"] for item in cited_sources)
     all_sources = merge_sources(cited_sources, extra)
 
-    await _SOURCES_CACHE.set(session_id, all_sources)
+    await _SOURCES_CACHE.set(session_id, all_sources, consulted)
     # Counts describe what Grok cited; extra-source hits are reported separately.
     counts = _counts(cited_sources, extra, all_sources)
+    if consulted:
+        counts["consulted_sources_count"] = len(consulted)
 
     if not answer:
         if grok_error:
@@ -553,7 +621,7 @@ async def web_search(
             "error_type": grok_error.get("error_type", "empty_response"),
         }
         for field in ("retry_after_s", "status", "exhausted", "incomplete", "finish_reason", "native_finish_reason",
-                      "usage", "search_queries", "dropped_events"):
+                      "usage", "search_queries", "search_queries_partial", "dropped_events"):
             if field in grok_error:
                 result[field] = grok_error[field]
         if extra_report is not None:
@@ -583,10 +651,11 @@ async def web_search(
 
     if verify and (config.verify_ids or config.verify_urls):
         try:
-            # Only what Grok cited is verified; extra_sources hits are search results, not citations.
+            # Only what Grok cited is verified, links written in the answer first; extra_sources hits are
+            # search results and consulted pages were not cited.
             verification = await verify_answer(
                 grok_answer,
-                cited_sources,
+                verify_order,
                 check_ids=config.verify_ids,
                 check_urls=config.verify_urls,
                 timeout_s=config.verify_timeout_s,
@@ -603,9 +672,9 @@ async def web_search(
 
 
 @mcp.tool(
-    name="get_sources",
+    name=_tool_name("get_sources"),
     annotations=_READ_ONLY_LOCAL,
-    description="""
+    description=_tool_description("""
     When you feel confused or curious about the search response content, use the session_id returned by web_search to invoke the this tool to obtain the corresponding list of information sources.
     Retrieve all cached sources for a previous web_search call.
     Provide the session_id returned by web_search to get the full source list.
@@ -620,28 +689,37 @@ async def web_search(
       upstream_start_index / upstream_end_index.
     - description (extra sources): a whitespace-collapsed snippet of at most 500 characters ending with
       "…" when cut; web_fetch the URL for the full page.
-    """,
-    meta={"version": "1.1.0", "author": "guda.studio"},
+    - consulted / consulted_sources_count (only when there are some): pages the upstream reported as
+      opened by its search without citing them (Responses API annotations with an empty span) and that
+      the answer does not mention. They are not sources of any statement, often unrelated to the answer,
+      and are neither counted in sources_count nor verified; at most 100 are listed.
+    """),
+    meta={"version": "1.2.0", "author": "guda.studio"},
 )
 async def get_sources(
     session_id: Annotated[str, "Session ID from previous web_search call."]
 ) -> dict:
-    sources = await _SOURCES_CACHE.get(session_id)
-    if sources is None:
+    entry = await _SOURCES_CACHE.get_entry(session_id)
+    if entry is None:
         return {
             "session_id": session_id,
             "sources": [],
             "sources_count": 0,
             "error": "session_id_not_found_or_expired",
         }
+    sources, consulted = entry
     extra_count = sum(1 for item in sources if isinstance(item, dict) and item.get("provider") in _EXTRA_PROVIDERS)
-    return {
+    result = {
         "session_id": session_id,
         "sources": sources,
         "sources_count": len(sources),
         "cited_sources_count": len(sources) - extra_count,
         "extra_sources_count": extra_count,
     }
+    if consulted:
+        result["consulted"] = consulted[:_CONSULTED_LISTED]
+        result["consulted_sources_count"] = len(consulted)
+    return result
 
 
 async def _call_tavily_search(query: str, max_results: int = 6, include_domains: list[str] | None = None) -> list[dict]:
@@ -715,10 +793,10 @@ async def _call_firecrawl_search(query: str, limit: int = 14, include_domains: l
 
 
 @mcp.tool(
-    name="web_fetch",
+    name=_tool_name("web_fetch"),
     output_schema=None,
     annotations=_READ_ONLY_WEB,
-    description="""
+    description=_tool_description("""
     Fetches a URL: web pages as Markdown, text files verbatim. Read-only: several fetches may run in parallel.
 
     Backends:
@@ -737,8 +815,9 @@ async def _call_firecrawl_search(query: str, limit: int = 14, include_domains: l
       extractors. GROK_FETCH_DIRECT=false skips the
       direct download. Without it, raw/gist/forge file and /raw/ URLs are read by Firecrawl and then Tavily;
       a URL that only ends in such an extension (often a page: www.npmjs.com/package/chart.js,
-      en.wikipedia.org/wiki/Node.js) like a page, Tavily first, and Firecrawl when Tavily's copy is short
-      (its content type then tells a file from a page) or looks like damaged code. Visibly damaged code
+      en.wikipedia.org/wiki/Node.js) like a page, Firecrawl's content type telling a file from a page.
+      When the origin itself answers 404 or 410, no extractor is called (they would read the same address):
+      `error=fetch_failed attempts=direct:extract_failed page_status=404`. Visibly damaged code
       (collapsed newlines, lost indentation, escaped "_", stripped #include targets) is marked
       `warning=degraded_code degraded=<reasons>`: do not quote it. A URL whose origin
       answers with HTML is fetched as a web page, and a backend copy reported as text/html is never flagged
@@ -746,14 +825,19 @@ async def _call_firecrawl_search(query: str, limit: int = 14, include_domains: l
     - arXiv abstract pages: the arXiv API (a requested version such as .../abs/1706.03762v1 is honoured;
       cached for an hour; given up after GROK_FETCH_ARXIV_BUDGET_S, default 8 s, then skipped for 2 minutes:
       `arxiv-api:cooldown`), then DataCite's record (`source=datacite`, latest version only), Firecrawl, Tavily.
-    - Other pages: Tavily Extract, then Firecrawl when the extract is missing, shorter than
-      GROK_FETCH_MIN_CHARS (2,000) or a bot check.
+    - Other pages: Firecrawl's live scrape first; Tavily Extract when Firecrawl fails, answers with a bot
+      check, or its copy is shorter than GROK_FETCH_MIN_CHARS (2,000) and Tavily's is at least twice as long.
+      GROK_FETCH_PAGE_FIRST=tavily (or no Firecrawl key) reads Tavily first, Firecrawl when that is short or
+      a bot check. Image markup is removed from page copies (badges, icons; a linked image keeps its link,
+      an image its alt text as [image: alt]; `images_stripped=N`; GROK_FETCH_STRIP_IMAGES=false keeps it),
+      never from files.
 
     The first line is a metadata header:
-    `[web_fetch] source=<backend> total_chars=N offset=O returned=R truncated=true|false [next_offset=X snapshot_id=S expires_in_s=T] [cached=true] [content_type=T charset=C status=S] [cache=hit|miss|bypassed|possible cached_at=T] [attempts=...] [warning=interstitial|degraded_code|size_limit|decode_errors|charset_guess] [degraded=...] [final_url=<url> title="<title>"]`
+    `[web_fetch] source=<backend> total_chars=N offset=O returned=R truncated=true|false [next_offset=X snapshot_id=S expires_in_s=T] [cached=true] [content_type=T charset=C status=S] [cache=hit|miss|bypassed|possible cached_at=T] [images_stripped=N] [attempts=...] [warning=interstitial|degraded_code|size_limit|decode_errors|charset_guess] [degraded=...] [final_url=<url> title="<title>"]`
     cache= is the backend's cache: Firecrawl is asked for a copy at most GROK_FETCH_MAX_AGE_S old (default 0:
     `cache=bypassed`, scraped now); `cache=possible` is Tavily, which caches by URL without freshness
-    control, so a recently changed page may be stale. cached=true: served from a paging snapshot.
+    control (a python.org copy was over a week old): such a result also has a `注意:` line saying it may be
+    stale, so do not confirm versions, dates or prices with it alone. cached=true: served from a paging snapshot.
     A backend in attempts= that failed while another answered gets a `- <backend>: <category> ...` line.
     The default page is GROK_FETCH_MAX_CHARS (40,000) characters, or GROK_FETCH_MAX_CHARS_CJK (20,000) when
     more than 30% of it is CJK text (about one token per character), to stay under the ~25k-token MCP result
@@ -779,8 +863,8 @@ async def _call_firecrawl_search(query: str, limit: int = 14, include_domains: l
     **Edge Cases & Best Practices:**
         - Ensure URL is complete and accessible (not behind authentication or paywalls).
         - May not capture dynamically loaded content requiring JavaScript execution.
-    """,
-    meta={"version": "1.7.0", "author": "guda.studio"},
+    """),
+    meta={"version": "1.8.0", "author": "guda.studio"},
 )
 async def web_fetch(
     url: Annotated[str, "Complete public http(s) URL of the target page (e.g. https://example.com/page). Local/LAN addresses are refused."],
@@ -1258,10 +1342,10 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
 
 
 @mcp.tool(
-    name="web_map",
+    name=_tool_name("web_map"),
     output_schema=None,
     annotations=_READ_ONLY_WEB,
-    description="""
+    description=_tool_description("""
     Maps a website's structure by traversing it like a graph, discovering URLs and generating a comprehensive site map.
 
     **Key Features:**
@@ -1299,7 +1383,7 @@ async def _call_tavily_map(url: str, instructions: str = None, max_depth: int = 
           to allow several hosts of the same site.
         - Use instructions to filter for specific content (e.g., "only documentation pages").
         - Large sites may hit timeout limits; adjust timeout and limit parameters accordingly.
-    """,
+    """),
     meta={"version": "1.6.0", "author": "guda.studio"},
 )
 async def web_map(
@@ -1352,10 +1436,10 @@ def _masked_breaker_snapshot() -> dict:
 
 
 @mcp.tool(
-    name="get_config_info",
+    name=_tool_name("get_config_info"),
     output_schema=None,
     annotations=_READ_ONLY_WEB,
-    description="""
+    description=_tool_description("""
     Returns current Grok Search MCP server configuration, circuit-breaker state, and tests API connectivity.
 
     **Key Features:**
@@ -1369,6 +1453,9 @@ def _masked_breaker_snapshot() -> dict:
           web_search / switch_model accept; non_chat_models (TTS/voice/audio, image/video generation,
           embedding, moderation, realtime, rerank, recognised by name unless the gateway's /models entry
           declares text output, as OpenRouter's architecture.output_modalities does) are listed but rejected.
+          connection_test.current_model_listed says whether GROK_MODEL (its base name) is on that list; when
+          it is not (for example a gateway without the built-in default, grok-4.20-multi-agent-0309(high)),
+          config_warnings says so and names close chat models.
         - **Model Source:** GROK_MODEL_SOURCE is env, switch_model (set in this process), config
           (config file) or default; GROK_MODEL_NOTE says how long a switch_model choice lasts.
         - **Warnings:** config_warnings lists environment values that were not understood (their
@@ -1378,8 +1465,8 @@ def _masked_breaker_snapshot() -> dict:
         - Use this tool first when debugging connection or configuration issues.
         - API keys are masked (at most a quarter of a key is shown) and credentials in URLs are hidden.
         - Connection test timeout is 10 seconds per attempt; network issues may cause delays.
-    """,
-    meta={"version": "1.7.0", "author": "guda.studio"},
+    """),
+    meta={"version": "1.8.0", "author": "guda.studio"},
 )
 async def get_config_info() -> str:
     import json
@@ -1393,6 +1480,7 @@ async def get_config_info() -> str:
         config_info["NO_PROXY_SANITIZED"] = list(_SANITIZED_ENV)
 
     test_result = {"status": "未测试", "message": "", "response_time_ms": 0}
+    listed_models: list[str] = []
     try:
         api_url = config.grok_api_url
         api_key = config.grok_api_key
@@ -1421,6 +1509,7 @@ async def get_config_info() -> str:
                     test_result["message"] += f"，共 {len(models_data['data'])} 个模型"
                     model_names = [m["id"] for m in models_data["data"] if isinstance(m, dict) and isinstance(m.get("id"), str)]
                     if model_names:
+                        listed_models = model_names
                         remember_capabilities(api_url, models_data["data"])
                         test_result["available_models"] = model_names
                         test_result["chat_models"] = [m for m in model_names if not model_kind(m, api_url)]
@@ -1466,20 +1555,34 @@ async def get_config_info() -> str:
             f"GROK_MODEL={config_info['GROK_MODEL']}（来源: {config_info.get('GROK_MODEL_SOURCE')}）看起来不是对话/搜索模型"
             f"（{default_kind}），web_search 会被上游拒绝；请用 switch_model 或 GROK_MODEL 换成 chat_models 中的模型"
         )
+    elif listed_models:
+        # A configured model, or the built-in default when GROK_MODEL is unset, is not served by every gateway.
+        current = config_info.get("GROK_MODEL") or ""
+        base = routing_base(current)
+        listed = current in listed_models or base_is_listed(base, listed_models)
+        test_result["current_model_listed"] = listed
+        if not listed:
+            suggestions = suggest_models(base, listed_models)
+            config_info.setdefault("config_warnings", []).append(
+                f"GROK_MODEL={current}（来源: {config_info.get('GROK_MODEL_SOURCE')}）不在网关的 /models 列表中，"
+                "web_search 很可能被上游拒绝；请用 switch_model 或在 MCP 配置里设置 GROK_MODEL 换成 chat_models 中的模型"
+                + (f"，例如 {', '.join(suggestions)}" if suggestions else "")
+            )
     config_info["connection_test"] = test_result
     return json.dumps(config_info, ensure_ascii=False, indent=2)
 
 
 @mcp.tool(
-    name="switch_model",
+    name=_tool_name("switch_model"),
     output_schema=None,
-    description="""
+    description=_tool_description("""
     Switches the default Grok model used for search operations, persisting the setting.
 
     **Key Features:**
         - **Validation:** The name is stripped and checked against the proxy's /models list the same
           way as web_search(model=...): a thinking suffix such as "(high)" is accepted, an empty,
-          over-long or unlisted name is rejected and nothing changes. Non-chat models (TTS/voice/audio,
+          over-long or unlisted name is rejected and nothing changes. An unsupported suffix on an unlisted
+          model reports both problems at once. Non-chat models (TTS/voice/audio,
           image/video generation, embedding, moderation, realtime, rerank) are rejected even when
           /models lists them. When /models cannot be reached the switch is applied unverified, with a
           warning.
@@ -1495,11 +1598,11 @@ async def get_config_info() -> str:
           the switch lasts only for this process and GROK_MODEL wins again after a restart; the response
           carries a warning in that case. Switching back to the GROK_MODEL value restores
           GROK_MODEL_SOURCE=env.
-    """,
-    meta={"version": "1.6.0", "author": "guda.studio"},
+    """),
+    meta={"version": "1.7.0", "author": "guda.studio"},
 )
 async def switch_model(
-    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4-fast', 'grok-4.20-multi-agent-0309(high)'). Must be non-empty."]
+    model: Annotated[str, "Model ID to switch to (e.g., 'grok-4.7', 'grok-4.20-multi-agent-0309(high)'). Must be non-empty."]
 ) -> str:
     import json
 
@@ -1602,28 +1705,51 @@ def _find_project_root(start: Path) -> Optional[Path]:
     return None
 
 
+def _is_home(path: Path) -> bool:
+    try:
+        return path == Path.home().resolve()
+    except Exception:
+        return False
+
+
+def _not_a_project(path: Path) -> str:
+    """Why path cannot be the project whose settings are changed ("" when it can)."""
+    if _is_fs_root(path):
+        return f"拒绝把文件系统根目录当作项目目录: {path}"
+    if _is_home(path):
+        return (f"拒绝把用户主目录当作项目目录: {path}。~/.claude/settings.json 是用户级设置，改动会影响所有项目；"
+                "本工具只改项目级设置，未做任何修改。确需在所有项目屏蔽内置工具时，请自行编辑 ~/.claude/settings.json")
+    return ""
+
+
 def _resolve_project_dir(project_dir: str) -> tuple[Optional[Path], str, str]:
-    """(directory, source, error). Order: argument, CLAUDE_PROJECT_DIR, nearest .git/.claude above cwd."""
+    """(directory, source, error). Order: argument, CLAUDE_PROJECT_DIR, nearest .git/.claude above cwd, the
+    working directory itself (Claude Code starts MCP servers in the project directory). The home directory and a
+    filesystem root are refused whatever their source."""
     if project_dir and project_dir.strip():
         path = Path(project_dir.strip()).expanduser()
         if not path.is_dir():
             return None, "argument", f"project_dir 不存在或不是目录: {path}"
         path = path.resolve()
-        if _is_fs_root(path):
-            return None, "argument", f"拒绝把文件系统根目录当作项目目录: {path}"
-        return path, "argument", ""
+        problem = _not_a_project(path)
+        return (None, "argument", problem) if problem else (path, "argument", "")
     env_dir = os.getenv("CLAUDE_PROJECT_DIR", "").strip()
-    if env_dir and Path(env_dir).is_dir() and not _is_fs_root(Path(env_dir).resolve()):
-        return Path(env_dir).resolve(), "CLAUDE_PROJECT_DIR", ""
+    if env_dir and Path(env_dir).is_dir():
+        path = Path(env_dir).resolve()
+        problem = _not_a_project(path)
+        return (None, "CLAUDE_PROJECT_DIR", problem) if problem else (path, "CLAUDE_PROJECT_DIR", "")
     try:
-        found = _find_project_root(Path.cwd().resolve())
+        cwd = Path.cwd().resolve()
     except OSError:  # the working directory was removed or is not accessible
-        found = None
+        cwd = None
+    found = _find_project_root(cwd) if cwd is not None else None
     if found is not None:
         return found, "cwd", ""
+    if cwd is not None and not _not_a_project(cwd):
+        return cwd, "working_directory", ""
     return None, "", (
-        "无法确定项目目录：未设置 CLAUDE_PROJECT_DIR，且从当前目录向上到用户主目录之前都没有 .git 或 .claude。"
-        "请用 project_dir 参数传入项目根目录，未做任何修改。"
+        "无法确定项目目录：未设置 CLAUDE_PROJECT_DIR，从当前目录向上到用户主目录之前都没有 .git 或 .claude，"
+        "而工作目录本身是用户主目录、文件系统根目录或无法访问。请用 project_dir 参数传入项目根目录，未做任何修改。"
     )
 
 
@@ -1735,9 +1861,9 @@ def _write_settings(path: Path, settings: dict) -> None:
 
 
 @mcp.tool(
-    name="toggle_builtin_tools",
+    name=_tool_name("toggle_builtin_tools"),
     output_schema=None,
-    description="""
+    description=_tool_description("""
     Block or allow Claude Code's built-in WebSearch and WebFetch tools for a project.
 
     **Actions:**
@@ -1748,8 +1874,10 @@ def _write_settings(path: Path, settings: dict) -> None:
         Any other value (including the ambiguous "enable"/"disable") is rejected with an error.
 
     **Project directory:** project_dir if given, else CLAUDE_PROJECT_DIR, else the nearest directory
-    containing .git or .claude above the server's working directory (never the home directory or a
-    filesystem root). If none applies, nothing is written and the tool asks for project_dir.
+    containing .git or .claude above the server's working directory, else that working directory itself
+    (Claude Code starts MCP servers in the project directory; project_dir_source "working_directory" and a
+    warning say so). The home directory (whose .claude/settings.json is the user-level file of every
+    project) and a filesystem root are refused from any source; nothing is written then.
 
     **Other scopes:** Claude Code also applies deny rules from .claude/settings.local.json and
     ~/.claude/settings.json. They are read (never changed) and reported in denied_elsewhere; "off"
@@ -1757,15 +1885,15 @@ def _write_settings(path: Path, settings: dict) -> None:
 
     **Safety:** a .claude directory or settings file that is a symlink pointing outside the project is
     refused; the file is replaced atomically.
-    """,
-    meta={"version": "1.5.0", "author": "guda.studio"},
+    """),
+    meta={"version": "1.6.0", "author": "guda.studio"},
 )
 async def toggle_builtin_tools(
     action: Annotated[str, Field(
         description="'on' (block the built-in tools), 'off' (allow them again) or 'status' (check the current state). 'block' and 'allow' are accepted as aliases.",
         json_schema_extra={"enum": ["on", "off", "status", "block", "allow"]},
     )] = "status",
-    project_dir: Annotated[str, "Project root whose .claude/settings.json is read or changed. Optional when CLAUDE_PROJECT_DIR or a .git/.claude directory above the server's working directory identifies the project."] = "",
+    project_dir: Annotated[str, "Project root whose .claude/settings.json is read or changed. Optional: CLAUDE_PROJECT_DIR, a .git/.claude directory above the server's working directory, or that working directory is used. Never the home directory."] = "",
 ) -> str:
     def reply(**data) -> str:
         return json.dumps(data, ensure_ascii=False, indent=2)
@@ -1840,11 +1968,9 @@ async def toggle_builtin_tools(
         result["symlink"] = str(link_path)
     if elsewhere:
         result["denied_elsewhere"] = elsewhere
-    try:
-        if root == Path.home().resolve():
-            warnings.append("project_dir 是用户主目录：~/.claude/settings.json 是用户级设置，会影响所有项目")
-    except Exception:
-        pass
+    if source == "working_directory":
+        warnings.insert(0, f"没有 CLAUDE_PROJECT_DIR，{root} 及其上层也没有 .git 或 .claude，按服务器的工作目录处理"
+                           "（Claude Code 在项目目录中启动 MCP 服务器）；如果这不是项目根目录，请用 project_dir 指定")
     if warnings:
         result["warning"] = "\n".join(warnings)
     return reply(**result)
@@ -1854,9 +1980,9 @@ def register_planning_tools(app: FastMCP) -> None:
     """Six bookkeeping tools that record a client's search plan. Opt-in via GROK_PLANNING_TOOLS=true."""
 
     @app.tool(
-        name="plan_intent",
+        name=_tool_name("plan_intent"),
         output_schema=None,
-        description="""
+        description=_tool_description("""
         Phase 1 of search planning: Analyze user intent. Call this FIRST to create a session.
         Returns session_id for subsequent phases. Required flow:
         plan_intent → plan_complexity → plan_sub_query(×N) → plan_search_term(×N) → plan_tool_mapping(×N) → plan_execution
@@ -1865,7 +1991,7 @@ def register_planning_tools(app: FastMCP) -> None:
         Every plan_* call validates its input (enums, ranges, confidence 0.0-1.0) and returns
         {"error": ..., "invalid_fields": [...]} without recording anything when it is invalid.
         A recorded intent, complexity or execution phase is only replaced with is_revision=true.
-        """,
+        """),
     )
     async def plan_intent(
         thought: Annotated[str, "Reasoning for this phase"],
@@ -1896,7 +2022,7 @@ def register_planning_tools(app: FastMCP) -> None:
         ), ensure_ascii=False, indent=2)
 
     @app.tool(
-        name="plan_complexity",
+        name=_tool_name("plan_complexity"),
         output_schema=None,
         description="Phase 2: Assess search complexity (1-3). Controls required phases: Level 1 = phases 1-3; Level 2 = phases 1-5; Level 3 = all 6.",
     )
@@ -1921,7 +2047,7 @@ def register_planning_tools(app: FastMCP) -> None:
         ), ensure_ascii=False, indent=2)
 
     @app.tool(
-        name="plan_sub_query",
+        name=_tool_name("plan_sub_query"),
         output_schema=None,
         description="Phase 3: Add one sub-query. Call once per sub-query; data accumulates across calls. Set is_revision=true to replace all.",
     )
@@ -1951,7 +2077,7 @@ def register_planning_tools(app: FastMCP) -> None:
         ), ensure_ascii=False, indent=2)
 
     @app.tool(
-        name="plan_search_term",
+        name=_tool_name("plan_search_term"),
         output_schema=None,
         description="Phase 4: Add one search term. Call once per term; data accumulates. First call must set approach.",
     )
@@ -1980,7 +2106,7 @@ def register_planning_tools(app: FastMCP) -> None:
         ), ensure_ascii=False, indent=2)
 
     @app.tool(
-        name="plan_tool_mapping",
+        name=_tool_name("plan_tool_mapping"),
         output_schema=None,
         description="Phase 5: Map a sub-query to a tool. Call once per mapping; data accumulates.",
     )
@@ -2010,7 +2136,7 @@ def register_planning_tools(app: FastMCP) -> None:
         ), ensure_ascii=False, indent=2)
 
     @app.tool(
-        name="plan_execution",
+        name=_tool_name("plan_execution"),
         output_schema=None,
         description="Phase 6: Define execution order. parallel_groups: semicolon-separated groups of comma-separated IDs (e.g., 'sq1,sq2;sq3').",
     )

@@ -13,15 +13,19 @@ receives, so every answer goes through normalize_citations() before it is return
    or exactly one Markdown link to that URL, is kept with shifted offsets.
 4. Any other annotation is relocated to the next unclaimed marker for the same
    URL in reading order (label match preferred) -- this repairs offsets that
-   use another unit or scale -- or, when there is no such marker, loses its
-   coordinates. The upstream values are kept as upstream_start_index /
-   upstream_end_index and "position" says "relocated" or "removed".
+   use another unit or scale -- or, when the answer has no such marker (models
+   that write plain Markdown links), to the next unclaimed Markdown link or bare
+   URL for that URL; with neither it loses its coordinates. The upstream values
+   are kept as upstream_start_index / upstream_end_index and "position" says
+   "relocated" or "removed".
 """
 import bisect
 import copy
 import json
 import re
 from dataclasses import dataclass
+
+from .utils import URL_BODY, clean_url
 
 # The URL keeps one level of balanced parentheses; square brackets end it, so a long run of unclosed
 # markers cannot make one match attempt scan the rest of the answer.
@@ -30,6 +34,8 @@ MARKER_RE = re.compile(
     r"\((?P<url>https?://(?:[^\s()\[\]]|\([^\s()\[\]]*\))+)\)"
 )
 _RUN_GAP_RE = re.compile(r"[ \t]*")
+_LINK_RE = re.compile(r"\[[^\[\]\n]{1,500}\]\((?P<url>https?://" + URL_BODY + r")\)")
+_BARE_URL_RE = re.compile(r"https?://" + URL_BODY)
 
 
 @dataclass(frozen=True)
@@ -104,6 +110,28 @@ def _is_link_span(text: str, start: int, end: int, url: str) -> bool:
     return re.fullmatch(pattern, text[start:end]) is not None
 
 
+def _link_spans(text: str, markers: list[Marker]) -> dict[str, list[tuple[int, int]]]:
+    """Markdown links "[text](url)" and bare URLs outside markers and links, per URL key in reading order."""
+    taken = [(m.start, m.end) for m in markers]
+    spans: list[tuple[int, int, str]] = []
+    for m in _LINK_RE.finditer(text):
+        spans.append((m.start(), m.end(), m.group("url")))
+        taken.append((m.start(), m.end()))
+    taken.sort()
+    starts = [start for start, _ in taken]
+    for m in _BARE_URL_RE.finditer(text):
+        i = bisect.bisect_right(starts, m.start()) - 1
+        if i >= 0 and m.start() < taken[i][1]:
+            continue  # the target of a link or marker
+        url = clean_url(m.group())
+        if url.partition("://")[2]:
+            spans.append((m.start(), m.start() + len(url), url))
+    by_url: dict[str, list[tuple[int, int]]] = {}
+    for start, end, url in sorted(spans):
+        by_url.setdefault(_url_key(url), []).append((start, end))
+    return by_url
+
+
 def _positional(occ) -> bool:
     return isinstance(occ, dict) and type(occ.get("start_index")) is int and type(occ.get("end_index")) is int
 
@@ -123,16 +151,22 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
         by_url.setdefault(_url_key(m.url), []).append(i)
         by_url_label.setdefault((_url_key(m.url), m.label), []).append(i)
     cursor: dict = {}
+    links = _link_spans(text, markers)
+    claimed_links: set[tuple[int, int]] = set()
 
-    def first_unclaimed(key, indices: list[int] | None) -> int | None:
-        # claimed only grows, so each list is walked at most once in total.
+    def first_unclaimed(key, indices: list, taken: set | None = None):
+        # A claimed set only grows, so each list is walked at most once in total.
         if not indices:
             return None
+        taken = claimed if taken is None else taken
         pos = cursor.get(key, 0)
-        while pos < len(indices) and indices[pos] in claimed:
+        while pos < len(indices) and indices[pos] in taken:
             pos += 1
         cursor[key] = pos
         return indices[pos] if pos < len(indices) else None
+
+    def claim_links_within(url_key: str, start: int, end: int) -> None:
+        claimed_links.update(span for span in links.get(url_key, ()) if start <= span[0] and span[1] <= end)
 
     def final_span(i: int) -> tuple[int, int]:
         kept = markers[twin_of.get(i, i)]
@@ -168,6 +202,7 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
                 citations[idx] = {**occ, "start_index": new_start, "end_index": new_end}
                 report["valid"] += 1
             elif hit is None and _is_link_span(text, start, end, url):
+                claim_links_within(url_key, start, end)
                 citations[idx] = {**occ, "start_index": shift(start), "end_index": shift(end)}
                 report["valid"] += 1
             else:
@@ -182,14 +217,19 @@ def normalize_citations(content: str, sources: list[dict]) -> tuple[str, list[di
             target = first_unclaimed(("label", url_key, label), by_url_label.get((url_key, label)))
         if target is None:
             target = first_unclaimed(("url", url_key), by_url.get(url_key))
+        link = None if target is not None else first_unclaimed(("link", url_key), links.get(url_key), claimed_links)
         if target is not None:
             claimed.add(target)
             new_start, new_end = final_span(target)
-            source["citations"][idx] = {**rest, "start_index": new_start, "end_index": new_end, "position": "relocated", **upstream}
-            report["relocated"] += 1
+        elif link is not None:
+            claimed_links.add(link)
+            new_start, new_end = shift(link[0]), shift(link[1])
         else:
             source["citations"][idx] = {**rest, "position": "removed", **upstream}
             report["removed"] += 1
+            continue
+        source["citations"][idx] = {**rest, "start_index": new_start, "end_index": new_end, "position": "relocated", **upstream}
+        report["relocated"] += 1
 
     for source in out:
         if not isinstance(source, dict) or not isinstance(source.get("citations"), list):

@@ -432,9 +432,32 @@ def test_access_denied_is_unknown_not_suspect(status):
     assert reason == f"status {status} (access denied to automated requests; the page may still exist)"
 
 
-@pytest.mark.parametrize("status", [400, 404, 405, 410])
-def test_other_client_errors_stay_unresolved(status):
-    assert verify._url_outcome({"url": "https://example.test/x", "status": status, "title": ""})[0] == "unresolved"
+@pytest.mark.parametrize("status", [404, 410])
+def test_not_found_is_unresolved(status):
+    assert verify._url_outcome({"url": "https://example.test/x", "status": status, "title": ""}) == ("unresolved", f"status {status}")
+
+
+@pytest.mark.parametrize("status", [400, 402, 405, 406, 409, 418, 422, 499])
+def test_other_client_errors_are_unknown_not_suspect(status):
+    # Bot defences answer scripted requests with all of these (NASA ADS: 405 + an AWS WAF captcha); none of
+    # them says the page does not exist.
+    outcome, reason = verify._url_outcome({"url": "https://example.test/x", "status": status, "title": ""})
+    assert outcome == "lookup_failed" and reason.startswith(f"status {status} (request refused or not understood")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status, headers, reason", [
+    (405, {"x-amzn-waf-action": "captcha"}, "status 405 (bot challenge)"),
+    (404, {"x-amzn-waf-action": "Challenge"}, "status 404 (bot challenge)"),
+    (403, {"cf-mitigated": "challenge"}, "status 403 (bot challenge)"),
+    (202, {"x-amzn-waf-action": "challenge"}, "bot check / interstitial (page may exist)"),
+])
+async def test_bot_defence_headers_make_a_lookup_failure(status, headers, reason):
+    url = "https://ui.adsabs.example.test/abs/2016cvpr.confE...1H/abstract"
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(status, headers=headers))) as client:
+        info = await verify.check_url(url, client)
+    assert info["challenge"] is True
+    assert verify._url_outcome(info) == ("lookup_failed", reason)
 
 
 # ------------------------------------------------------- registry requests stay on the registry

@@ -268,10 +268,15 @@ async def test_web_search_in_responses_mode(monkeypatch):
     assert paths == ["/v1/responses"]
     assert "error" not in data and data["content"].startswith("The latest stable Rust release is **1.99.1**")
     assert data["usage"]["cost_usd"] == 0.0275 and data["usage"]["web_search_calls"] == 3
-    assert data["search_queries"] == FIXTURE_QUERIES
-    assert data["sources_count"] == 4
+    assert data["search_queries"] == FIXTURE_QUERIES and "search_queries_partial" not in data
+    # Four annotated citations, plus the [GitHub tags](...) link the answer writes without an annotation.
+    assert data["sources_count"] == 5 and "consulted_sources_count" not in data
     assert data["citation_positions"]["valid"] == data["citation_positions"]["checked"] == 4
-    assert [s["url"] for s in sources["sources"]][:1] == ["https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/"]
+    urls = [s["url"] for s in sources["sources"]]
+    assert urls[0] == "https://blog.rust-lang.org/2026/10/15/Rust-1.99.1/"
+    assert urls[-1] == "https://github.com/rust-lang/rust/tags" and sources["sources"][-1]["title"] == "GitHub tags"
+    # The annotated sources take their title from the answer's link text.
+    assert sources["sources"][0]["title"] == "official announcement"
 
 
 # ------------------------------------------------------------------ robustness (review findings F1-F6)

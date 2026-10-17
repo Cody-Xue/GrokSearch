@@ -7,7 +7,7 @@ from fastmcp import Client
 
 from grok_search import config as config_module
 from grok_search import models, server
-from grok_search.models import ModelListCache, check_model, model_name_problem
+from grok_search.models import ModelListCache, check_model, model_name_problem, routing_base
 from grok_search.providers.grok import GrokResponse, GrokSearchProvider
 from grok_search.sources import SourcesCache
 
@@ -344,3 +344,49 @@ async def test_switch_model_refuses_non_chat_models(isolated, listed, name):
     assert not any(m in data["model_check"].get("suggestions", []) for m in ("grok-tts", "grok-voice-tts-1.0", "gpt-image-2"))
     assert config_json(isolated) is None
     assert info["GROK_MODEL"] == "grok-4.20-multi-agent-0309(high)" and info["GROK_MODEL_SOURCE"] == "env"
+
+
+# ------------------------------------------------------------------ v1.13.1 field report
+@pytest.mark.asyncio
+async def test_a_bad_suffix_on_an_unknown_model_reports_both_problems(isolated):
+    async with Client(server.mcp) as client:
+        both = await call(client, "switch_model", {"model": "grok-99-fake(ultra)"})
+        suffix_only = await call(client, "switch_model", {"model": "grok-4.7(ultra)"})
+    assert both["status"] == "❌ 失败" and "unsupported thinking suffix '(ultra)'" in both["message"]
+    assert "'grok-99-fake' is not in the proxy's /models list" in both["message"]
+    assert both["model_check"]["suggestions"][:1] == ["grok-4.7"] and both["current_model"] == "grok-4.20-multi-agent-0309(high)"
+    assert "unsupported thinking suffix '(ultra)'" in suffix_only["message"] and "/models list" not in suffix_only["message"]
+    assert config_json(isolated) is None
+
+
+@pytest.mark.asyncio
+async def test_config_info_warns_when_the_model_is_not_served(isolated, monkeypatch):
+    # Without GROK_MODEL the built-in default is the multi-agent model at reasoning effort high.
+    monkeypatch.delenv("GROK_MODEL")
+    monkeypatch.setattr(server.config, "_cached_model", None)
+    async with Client(server.mcp) as client:
+        default = json.loads((await client.call_tool("get_config_info", {})).content[0].text)
+    assert default["GROK_MODEL"] == "grok-4.20-multi-agent-0309(high)" and default["GROK_MODEL_SOURCE"] == "default"
+    assert default["connection_test"]["current_model_listed"] is True  # listed by its base name
+    assert not any("/models 列表" in w for w in default.get("config_warnings", []))
+    # A model the gateway does not serve (grok-4-fast, v1.13.0's default, is not on CPA) is flagged.
+    monkeypatch.setenv("GROK_MODEL", "grok-4-fast")
+    monkeypatch.setattr(server.config, "_cached_model", None)
+    async with Client(server.mcp) as client:
+        info = json.loads((await client.call_tool("get_config_info", {})).content[0].text)
+    assert info["connection_test"]["current_model_listed"] is False
+    warning = next(w for w in info["config_warnings"] if "/models 列表" in w)
+    assert warning.startswith("GROK_MODEL=grok-4-fast（来源: env）不在网关的 /models 列表中") and "grok-4.7" in warning
+
+
+def test_the_built_in_default_model(monkeypatch, tmp_path):
+    from grok_search.config import DEFAULT_MODEL, Config
+    from grok_search.providers.grok import GrokSearchProvider
+
+    assert DEFAULT_MODEL == "grok-4.20-multi-agent-0309(high)" and routing_base(DEFAULT_MODEL) == "grok-4.20-multi-agent-0309"
+    assert GrokSearchProvider("https://api.example.test/v1", "k").model == DEFAULT_MODEL
+    monkeypatch.delenv("GROK_MODEL", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Config, "_instance", None)
+    cfg = Config()
+    assert (cfg.grok_model, cfg.grok_model_source) == (DEFAULT_MODEL, "default")

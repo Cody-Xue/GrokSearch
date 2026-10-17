@@ -3,7 +3,7 @@ import json
 import re
 import uuid
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import urlparse
 
 import asyncio
@@ -73,30 +73,61 @@ def url_identity(url: str) -> str:
     return host + parsed.path.rstrip("/") + ("?" + "&".join(params) if params else "")
 
 
+# A repository's page shows its root README, so the README's own URL is the same document (an extra_sources
+# answer listed github.com/o/r and github.com/o/r/blob/main/README.md as two results).
+_README = r"readme(?:\.(?:md|markdown|rst|txt|adoc|org))?"
+# GitHub owner and repository names are case-insensitive, so those keys are lower-cased.
+_GITHUB_REPO_RE = re.compile(r"(?i)^(?:github\.com/([^/]+/[^/]+)(?:/tree/[^/]+|/blob/[^/]+/" + _README + r")?"
+                             r"|raw\.githubusercontent\.com/([^/]+/[^/]+)/[^/]+/" + _README + r")$")
+_FORGE_REPO_RE = re.compile(r"(?i)^((?:gitlab\.com|codeberg\.org|gitea\.com)/.+?)(?:/-)?/(?:tree|blob|src/branch)/[^/]+(?:/" + _README + r")?$")
+_INDEX_PAGE_RE = re.compile(r"(?i)/index\.(?:html?|php)$")
+
+
+def document_identity(url: str) -> str:
+    """url_identity, with one key for a repository's page, its default tree and its root README, and for a
+    directory and its index.html. Keeps extra_sources free of the same document twice."""
+    key = url_identity(url)
+    if "?" in key:
+        return key
+    m = _GITHUB_REPO_RE.match(key)
+    if m:
+        return "github.com/" + (m.group(1) or m.group(2)).lower()
+    m = _FORGE_REPO_RE.match(key)
+    if m:
+        return m.group(1)
+    return _INDEX_PAGE_RE.sub("", key)
+
+
 def new_session_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
 class SourcesCache:
+    """Per session: the source list (cited, then extra) and the pages the search only consulted."""
+
     def __init__(self, max_size: int = 256):
         self._max_size = max_size
         self._lock = asyncio.Lock()
-        self._cache: OrderedDict[str, list[dict]] = OrderedDict()
+        self._cache: OrderedDict[str, tuple[list[dict], list[dict]]] = OrderedDict()
 
-    async def set(self, session_id: str, sources: list[dict]) -> None:
+    async def set(self, session_id: str, sources: list[dict], consulted: list[dict] | None = None) -> None:
         async with self._lock:
-            self._cache[session_id] = sources
+            self._cache[session_id] = (sources, list(consulted or []))
             self._cache.move_to_end(session_id)
             while len(self._cache) > self._max_size:
                 self._cache.popitem(last=False)
 
-    async def get(self, session_id: str) -> list[dict] | None:
+    async def get_entry(self, session_id: str) -> tuple[list[dict], list[dict]] | None:
         async with self._lock:
-            sources = self._cache.get(session_id)
-            if sources is None:
+            entry = self._cache.get(session_id)
+            if entry is None:
                 return None
             self._cache.move_to_end(session_id)
-            return sources
+            return entry
+
+    async def get(self, session_id: str) -> list[dict] | None:
+        entry = await self.get_entry(session_id)
+        return None if entry is None else entry[0]
 
 
 def merge_sources(*source_lists: list[dict]) -> list[dict]:
@@ -131,25 +162,42 @@ def merge_sources(*source_lists: list[dict]) -> list[dict]:
     return merged
 
 
-def sources_from_annotations(annotations: list[dict]) -> list[dict]:
-    """Group native URL citations without losing repeated citation locations.
-
-    Accept both flat Grok annotations and nested Chat Completions citations.
-    Numeric titles are citation labels, not document titles. Offsets are kept
-    as supplied by the upstream API and refer to the unmodified answer.
-    """
-    by_url: dict[str, dict] = {}
-    seen: set[tuple] = set()
-    for annotation in annotations:
+def _url_citations(annotations) -> Iterator[tuple[str, dict]]:
+    """(url, citation) for each url_citation annotation, flat or nested, with an http(s) URL."""
+    for annotation in annotations or []:
         if not isinstance(annotation, dict) or annotation.get("type") != "url_citation":
             continue
         citation = annotation.get("url_citation", annotation)
         if not isinstance(citation, dict):
             continue
         url = citation.get("url")
-        if not isinstance(url, str) or not url.strip().startswith(("https://", "http://")):
-            continue
-        url = url.strip()
+        if isinstance(url, str) and url.strip().startswith(("https://", "http://")):
+            yield url.strip(), citation
+
+
+def _empty_span(citation: dict) -> bool:
+    """start_index == end_index: the annotation marks no text (xAI lists the pages its search consulted so, as 0/0)."""
+    start, end = citation.get("start_index"), citation.get("end_index")
+    return type(start) is int and type(end) is int and start == end
+
+
+def _label(citation: dict) -> str:
+    title = citation.get("title")
+    return title.strip() if isinstance(title, str) and title.strip().isdecimal() else ""
+
+
+def sources_from_annotations(annotations: list[dict]) -> list[dict]:
+    """Group native URL citations without losing repeated citation locations.
+
+    Accept both flat Grok annotations and nested Chat Completions citations.
+    Numeric titles are citation labels, not document titles; a title that is a URL is no title either.
+    Offsets are kept as supplied by the upstream API and refer to the unmodified answer. An empty span
+    (start_index == end_index, in practice 0/0) is no location: the Responses API lists every page the
+    search consulted that way, cited or not (see consulted_identities).
+    """
+    by_url: dict[str, dict] = {}
+    seen: set[tuple] = set()
+    for url, citation in _url_citations(annotations):
         source = by_url.setdefault(url, {"url": url, "provider": "grok", "citations": []})
         occurrence = {}
         title = citation.get("title")
@@ -157,17 +205,34 @@ def sources_from_annotations(annotations: list[dict]) -> list[dict]:
             title = title.strip()
             if title.isdecimal():
                 occurrence["label"] = title
-            else:
+            elif not title.lower().startswith(("https://", "http://")):
                 source.setdefault("title", title)
-        for key in ("start_index", "end_index"):
-            value = citation.get(key)
-            if type(value) is int and value >= 0:
-                occurrence[key] = value
+        if not _empty_span(citation):
+            for key in ("start_index", "end_index"):
+                value = citation.get(key)
+                if type(value) is int and value >= 0:
+                    occurrence[key] = value
         key = (url, tuple(sorted(occurrence.items())))
         if occurrence and key not in seen:
             seen.add(key)
             source["citations"].append(occurrence)
     return list(by_url.values())
+
+
+def consulted_identities(annotations: list[dict]) -> set[str]:
+    """url_identity of the URLs whose every url_citation annotation has an empty span and no citation number.
+
+    xAI's Responses API reports each page its search opened as such an annotation (title = the URL,
+    offsets 0/0), next to the real inline citations; on grok-4.7 that was 61 of 77 URLs of one answer,
+    most of them unrelated to it. Such a URL is a cited source only when the answer itself mentions it.
+    Annotations without offsets at all keep counting as citations, as they always did.
+    """
+    empty_only: dict[str, bool] = {}
+    for url, citation in _url_citations(annotations):
+        key = url_identity(url)
+        consulted = _empty_span(citation) and not _label(citation)
+        empty_only[key] = empty_only.get(key, True) and consulted
+    return {key for key, consulted in empty_only.items() if consulted}
 
 
 def split_answer_and_sources(text: str) -> tuple[str, list[dict]]:

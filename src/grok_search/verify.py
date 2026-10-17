@@ -15,9 +15,10 @@ What is checked:
   compared with the registry title (title_checks).
 
 Outcomes: "unresolved" means the registry or the site answered that the thing does not
-exist (404/410, another 4xx from the page, a domain that does not exist). "lookup_failed"
-means no answer could be obtained (429, 5xx, timeouts, network errors, a registry that is
-cooling down after rate-limiting us); it says nothing about the citation.
+exist (404/410 from the page, a domain that does not exist). "lookup_failed" means no answer
+could be obtained (429, 5xx, any other 4xx such as a 403 or a bot defence's 405, timeouts,
+network errors, a registry that is cooling down after rate-limiting us); it says nothing about
+the citation.
 
 What is NOT checked: whether a source supports the statement it is attached to.
 "Resolved" means "exists / reachable", not "true". Every identifier or URL that
@@ -56,9 +57,9 @@ SCOPE = (
     "Existence and reachability only: arXiv IDs and DOIs are resolved against arXiv, Crossref and the doi.org "
     "registry (DataCite for titles), cited URLs are fetched when their host resolves to public addresses only, "
     "and paper titles written next to an identifier are compared with the registry title. unresolved = the "
-    "registry or site said it does not exist (404/410, other 4xx, unknown domain); lookup_failed = no answer "
-    "could be obtained, including 401/403/451 refusals of scripted requests (not evidence either way). Whether "
-    "a source supports the sentence it is attached to is NOT checked."
+    "registry or site said it does not exist (404/410, unknown domain); lookup_failed = no answer could be "
+    "obtained, including every other 4xx (401/403/451 refusals, 400/405/406/418 bot defences) and bot "
+    "challenges (not evidence either way). Whether a source supports the sentence it is attached to is NOT checked."
 )
 # compact (default) output: the semantics of unresolved / lookup_failed are in the web_search tool
 # description, which the client receives once, instead of in every result.
@@ -1182,6 +1183,13 @@ def _proxied(url: str) -> bool:
         return False
 
 
+def _bot_challenge(headers) -> bool:
+    """A bot defence answered instead of the site: Cloudflare (cf-mitigated: challenge) or AWS WAF
+    (x-amzn-waf-action: captcha / challenge, sent by NASA ADS with a 405)."""
+    return (headers.get("cf-mitigated", "").strip().lower() == "challenge"
+            or headers.get("x-amzn-waf-action", "").strip().lower() in ("captcha", "challenge"))
+
+
 async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536) -> dict:
     """status and title of url. Redirects are followed here, hop by hop, without reading their bodies.
 
@@ -1205,7 +1213,7 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
             # A body cut at max_bytes is not a short page (GitHub issue pages: 250-360 KB of HTML).
             complete = len(body) < max_bytes
             charset = response.charset_encoding
-            challenge = response.headers.get("cf-mitigated", "").lower() == "challenge"
+            challenge = _bot_challenge(response.headers)
             final_url = str(response.url)
         finally:
             await response.aclose()
@@ -1231,6 +1239,12 @@ async def check_url(url: str, client: httpx.AsyncClient, max_bytes: int = 65536)
     return info
 
 
+# The only statuses that say the page does not exist. Every other 4xx answers the request rather than the
+# page: 401/403/451 refuse it, and 400, 405, 406, 418, ... are what bot defences send to scripted requests
+# (NASA ADS answers 405 with an AWS WAF captcha), so they are lookup_failed, never evidence against a citation.
+NOT_FOUND_STATUSES = frozenset({404, 410})
+
+
 def _url_outcome(info: dict) -> tuple[str, str]:
     """("urls" | "unresolved" | "lookup_failed" | "skipped", reason) for a check_url result."""
     status = info.get("status")
@@ -1239,7 +1253,7 @@ def _url_outcome(info: dict) -> tuple[str, str]:
     if status is None:
         return ("lookup_failed" if info.get("transient") else "unresolved"), info.get("error", "unreachable")
     if status < 400:
-        if info.get("interstitial"):
+        if info.get("interstitial") or info.get("challenge"):  # AWS WAF serves its challenge with a 202
             return "lookup_failed", "bot check / interstitial (page may exist)"
         return "urls", ""
     reason = f"status {status}"
@@ -1249,11 +1263,13 @@ def _url_outcome(info: dict) -> tuple[str, str]:
         return "lookup_failed", reason
     if info.get("challenge"):
         return "lookup_failed", reason + " (bot challenge)"
+    if status in NOT_FOUND_STATUSES:
+        return "unresolved", reason
     if status in (401, 403, 451):
         # Many publishers (Reuters, NYTimes, ScienceDirect, Zhihu, ...) refuse scripted requests outright:
         # the refusal says nothing about whether the page exists, so it is not counted against the citation.
         return "lookup_failed", reason + " (access denied to automated requests; the page may still exist)"
-    return "unresolved", reason
+    return "lookup_failed", reason + " (request refused or not understood; says nothing about whether the page exists)"
 
 
 # --------------------------------------------------------------- title checks
@@ -1284,6 +1300,25 @@ _LINE_LEAD_RE = re.compile(
     r"(?i)[\s>*_~`#+\-•·\d.,;:：，、)(（）\[\]【】]*"
     r"(?:(?:arxiv|biorxiv|medrxiv|doi|pmid|id|url|link|pdf|preprint|paper|论文|链接|预印本|编号|号)(?:[\s*_]*[:：])?[\s*_,;，、\[(（【]*)*"
 )
+# A record field: an optional list bullet, a short label and a colon ("- 正式发表会议 DOI：", "**Title:**",
+# "- **arXiv**:", "Authors: "). A bold run that goes on after its colon ("**BERT: Pre-training ...**") is a
+# title, not a label.
+_FIELD_LABEL = (
+    r"(?:\*\*[^\n:：*]{1,30}?(?:\*\*[ \t]*[:：]|[ \t]*[:：]\*\*)"
+    r"|__[^\n:：_]{1,30}?(?:__[ \t]*[:：]|[ \t]*[:：]__)"
+    r"|[^\n:：*_\[\]—–]{1,30}?[ \t]*[:：])"
+)
+_FIELD_BULLET = r"[ \t>]*(?:[-*+•·][ \t]+|\d{1,3}[.)][ \t]+)?"
+_FIELD_LINE_RE = re.compile(_FIELD_BULLET + _FIELD_LABEL)
+_FIELD_LEAD_RE = re.compile(_FIELD_BULLET + _FIELD_LABEL + r"[\s*_\[(（【]*")
+# How many lines of a record a title check looks through above and below an identifier's own line.
+RECORD_MAX_LINES = 6
+
+
+def _is_field_line(line: str) -> bool:
+    # A label sits at the start of its line: only that part is matched, so a line of a million spaces cannot
+    # make the leading [ \t>]* backtrack through all of them.
+    return _FIELD_LINE_RE.match(line.lstrip()[:120]) is not None
 _URL_TAIL_RE = re.compile(r"(?:https?://|www\.)\S*$")
 _CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff]")
 _YEAR_RE = re.compile(r"\b(?:19|20)\d{2}[a-z]?\b")
@@ -1321,12 +1356,57 @@ def _find_all(haystack_lower: str, needle: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _record_start(answer: str, line_start: int, pos: int, radius: int) -> int:
+    """Start of the record an identifier's line belongs to: up through its field lines ("- Authors: ..."), across
+    single blank lines, to the first line that is not a field (the record's title or heading), which is included.
+    At most RECORD_MAX_LINES lines, none starting more than radius characters before the identifier."""
+    start = cursor = line_start
+    taken, blank = 0, False
+    while cursor > 0 and taken < RECORD_MAX_LINES and pos - cursor <= radius:
+        prev_start = answer.rfind("\n", 0, cursor - 1) + 1
+        line = answer[prev_start:cursor - 1]
+        cursor = prev_start
+        if not line.strip():
+            if blank:
+                break  # two blank lines: another part of the answer
+            blank = True
+            continue
+        start, taken, blank = prev_start, taken + 1, False  # the window is cut to radius later
+        if not _is_field_line(line):
+            break
+    return start
+
+
+def _record_end(answer: str, line_end: int, end: int, radius: int) -> int:
+    """End of the field lines that follow an identifier's line ("- Title: ..." under "- arXiv: ..."), across single
+    blank lines; the first line that is not a field (the next record) is left out."""
+    stop = cursor = line_end
+    taken, blank = 0, False
+    while cursor < len(answer) and taken < RECORD_MAX_LINES and cursor - end <= radius:
+        next_end = answer.find("\n", cursor + 1)
+        next_end = len(answer) if next_end == -1 else next_end
+        line = answer[cursor + 1:next_end]
+        cursor = next_end
+        if not line.strip():
+            if blank:
+                break
+            blank = True
+            continue
+        if not _is_field_line(line):
+            break
+        stop, taken, blank = next_end, taken + 1, False
+    return stop
+
+
 def _identifier_windows(answer: str, identifier: str, radius: int = 300, separators: Optional[list] = None,
                         same_paper: Optional[list] = None) -> list[tuple[int, int, int, int, Optional[int], Optional[int]]]:
     """(window_start, window_end, id_start, id_end, prev_separator_end, next_separator_start) per occurrence.
 
-    A window is the identifier's line, extended to the previous line when the identifier starts its
-    line, clipped to radius and to the nearest occurrence of another identifier (a separator).
+    A window is the identifier's line. When the identifier starts its line, after a label such as "arXiv:" or
+    a record field such as "- 正式发表会议 DOI：", the window takes in the rest of its record: the field lines
+    above it up to the record's title line (also across a blank line: "**Title**", "", "- arXiv: ...") and the
+    field lines below it. It is clipped to radius and to the nearest occurrence of another identifier (a
+    separator).
     """
     separators = separators or []
     windows = []
@@ -1340,10 +1420,9 @@ def _identifier_windows(answer: str, identifier: str, radius: int = 300, separat
             if line_start <= s and e <= pos:
                 prefix = prefix[:s - line_start] + prefix[e - line_start:]
         prefix = _URL_TAIL_RE.sub("", prefix)
-        if line_start > 0 and len(prefix) <= 80 and _LINE_LEAD_RE.fullmatch(prefix):
-            prev_start = answer.rfind("\n", 0, line_start - 1) + 1
-            if answer[prev_start:line_start - 1].strip():
-                start = prev_start
+        if len(prefix) <= 80 and (_LINE_LEAD_RE.fullmatch(prefix) or _FIELD_LEAD_RE.fullmatch(prefix)):
+            start = _record_start(answer, line_start, pos, radius)
+            line_end = _record_end(answer, line_end, end, radius)
         prev_sep = max((e for s, e in separators if e <= pos), default=None)
         next_sep = min((s for s, e in separators if s >= end), default=None)
         start = max(start, pos - radius, prev_sep if prev_sep is not None else 0)

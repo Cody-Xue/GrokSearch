@@ -11,17 +11,19 @@ Order of backends:
   damaged copy is flagged, unless the backend says the URL is an HTML page. When the origin answers
   with a web page (HTML, including an HTML error page), or a URL that only ends in a code-like
   extension answers with an HTTP error or a binary type, it is read as a web page instead
-  (www.npmjs.com/package/chart.js is a page, not a JavaScript file). Such a URL that was not
-  downloaded is read like a page, Tavily first: a copy long enough for a page with few Markdown links
-  is taken for the file (and checked for damage), and a shorter copy goes on to Firecrawl like any
-  short page; Firecrawl's content type then decides whether the URL is a file.
-* Other pages: Tavily first. Its result is only accepted when it is long enough to be a real page
-  (GROK_FETCH_MIN_CHARS) and is not a bot check; otherwise Firecrawl runs and the better of the two
-  is returned.
+  (www.npmjs.com/package/chart.js is a page, not a JavaScript file); Firecrawl's content type then
+  decides whether such a URL is a file. When the origin answers 404 or 410, no extractor is asked:
+  they would read the same address.
+* Other pages: Firecrawl's live scrape first (GROK_FETCH_PAGE_FIRST=firecrawl, the default), Tavily
+  when Firecrawl fails, answers with a bot check, or its copy is shorter than GROK_FETCH_MIN_CHARS;
+  GROK_FETCH_PAGE_FIRST=tavily (or no Firecrawl key) keeps the older order, Tavily first, Firecrawl when
+  Tavily's copy is short or a bot check. Image markup is removed from page copies
+  (GROK_FETCH_STRIP_IMAGES), never from files.
 
 Freshness: Firecrawl is asked for a copy no older than GROK_FETCH_MAX_AGE_S (default 0: always
 scraped fresh) and the header reports its cache state. Tavily caches pages per URL and offers no
-freshness control, which the header says as cache=possible.
+freshness control (its python.org/downloads copy was over a week old), which the header says as
+cache=possible plus a 注意 line.
 
 Paging never refetches: a page that does not fit into one response is kept as
 a snapshot, and later pages are cut from exactly that text via snapshot_id.
@@ -490,6 +492,47 @@ def _tavily_info(text: str) -> dict:
     return info
 
 
+# Markdown images in an extracted web page: badges, icons and logos cost tokens and say nothing but their alt
+# text (pypi.org/project/fastapi: 397 images, 41 % of Tavily's 85,000 characters, 325 of them the empty-alt
+# "white-cube" icon of each release). A linked image keeps its link with the alt text as the link text, an
+# image with alt text becomes "[image: alt]", one without alt text goes. A target may not contain brackets,
+# parentheses (one balanced pair aside) or whitespace, so no two attempts scan the same characters.
+_IMG_URL = r"(?:[^()\[\]\s]|\([^()\[\]\s]*\))+"
+_IMG_TITLE = r"(?:[ \t]+\"[^\"\n]{0,300}\")?"
+_LINKED_IMAGE_RE = re.compile(r"\[!\[([^\[\]\n]{0,300})\]\(" + _IMG_URL + _IMG_TITLE + r"\)\]\((" + _IMG_URL + r")" + _IMG_TITLE + r"\)")
+_IMAGE_RE = re.compile(r"!\[([^\[\]\n]{0,300})\]\(" + _IMG_URL + _IMG_TITLE + r"\)")
+_BLANK_RUN_RE = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)+")
+
+
+def strip_images(text: str) -> tuple[str, int]:
+    """(text without Markdown image markup, number of images removed); see _IMAGE_RE above."""
+    count = 0
+
+    def linked(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        alt = " ".join(m.group(1).split())
+        return f"[{alt}]({m.group(2)})" if alt else ""
+
+    def image(m: re.Match) -> str:
+        nonlocal count
+        count += 1
+        alt = " ".join(m.group(1).split())
+        return f"[image: {alt}]" if alt else ""
+
+    text = _IMAGE_RE.sub(image, _LINKED_IMAGE_RE.sub(linked, text or ""))
+    return (_BLANK_RUN_RE.sub("\n\n", text) if count else text), count
+
+
+def _page_result(text: str, provider: str, info: dict) -> tuple[str, str, dict]:
+    """An extractor's copy of a web page as web_fetch returns it: images stripped (GROK_FETCH_STRIP_IMAGES)."""
+    if config.fetch_strip_images:
+        text, removed = strip_images(text)
+        if removed:
+            info["images_stripped"] = removed
+    return text, provider, info
+
+
 def _add_warning(info: dict, warning: str) -> None:
     warnings = [w for w in (info.get("warning") or "").split(",") if w]
     if warning not in warnings:
@@ -510,10 +553,17 @@ def _info_fields(info: dict | None) -> str:
     if not info:
         return ""
     out = ""
-    for key in ("content_type", "charset", "status", "cache", "cached_at"):
+    for key in ("content_type", "charset", "status", "cache", "cached_at", "images_stripped"):
         if info.get(key) not in (None, ""):
             out += f" {key}={info[key]}"
     return out
+
+
+# Every page Tavily answers carries this line: the header's cache=possible alone was easy to miss.
+TAVILY_CACHE_NOTE = (
+    "注意: 这是 Tavily 的缓存副本，Tavily 没有新鲜度控制，副本可能是几天甚至几周前的版本；"
+    "版本号、发布日期、价格等时效性信息不要只凭此页确认。"
+)
 
 
 def _info_header(info: dict | None) -> str:
@@ -541,6 +591,11 @@ def _info_header(info: dict | None) -> str:
             f"\n注意: 这是提取服务把源代码/文本文件当网页转换后的结果，内容已被改写（{damage}），不是原文。"
             "不要据此引用或修改代码；请稍后重试，或改用 raw / commit 固定的链接。"
         )
+    if info.get("live_status"):
+        out += (f"\n注意: Firecrawl 实时抓取时源站答复 HTTP {info['live_status']}，下面是 Tavily 缓存的旧副本，"
+                "该页面现在很可能已经不存在或已移动。")
+    if info.get("cache") == "possible":
+        out += "\n" + TAVILY_CACHE_NOTE
     if "size_limit" in warnings:
         out += f"\n注意: 文件超过 {DIRECT_MAX_MB} MB，只返回了前 {DIRECT_MAX_MB} MB（在最后一个完整行处截断）。"
     if "decode_errors" in warnings:
@@ -605,7 +660,12 @@ def _failure_message(errors: list[ProviderError]) -> str:
         page_statuses = list(dict.fromkeys(str(e.page_status) for e in errors if isinstance(e, PageStatusError)))
         if page_statuses:
             head += " page_status=" + ",".join(page_statuses)
-        title = "提取失败: 所有提取服务均未能获取内容"
+        gone = [e for e in errors if _origin_says_gone(e)]
+        if gone and len(errors) == len(gone):
+            title = (f"源站答复 HTTP {gone[-1].page_status}：该地址不存在。未再调用 Tavily / Firecrawl"
+                     "（它们读取同一地址，只会得到同样的结果）；请检查 URL，或用 web_search 查找正确的地址")
+        else:
+            title = "提取失败: 所有提取服务均未能获取内容"
     return "\n".join([head, "", title] + [f"- {e.summary()}" for e in errors])
 
 
@@ -660,7 +720,72 @@ def _mark_degraded(info: dict, reasons: list[str]) -> None:
 
 
 async def _extract_page(url: str, ctx, errors: list, notes: list, *, maybe_file: bool = False):
-    """A web page: Tavily first; Firecrawl when Tavily's text is missing, short or a bot check.
+    """A web page (or, with maybe_file, a URL that may be a file): Firecrawl's live scrape first by default,
+    Tavily's cached copy first with GROK_FETCH_PAGE_FIRST=tavily or without a Firecrawl key."""
+    if config.fetch_page_first == "firecrawl" and config.firecrawl_active:
+        return await _extract_page_live(url, ctx, errors, notes, maybe_file=maybe_file)
+    return await _extract_page_cached(url, ctx, errors, notes, maybe_file=maybe_file)
+
+
+# A clean live copy shorter than GROK_FETCH_MIN_CHARS (a stub, or a page whose scripts did not run) gives way to
+# Tavily's cached copy only when that is at least this many times longer.
+CACHED_COPY_MIN_RATIO = 2
+
+
+async def _extract_page_live(url: str, ctx, errors: list, notes: list, *, maybe_file: bool = False):
+    """Firecrawl first (scraped now: maxAge GROK_FETCH_MAX_AGE_S); Tavily when Firecrawl fails, answers with a bot
+    check or damaged code, or with a copy shorter than GROK_FETCH_MIN_CHARS.
+
+    Tavily caches pages without any freshness control: its python.org/downloads copy still called 3.14.8 the
+    latest release eight days after 3.15.0 was out. So between two clean copies of a page the live one wins
+    unless it is short and Tavily's is at least CACHED_COPY_MIN_RATIO times longer.
+    maybe_file: Firecrawl's content type tells a file (anything but HTML, complete at any length and checked
+    for code damage) from a page; when Firecrawl failed, Tavily's copy is judged as _extract_page_cached does."""
+    page: dict = {}
+    firecrawl = await _try("firecrawl", _call_firecrawl_scrape(url, ctx, page), errors, notes)
+    live_info: dict = {}
+    live_problems: list[str] = []
+    as_file = False
+    if firecrawl is not None:
+        live_info = _page_info(url, page, firecrawl)
+        as_file = maybe_file and not _is_html_info(live_info)
+        live_problems = _judge(firecrawl, live_info, url, as_file)
+        if not live_problems and (as_file or len(firecrawl) >= config.fetch_min_chars):
+            notes.append("firecrawl:ok")
+            return (firecrawl, "firecrawl", live_info) if as_file else _page_result(firecrawl, "firecrawl", live_info)
+        notes.append(f"firecrawl:{live_problems[0]}" if live_problems else f"firecrawl:short({len(firecrawl)})")
+    await log_info(ctx, "Firecrawl result missing, short, damaged or a bot check, trying Tavily...", config.debug_enabled)
+    tavily = await _try("tavily", _call_tavily_extract(url), errors, notes)
+    if tavily is None:
+        if firecrawl is None:
+            return None, "", {}
+        return (firecrawl, "firecrawl", live_info) if as_file else _page_result(firecrawl, "firecrawl", live_info)
+    cached_info = _tavily_info(tavily)
+    if firecrawl is None:
+        # Nothing tells a file from a page but the copy itself: a long copy with page links is a page.
+        as_file = maybe_file and not (len(tavily) >= config.fetch_min_chars and links_like_a_page(tavily))
+    cached_problems = _judge(tavily, cached_info, url, as_file)
+    if firecrawl is None:
+        live_error = next((e for e in reversed(errors) if e.provider == "firecrawl"), None)
+        if isinstance(live_error, PageStatusError) and live_error.page_status in GONE_STATUSES:
+            cached_info["live_status"] = live_error.page_status  # the page is gone now; this copy predates that
+        notes.append(f"tavily:{cached_problems[0]}" if cached_problems else "tavily:ok")
+        return (tavily, "tavily", cached_info) if as_file else _page_result(tavily, "tavily", cached_info)
+    if live_problems or cached_problems:
+        # A real page before a bot check, an intact copy before a damaged one, then the live copy.
+        candidates = [(live_problems, 0, firecrawl, "firecrawl", live_info), (cached_problems, 1, tavily, "tavily", cached_info)]
+        problems, _, text, provider, info = min(candidates, key=lambda c: ("interstitial" in c[0], bool(c[0]), c[1]))
+    elif len(tavily) >= max(config.fetch_min_chars, CACHED_COPY_MIN_RATIO * len(firecrawl)):
+        text, provider, info = tavily, "tavily", cached_info
+    else:
+        text, provider, info = firecrawl, "firecrawl", live_info
+    notes.append(f"tavily:{cached_problems[0]}" if cached_problems else "tavily:ok" if provider == "tavily" else "tavily:unused")
+    return (text, provider, info) if as_file else _page_result(text, provider, info)
+
+
+async def _extract_page_cached(url: str, ctx, errors: list, notes: list, *, maybe_file: bool = False):
+    """A web page: Tavily first; Firecrawl when Tavily's text is missing, short or a bot check
+    (GROK_FETCH_PAGE_FIRST=tavily, the order of v1.13.0 and earlier).
 
     maybe_file: url only ends in a code-like extension and was not downloaded directly (behind a proxy,
     a failed download, GROK_FETCH_DIRECT=false), so it may be a page (en.wikipedia.org/wiki/Node.js,
@@ -680,7 +805,7 @@ async def _extract_page(url: str, ctx, errors: list, notes: list, *, maybe_file:
     as_file = maybe_file and long_enough and not links_like_a_page(tavily)
     damage = code_degradation(tavily, url) if as_file else []
     if long_enough and not tavily_wall and not damage:
-        return tavily, "tavily", tavily_info
+        return (tavily, "tavily", tavily_info) if as_file else _page_result(tavily, "tavily", tavily_info)
     tavily_note = len(notes)
     if tavily is not None:
         notes.append("tavily:interstitial" if tavily_wall else "tavily:degraded" if damage else f"tavily:short({len(tavily)})")
@@ -692,7 +817,11 @@ async def _extract_page(url: str, ctx, errors: list, notes: list, *, maybe_file:
             damage = code_degradation(tavily, url)  # the short copy may be the file: its damage is flagged
         if damage:
             _mark_degraded(tavily_info, damage)
-        return (tavily, "tavily", tavily_info) if tavily is not None else (None, "", {})
+        if tavily is None:
+            return None, "", {}
+        if as_file or (maybe_file and not long_enough):
+            return tavily, "tavily", tavily_info
+        return _page_result(tavily, "tavily", tavily_info)
     firecrawl_info = _page_info(url, page, firecrawl)
     if maybe_file and not _is_html_info(firecrawl_info):
         # A file after all: an intact copy beats a damaged one, and Firecrawl's (text/plain unchanged) goes first.
@@ -714,12 +843,12 @@ async def _extract_page(url: str, ctx, errors: list, notes: list, *, maybe_file:
     firecrawl_wall = bool(firecrawl_info.get("warning"))
     if firecrawl_wall and tavily is not None and not tavily_wall:
         notes.append("firecrawl:interstitial")  # a login wall never replaces a real extract
-        return tavily, "tavily", tavily_info
+        return _page_result(tavily, "tavily", tavily_info)
     if tavily is None or (tavily_wall and not firecrawl_wall) or len(firecrawl) > len(tavily):
         notes.append("firecrawl:interstitial" if firecrawl_wall else "firecrawl:ok")
-        return firecrawl, "firecrawl", firecrawl_info
+        return _page_result(firecrawl, "firecrawl", firecrawl_info)
     notes.append("firecrawl:shorter")
-    return tavily, "tavily", tavily_info
+    return _page_result(tavily, "tavily", tavily_info)
 
 
 def _is_html_info(info: dict) -> bool:
@@ -768,6 +897,15 @@ async def _extract_exact(url: str, ctx, errors: list, notes: list, *, code: bool
     # Prefer a real page over a bot check, an intact copy over a damaged one, then Firecrawl.
     _, _, text, provider, info = min(candidates, key=lambda c: ("interstitial" in c[0], bool(c[0]), c[1]))
     return text, provider, info
+
+
+# Statuses with which the origin says the URL does not exist (an error page in HTML included).
+GONE_STATUSES = frozenset({404, 410})
+
+
+def _origin_says_gone(error: ProviderError) -> bool:
+    """The direct download reached the origin, which answered 404 or 410: no extractor is asked after that."""
+    return isinstance(error, PageStatusError) and error.provider == "direct" and error.page_status in GONE_STATUSES
 
 
 def _answered_as_page(error: ProviderError) -> bool:
@@ -823,6 +961,9 @@ async def _fetch_fresh(url: str, ctx=None):
             if page is not None:
                 return page.text, "direct", [], errors, _direct_info(url, page)
             direct_error = errors[-1]
+            if _origin_says_gone(direct_error):
+                # The extractors would read the same address and bill for the same 404.
+                return None, "", notes, errors, {}
         # No local download (GROK_FETCH_DIRECT=false, a proxy, a failure) of what may still be a file.
         if target and (direct_error is None or _still_a_file(direct_error, target.strong)):
             if target.strong:
